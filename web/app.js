@@ -884,3 +884,126 @@ window.SpeechDebug = {
   stateVersion: () => stateVersion,
   sockets: () => [stateSocket, transcriptSocket].filter(Boolean).length,
 };
+
+/* ============================================================
+   模型架
+   ⭐ 这是唯一能取得或删除语音模型的地方。资产包不在 Framework 的 Package 页面里。
+   ============================================================ */
+
+const MODEL_STATE = {
+  present: { label: '已就绪', cls: 'is-present' },
+  missing: { label: '未下载', cls: '' },
+  no_variant: { label: '本机没有可用版本', cls: 'is-blocked' },
+  no_provider: { label: '资产包未安装', cls: 'is-blocked' },
+};
+
+let modelsBusy = false;
+
+function renderModels(data) {
+  const list = $('models-list');
+  list.replaceChildren();
+  for (const item of data.items ?? []) {
+    const row = document.createElement('div');
+    const state = MODEL_STATE[item.state] ?? { label: item.state, cls: '' };
+    row.className = `model-row ${state.cls}`;
+
+    const main = document.createElement('div');
+    main.className = 'model-main';
+    const name = document.createElement('span');
+    name.className = 'model-name';
+    name.textContent = item.name + (item.required ? '' : '（可选）');
+    const sub = document.createElement('span');
+    sub.className = 'model-state';
+    /**
+     * ⚠ 三种「没有」显示成三句不同的话，因为下一步动作完全不同：
+     * 能下的就下，本机没有对应硬件版本的下了也没用，资产包没装的要先装包。
+     */
+    sub.textContent = item.detail ? `${state.label} · ${item.detail}` : state.label;
+    main.append(name, sub);
+    row.append(main);
+
+    if (item.state === 'no_provider') {
+      /**
+       * ⭐ 按钮说的是使用者要的那件事，不是它背后要装哪个包。
+       * 包名由框架从目录里查出来——页面写死一个包名，迟早会跟目录说不一样的话。
+       */
+      const add = document.createElement('button');
+      add.type = 'button'; add.className = 'primary'; add.textContent = '启用';
+      add.addEventListener('click', () => void modelAction('install-provider', item, add));
+      row.append(add);
+    } else if (item.state === 'missing') {
+      const get = document.createElement('button');
+      get.type = 'button'; get.className = 'primary'; get.textContent = '下载';
+      get.addEventListener('click', () => void modelAction('fetch', item, get));
+      row.append(get);
+    } else if (item.state === 'present' && item.removable) {
+      const drop = document.createElement('button');
+      drop.type = 'button'; drop.className = 'ghost'; drop.textContent = '删除';
+      drop.addEventListener('click', () => void modelAction('delete', item, drop));
+      row.append(drop);
+    }
+    list.append(row);
+  }
+  setNote($('models-summary'),
+    data.ready ? '模型齐了，可以转写。' : '还缺模型，暂时不能转写。',
+    data.ready ? 'good' : 'bad');
+}
+
+async function modelAction(kind, item, button) {
+  if (modelsBusy) return;
+  if (kind === 'delete' && !window.confirm(`删除「${item.name}」？下次要用还得重新下载。`)) return;
+  modelsBusy = true;
+  button.disabled = true;
+  const was = button.textContent;
+  const busyLabel = { fetch: '下载中…', delete: '删除中…', 'install-provider': '安装中…' };
+  const busyNote = {
+    fetch: `正在下载「${item.name}」，大文件可能要几十分钟，可以离开这一页。`,
+    delete: `正在删除「${item.name}」…`,
+    'install-provider': `正在安装提供「${item.name}」的资产包，装好后这一行会变成「未下载」。`,
+  };
+  // 下载没有服务端进度事件，所以这里只如实说「在做」，不画一根假的进度条。
+  button.textContent = busyLabel[kind];
+  setNote($('models-summary'), busyNote[kind], '');
+  try {
+    const response = await api(`${PKG}/models/${kind}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: item.id }),
+    });
+    const payload = await response.json();
+    if (!payload.ok) {
+      const extra = payload.candidates?.length ? `（已有的版本：${payload.candidates.join(', ')}）` : '';
+      throw new Error(`${payload.error}${payload.detail ? ' — ' + payload.detail : ''}${extra}`);
+    }
+  } catch (error) {
+    const verb = { fetch: '下载', delete: '删除', 'install-provider': '安装' }[kind];
+    setNote($('models-summary'), `${verb}失败：${error.message}`, 'bad');
+    button.textContent = was;
+    button.disabled = false;
+    modelsBusy = false;
+    return;
+  }
+  modelsBusy = false;
+  /**
+   * ⚠ 装资产包是一个**后台作业**，202 只表示已经开始。立刻重读会看到还没变的状态，
+   * 而那看起来就像什么都没发生——所以先如实说一句，再隔几秒读一次。
+   */
+  if (kind === 'install-provider') {
+    setNote($('models-summary'), '资产包正在安装，稍后这一行会变成「未下载」。', '');
+    setTimeout(() => void loadModels(), 6000);
+    return;
+  }
+  await loadModels();
+}
+
+async function loadModels() {
+  try {
+    const response = await api(`${PKG}/models`);
+    renderModels(await response.json());
+  } catch (error) {
+    setNote($('models-summary'), `读取模型状态失败：${error.message}`, 'bad');
+  }
+}
+
+$('models-refresh').addEventListener('click', () => void loadModels());
+void loadModels();

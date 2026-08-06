@@ -42,6 +42,10 @@ export async function register(context) {
       // 常驻 id 即 App worker 侧的 session 名：`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`，
       // 且不得撞 App 自己的保留名。实例键拼进去会超 64 字符，故取摘要——
       // 同一实例恒定，Dev 与 Installed 互不相撞（docs/054 §4.2）。
+      // Manifest 是「本包需要哪些模型」的唯一来源，模型架从这里读它。
+      // ⚠ 显式注入：dev runtime 每次 reload 换一个 gen/<timestamp>/ 目录，
+      // 从 import.meta.url 推出来的相对根会跟着漂。
+      TERMUX_OS_PACKAGE_ROOT: context.root,
       VAD_RESIDENT_ID: `tsp-vad-${instanceDigest}`,
       ASR_RESIDENT_ID: `tsp-asr-${instanceDigest}`,
     },
@@ -49,7 +53,12 @@ export async function register(context) {
     stop_timeout_ms: 5000,
   });
 
-  const serviceRequest = async (path, { method = 'GET', body } = {}) => {
+  /**
+   * ⚠ `timeoutMs` 必须能被调大：取一个模型是几百 MB，8 秒会把一条**正在成功**的
+   * 下载掐成一次失败，而盘上留下的是半个 `.part`——看起来像网络坏了，其实是我们
+   * 自己等不及。请求发起方最清楚这一次该等多久。
+   */
+  const serviceRequest = async (path, { method = 'GET', body, timeoutMs = 8000 } = {}) => {
     const response = await fetch(serviceBase + path, {
       method,
       headers: {
@@ -57,7 +66,7 @@ export async function register(context) {
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const payload = await response.json().catch(() => null);
     if (!response.ok || payload?.ok !== true) {
@@ -235,14 +244,14 @@ export async function register(context) {
     });
   });
 
-  const proxy = (method, route, servicePath = route) => {
+  const proxy = (method, route, servicePath = route, { timeoutMs } = {}) => {
     context.routes.register(method, route, async (req, res, { json, readBody }) => {
       try {
         const body = method === 'POST' ? await readBody() : undefined;
         const query = method === 'GET'
           ? new URL(req.url, 'http://framework.local').search
           : '';
-        const payload = await serviceRequest(servicePath + query, { method, body });
+        const payload = await serviceRequest(servicePath + query, { method, body, timeoutMs });
         json(res, 200, payload);
       } catch (error) {
         json(res, Number(error?.status) || 503, {
@@ -253,6 +262,13 @@ export async function register(context) {
     });
   };
 
+  // 模型架。⭐ 这是唯一能取得或删除语音模型的地方——资产包不出现在 Framework
+  // 自己的 Package 页面里，所以少任何一条，setup 就走不完。
+  proxy('GET', '/models');
+  // 40 分钟：这一条真的在下几百 MB，由使用者显式点出来。
+  proxy('POST', '/models/fetch', '/models/fetch', { timeoutMs: 40 * 60_000 });
+  proxy('POST', '/models/delete', '/models/delete', { timeoutMs: 60_000 });
+  proxy('POST', '/models/install-provider', '/models/install-provider', { timeoutMs: 5 * 60_000 });
   proxy('GET', '/status');
   proxy('GET', '/live');
   proxy('GET', '/state');

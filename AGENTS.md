@@ -22,6 +22,9 @@ through Framework Core or the browser.
 - **Suppress feedback at the gate, never at the microphone.** Re-enabling capture needs a top
   activity, so disabling the mic becomes permanent deafness.
 - **A session has no maximum length.** The configured end keyword closes it.
+- **Never download inside service startup.** A model is hundreds of megabytes; fetching one there
+  makes starting take half an hour with nowhere to show progress, and a failure removes the page
+  that would fix it. Startup resolves; the model shelf fetches.
 - Never overwrite user configuration, profiles, model files or records during an update.
 - Give every Package instance a distinct App graph session name.
 
@@ -30,6 +33,8 @@ through Framework Core or the browser.
 - `service/` — HTTP service, App clients, resident declarations, RMS, lease, projections, config
   - `kws/` wake word · `vad/` VAD and WAV · `asr/` recognition · `storage/` records
   - `capture/` App event stream · `lifecycle/` chain start/stop
+- `service/models.mjs` — the model shelf: the only route to obtaining or removing a speech model,
+  because asset Packages are hidden from the Framework's own Package pages
 - `web/` — 概览 / 设置 / 诊断 pages plus the wake-word setup page
 - `test/`, `scripts/` — host suites, smoke, and the device verification hook
 - `public-files.txt` — the release archive's contents. Anything imported at runtime must be listed.

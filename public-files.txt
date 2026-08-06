@@ -15,6 +15,7 @@ service/assets.mjs
 service/config.mjs
 service/http-auth.mjs
 service/main.mjs
+service/models.mjs
 service/pcm-ws.mjs
 service/pipeline-lease.mjs
 service/residents.mjs

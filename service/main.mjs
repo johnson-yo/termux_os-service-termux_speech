@@ -32,7 +32,11 @@ import { AppEventsClient, CaptureWatchdog } from './capture/app-events.mjs';
 import { RecordArchive } from './storage/archive.mjs';
 import { RecordGroups } from './storage/groups.mjs';
 import { StateHub, WATCH_TIMEOUT_MS } from './state-hub.mjs';
+import { listModels, fetchModel, removeModel, installProvider } from './models.mjs';
 
+/** 本包自己的目录。Manifest 是「需要哪些模型」的唯一来源，从这里读。 */
+const PACKAGE_ROOT = process.env.TERMUX_OS_PACKAGE_ROOT
+  || path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 const STATUS_FILE = process.env.STATUS_FILE || '.runtime-dev/status.json';
 const CONFIG_FILE = process.env.CONFIG_FILE || '.runtime-dev/conf.v4.json';
 const LEGACY_CONFIG_FILE = process.env.LEGACY_CONFIG_FILE || '';
@@ -514,36 +518,41 @@ const senseFrontend = await resolveAssetRoot('model.sensevoice.frontend');
 console.log(`[termux-speech] model.sensevoice.frontend ${senseFrontend.version} → ${senseFrontend.root}`);
 
 /**
- * ⭐ ctx 与源图都是 `optional`：它们不在安装时到位，而是在**这里**——服务起来、
- * 准备好转写的那一刻——才按本机架构取。取哪一份不由本包决定，本包只说得出一个 id。
+ * ⭐ **启动只解析，绝不下载。**
+ *
+ * 这两个是几百 MB 到近 1 GB 的东西。在服务启动路径上取它们，等于让「启动」这件事
+ * 在一台干净设备上要花半小时，而且没有任何地方能看见进度——它看起来就是起不来。
+ * 更糟的是取失败会把服务一起带走：使用者失去的恰好是那个能让他去补模型的界面。
+ *
+ * 所以缺就缺着：服务照常起来，ASR 如实报「模型没到位」，由页面上的模型区去下载。
  */
-const onFetch = ({ id, stage, reason, bytes }) => {
-  if (stage === 'start') console.log(`[termux-speech] ${id} not present yet, fetching — ${reason}`);
-  if (stage === 'done') console.log(`[termux-speech] ${id} fetched (${bytes} bytes)`);
-};
-
 let senseCtx = null;
 let senseCtxWhy = null;
 try {
-  senseCtx = await ensureAssetRoot('model.sensevoice.ctx', { onFetch });
+  senseCtx = await resolveAssetRoot('model.sensevoice.ctx');
   console.log(`[termux-speech] model.sensevoice.ctx ${senseCtx.version} → ${senseCtx.root}`);
 } catch (error) {
   senseCtxWhy = String(error?.message ?? error);
-  console.log(`[termux-speech] no precompiled ctx for this device: ${senseCtxWhy}`);
+  console.log(`[termux-speech] no precompiled ctx yet: ${senseCtxWhy}`);
 }
 
 let senseGraph = null;
+let senseGraphWhy = null;
 if (!senseCtx) {
   try {
-    senseGraph = await ensureAssetRoot('model.sensevoice.graph', { onFetch });
+    senseGraph = await resolveAssetRoot('model.sensevoice.graph');
     console.log(`[termux-speech] model.sensevoice.graph ${senseGraph.version} → ${senseGraph.root}`);
   } catch (error) {
-    // 兩條路都斷了才是真失敗，而且要把**兩個**原因都說出來——只報後一個的話，
-    // 使用者會以為問題是「缺源圖」，而真正該做的是裝一份本機架構的 ctx。
-    throw new Error(`SenseVoice has neither a context nor a graph on this device.\n`
-      + `  model.sensevoice.ctx:   ${senseCtxWhy}\n`
-      + `  model.sensevoice.graph: ${String(error?.message ?? error)}`);
+    // ⚠ 两个原因都留着。只报后一个会让人以为该去下那张 937 MB 的图，
+    // 而正确动作多半是取一份本机架构的 ctx。
+    senseGraphWhy = String(error?.message ?? error);
+    console.log(`[termux-speech] no portable graph either: ${senseGraphWhy}`);
   }
+}
+/** SenseVoice 能不能转写。缺模型不是启动失败，是一个如实报出来的未就绪状态。 */
+const senseVoiceReady = Boolean(senseCtx || senseGraph);
+if (!senseVoiceReady) {
+  console.log('[termux-speech] SenseVoice has no model yet; the service starts and the page can fetch one.');
 }
 
 const senseTarget = await (async () => {
@@ -1204,6 +1213,28 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && route === '/status') {
       return send(200, { ok: true, service: 'termux-speech', status: state });
+    }
+    /**
+     * 模型架。⭐ 这是**唯一**能取得或删除语音模型的地方——资产包刻意不出现在
+     * Framework 自己的 Package 页面上，因为一份模型权重属于需要它的那个包。
+     */
+    if (req.method === 'GET' && route === '/models') {
+      return send(200, { ok: true, ...(await listModels(PACKAGE_ROOT)) });
+    }
+    if (req.method === 'POST' && route === '/models/fetch') {
+      const body = await readBody(req);
+      const r = await fetchModel(String(body?.id ?? ''));
+      return send(r.ok ? 200 : 502, r);
+    }
+    if (req.method === 'POST' && route === '/models/install-provider') {
+      const body = await readBody(req);
+      const r = await installProvider(String(body?.id ?? ''));
+      return send(r.ok ? 202 : 409, r);
+    }
+    if (req.method === 'POST' && route === '/models/delete') {
+      const body = await readBody(req);
+      const r = await removeModel(String(body?.id ?? ''));
+      return send(r.ok ? 200 : 409, r);
     }
     if (req.method === 'GET' && route === '/live') {
       hub.markAll();

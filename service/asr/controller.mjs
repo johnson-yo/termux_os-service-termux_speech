@@ -176,9 +176,13 @@ export class AsrController {
     this.failedFile = path.join(dataRoot, 'failed.v1.jsonl');
     this.config = { ...config };
     if (!frontendRoot) throw new Error('AsrController requires a resolved frontendRoot from the asset map');
-    if (!ctxRoot && !graphRoot) {
-      throw new Error('AsrController needs either a ctx (model.sensevoice.ctx) or the graph (model.sensevoice.graph)');
-    }
+    /**
+     * ⚠ 没有模型不是构造失败，是一个如实报出来的**未就绪**。
+     *
+     * 先前这里直接抛：干净设备上服务因此起不来，而使用者失去的恰好是那个能让他
+     * 去取模型的界面。缺模型时照常构造，`ready` 为 false，转写请求明确拒绝并说明原因。
+     */
+    this.modelReady = Boolean(ctxRoot || graphRoot);
     this.frontendRoot = frontendRoot;
     this.graphRoot = graphRoot;
     // EPContext wrapper 的檔名由 Asset Package 的 `files.graph` 決定；
@@ -450,6 +454,11 @@ export class AsrController {
   async transcribe(segment) {
     const variant = this.config.model ?? 'sensevoice';
     if (variant !== 'sensevoice') return this.transcribeQwen(segment, variant);
+    // ⛔ 缺模型时明确拒绝并说清楚该做什么。不重试——重试解决不了「东西不在盘上」。
+    if (!this.modelReady) {
+      throw new Error('SenseVoice has no model on this device yet. '
+        + 'Open 设置 → 模型 and fetch the context for this device (or the portable graph).');
+    }
     await this.ensureResident();
     const samples = readWavMono16(segment.wav_path);
     const input = makeSenseVoiceInput(samples, this.cmvn);

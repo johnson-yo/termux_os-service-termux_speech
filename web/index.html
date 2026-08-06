@@ -183,6 +183,24 @@
        设置页 —— 按用途分组，不按程序模块分组
        ============================================================ -->
   <section class="page" id="page-settings" role="tabpanel" hidden>
+    <!--
+      模型。⭐ 放在设置页最前面，因为在模型到位之前，下面每一项都还谈不上。
+      资产包刻意不出现在 Framework 的 Package 页面里——一份模型权重属于需要它的那个包，
+      所以取得与删除都在这里。
+    -->
+    <section class="card" id="card-models">
+      <div class="section-title">
+        <div>
+          <h2>模型</h2>
+          <p class="note">语音识别需要的模型。装好之前不能转写。</p>
+        </div>
+        <button id="models-refresh" type="button" class="ghost">刷新</button>
+      </div>
+      <p id="models-summary" class="message"></p>
+      <div id="models-list" class="model-list"></div>
+      <p class="hint">下载会持续几分钟到几十分钟，取决于模型大小与网络。期间可以离开这一页。</p>
+    </section>
+
     <form class="card" id="form-daily">
       <div class="section-title">
         <div>

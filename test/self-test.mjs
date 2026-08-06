@@ -741,21 +741,27 @@ asrDeclares.length = 0;
     'without a context, the graph is required again',
     asr.senseFiles().includes(path.join(senseGraphRoot, 'model.onnx')),
   );
+  /**
+   * ⭐ 没有模型时**服务照常起来**，转写才拒绝。
+   *
+   * 先前这里在构造时就抛，于是一台干净设备上服务根本起不来——而使用者失去的恰好是
+   * 那个能让他去取模型的界面。缺模型是一个要被显示出来、并且能就地补上的状态，
+   * 不是一个让整个服务消失的理由。
+   */
+  const withoutModel = new AsrController({
+    android: { json: asrResidentApi('fixture-asr-none', ['_ctc_logits']) },
+    dataRoot: path.join(temporaryRoot, 'asr-data-none'),
+    frontendRoot: senseFrontendRoot,
+    residentId: 'fixture-asr-none',
+    config: { enabled: true },
+  });
+  test('a missing model does not stop the service from starting',
+    withoutModel.modelReady === false);
   let refused = null;
-  try {
-    // eslint-disable-next-line no-new
-    new AsrController({
-      android: { json: asrResidentApi('fixture-asr-none', ['_ctc_logits']) },
-      dataRoot: path.join(temporaryRoot, 'asr-data-none'),
-      frontendRoot: senseFrontendRoot,
-      residentId: 'fixture-asr-none',
-      config: { enabled: true },
-    });
-  } catch (error) { refused = String(error.message); }
-  test(
-    'neither a context nor a graph is refused at construction, naming both',
-    refused !== null && refused.includes('model.sensevoice.ctx') && refused.includes('model.sensevoice.graph'),
-  );
+  await withoutModel.transcribe({ wav_path: path.join(temporaryRoot, 'nope.wav') })
+    .catch((error) => { refused = String(error.message); });
+  test('transcription refuses with the place the model can be fetched from',
+    refused !== null && refused.includes('模型'));
 }
 
 const asrWarm = new AsrController({
@@ -925,7 +931,7 @@ const appJs = ['web/app.js', 'web/views.js']
 const styleCss = fs.readFileSync(path.join(root, 'web/style.css'), 'utf8');
 test(
   'Manifest declares every speech Capability and locates SenseVoice through assets, not paths',
-  manifest.version === '0.18.0'
+  manifest.version === '0.19.0'
     && manifest.id === 'github.termux-os.service.termux-speech'
     && manifest.capabilities.requires.some((item) => item.id === 'termux-os.app.api' && item.required)
     && manifest.capabilities.provides.some((item) => item.id === 'speech.input')
@@ -978,13 +984,45 @@ test(
      * 「缺了就取」與「缺了就死」——而缺的那一刻不會有任何語法錯誤提醒任何人。
      */
     assetsSource.includes('export async function ensureAssetRoot')
-      // ctx 与源图：服务起来准备转写的那一刻
-      && /senseCtx = await ensureAssetRoot\('model\.sensevoice\.ctx'/.test(mainSource)
-      && /senseGraph = await ensureAssetRoot\('model\.sensevoice\.graph'/.test(mainSource)
+      // ⛔ 启动路径上**不许**出现下载。几百 MB 的取用发生在页面显式点下载时。
+      && !/ensureAssetRoot\('model\.sensevoice/.test(mainSource)
+      && /senseCtx = await resolveAssetRoot\('model\.sensevoice\.ctx'/.test(mainSource)
       // Qwen：选中那一档的那一刻（注入给 AsrController 的解析器）
       && /resolveAsset: \(id\) => ensureAssetRoot\(id/.test(mainSource)
       // 只有 optional 的资产走得通这条路；必需的仍然必须装的时候到位
       && assetsSource.includes('not_optional'),
+  );
+  const modelsSource = fs.readFileSync(path.join(root, 'service/models.mjs'), 'utf8');
+  const indexHtmlModels = fs.readFileSync(path.join(root, 'web/index.html'), 'utf8');
+  const appJsModels = fs.readFileSync(path.join(root, 'web/app.js'), 'utf8');
+  test(
+    'a model can be obtained and removed from this page, with no other route to it',
+    /**
+     * ⭐ 资产包刻意不出现在 Framework 的 Package 页面里，所以这里必须是完整的入口：
+     * 看得到状态、下得了、删得掉。少任何一半，setup 就走不完——而「装了却不能用」
+     * 正是这套东西要消灭的状态。
+     */
+    /export async function listModels/.test(modelsSource)
+      && /export async function fetchModel/.test(modelsSource)
+      && /export async function removeModel/.test(modelsSource)
+      && /route === '\/models'/.test(mainSource)
+      && /route === '\/models\/fetch'/.test(mainSource)
+      && /route === '\/models\/delete'/.test(mainSource)
+      // ⭐ 资产包也从这里装：少这一条，Qwen 档位就永远停在「资产包未安装」而无路可走。
+      && /export async function installProvider/.test(modelsSource)
+      && /route === '\/models\/install-provider'/.test(mainSource)
+      && appJsModels.includes("'install-provider'")
+      && indexHtmlModels.includes('id="models-list"')
+      && appJsModels.includes('renderModels'),
+  );
+  test(
+    'the three kinds of "not here" stay three different answers',
+    /**
+     * ⚠ 能下的就下、本机没有对应硬件版本的下了也没用、资产包没装的要先装包——
+     * 三件事的下一步动作完全不同，压成一句「缺失」等于什么都没说。
+     */
+    /no_variant/.test(modelsSource) && /no_provider/.test(modelsSource)
+      && appJsModels.includes('no_variant') && appJsModels.includes('no_provider'),
   );
   test(
     'a missing model reports both why it was missing and why the fetch failed',

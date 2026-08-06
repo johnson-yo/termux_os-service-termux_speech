@@ -461,3 +461,19 @@ pre {
 }
 .group-list strong { font-size: .9rem; }
 .group-list small { opacity: .72; font-size: .78rem; text-align: right; }
+
+/* 模型架。一行一个模型：名字 + 状态 + 一个动作，390dp 下不换行不溢出。 */
+.model-list { display: flex; flex-direction: column; gap: 8px; }
+.model-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px; border: 1px solid var(--line); border-radius: 8px;
+}
+.model-row .model-main { flex: 1 1 auto; min-width: 0; }
+.model-row .model-name {
+  display: block; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.model-row .model-state { display: block; font-size: 12px; color: var(--muted); }
+.model-row button { flex: 0 0 auto; min-height: var(--touch); }
+.model-row.is-present { border-color: var(--ok); }
+.model-row.is-blocked { border-color: var(--warn); }
