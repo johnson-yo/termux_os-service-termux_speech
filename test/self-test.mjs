@@ -931,7 +931,7 @@ const appJs = ['web/app.js', 'web/views.js']
 const styleCss = fs.readFileSync(path.join(root, 'web/style.css'), 'utf8');
 test(
   'Manifest declares every speech Capability and locates SenseVoice through assets, not paths',
-  manifest.version === '0.19.0'
+  manifest.version === '0.19.1'
     && manifest.id === 'github.termux-os.service.termux-speech'
     && manifest.capabilities.requires.some((item) => item.id === 'termux-os.app.api' && item.required)
     && manifest.capabilities.provides.some((item) => item.id === 'speech.input')
@@ -948,7 +948,13 @@ test(
      * 一個讀得出值、答的卻是另一個問題的探針。位置的唯一真相是 assets.requires。
      */
     && !manifest.runtime.external.some((item) => item.id.startsWith('sensevoice'))
-    && manifest.runtime.bundled.length === 0,
+    && manifest.runtime.bundled.length === 0
+    /**
+     * ⚠ `release.repository` 少了没有任何症状：包照样装、照样跑，只是管理页上的
+     * 「更新」按钮永远是灰的，而没有一个地方说得出为什么。
+     */
+    && typeof manifest.release?.repository === 'string'
+    && manifest.release.repository.includes('termux_os-service-termux_speech'),
 );
 test(
   'the Qwen tiers are optional, so nothing is downloaded until a tier is chosen',

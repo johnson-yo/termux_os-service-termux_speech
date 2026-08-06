@@ -1,5 +1,10 @@
 # Release notes — github.termux-os.service.termux-speech
 
+## 0.19.1
+
+- Declare `release.repository`. Without it the admin console's Update button for this Package
+  stayed greyed out, with nothing anywhere saying why.
+
 ## 0.19.0 — models are obtained from this page
 
 - **The service starts without a model.** It used to download the SenseVoice context inside service
