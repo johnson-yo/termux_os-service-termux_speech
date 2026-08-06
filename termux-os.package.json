@@ -1,0 +1,206 @@
+{
+  "schema": "termux-os.package.v1",
+  "id": "github.termux-os.service.termux-speech",
+  "name": "Termux Speech",
+  "version": "0.18.0",
+  "description": "Runs a last-owner RMS/KWS/VAD/ASR pipeline with App-HTP FireRedVAD, SenseVoice WAV transcription, a dictation listen mode, speech.idle, live transcript feeds, a switchable ASR model (SenseVoice / Qwen3-ASR Q4 / Q8), and a live available-memory readout.",
+  "types": [
+    "service"
+  ],
+  "compatibility": {
+    "framework": ">=0.2.22"
+  },
+  "entrypoints": {
+    "backend": "package.mjs",
+    "webui": "web/index.html"
+  },
+  "admin": {
+    "title": "Termux Speech"
+  },
+  "verification": {
+    "device": {
+      "command": "node scripts/verify-device.mjs",
+      "timeout_ms": 120000,
+      "requires_running": true
+    }
+  },
+  "components": {
+    "services": [
+      "termux-speech"
+    ],
+    "actions": [
+      "speech.input.read",
+      "speech.idle.request",
+      "speech.listen.set"
+    ],
+    "apps": []
+  },
+  "capabilities": {
+    "provides": [
+      {
+        "id": "speech.input",
+        "provider": "termux-speech",
+        "kind": "action",
+        "action": "speech.input.read"
+      },
+      {
+        "id": "speech.activity",
+        "provider": "termux-speech",
+        "kind": "feed",
+        "service": "termux-speech",
+        "endpoint": "/api/packages/github.termux-os.service.termux-speech/vad/activity"
+      },
+      {
+        "id": "speech.transcript",
+        "provider": "termux-speech",
+        "kind": "feed",
+        "service": "termux-speech",
+        "endpoint": "/api/packages/github.termux-os.service.termux-speech/asr/transcripts"
+      },
+      {
+        "id": "speech.idle",
+        "provider": "termux-speech",
+        "kind": "action",
+        "action": "speech.idle.request"
+      },
+      {
+        "id": "speech.listen",
+        "provider": "termux-speech",
+        "kind": "action",
+        "action": "speech.listen.set"
+      }
+    ],
+    "requires": [
+      {
+        "id": "termux-os.app.api",
+        "required": true
+      }
+    ]
+  },
+  "states": {
+    "provides": [
+      {
+        "id": "speech.input",
+        "type": "bool",
+        "service": "termux-speech",
+        "description": "Persistent Mic capture is live and PCM frames are fresh"
+      },
+      {
+        "id": "speech.stage",
+        "type": "enum",
+        "values": [
+          "rms",
+          "kws",
+          "vad",
+          "asr"
+        ],
+        "service": "termux-speech",
+        "description": "Current Pipeline lease owner"
+      },
+      {
+        "id": "speech.voice",
+        "type": "bool",
+        "service": "termux-speech",
+        "description": "FireRedVAD says someone is speaking right now"
+      },
+      {
+        "id": "audio.input.route",
+        "type": "enum",
+        "values": [
+          "built_in",
+          "bluetooth",
+          "wired",
+          "usb",
+          "unknown"
+        ],
+        "service": "termux-speech",
+        "description": "Actual Android input route class"
+      }
+    ]
+  },
+  "menu": [
+    {
+      "parent": "/admin/services",
+      "path": "/packages/github.termux-os.service.termux-speech/",
+      "title": "Termux Speech",
+      "order": 100
+    }
+  ],
+  "ports": [
+    {
+      "id": "http",
+      "protocol": "http",
+      "visibility": "loopback",
+      "health": "/health"
+    }
+  ],
+  "runtime": {
+    "framework": {
+      "commands": [
+        "node"
+      ]
+    },
+    "termux_packages": [],
+    "bundled": [],
+    "external": []
+  },
+  "packages": {
+    "requires": [
+      {
+        "id": "github.termux-os.asset.fireredvad",
+        "version": ">=1.0.0",
+        "required": true
+      },
+      {
+        "id": "github.termux-os.asset.sensevoice",
+        "version": ">=3.0.0",
+        "required": true
+      },
+      {
+        "id": "github.termux-os.asset.qwen3asr",
+        "version": ">=1.1.0",
+        "required": false
+      }
+    ]
+  },
+  "integrations": {
+    "requires": [
+      {
+        "capability": "termux-os.app.api",
+        "required": true
+      }
+    ]
+  },
+  "assets": {
+    "requires": [
+      {
+        "id": "model.fireredvad",
+        "required": true
+      },
+      {
+        "id": "model.sensevoice.frontend",
+        "required": true
+      },
+      {
+        "id": "model.sensevoice.ctx",
+        "required": false
+      },
+      {
+        "id": "model.sensevoice.graph",
+        "required": false
+      },
+      {
+        "id": "model.qwen3asr.encoder",
+        "required": false
+      },
+      {
+        "id": "model.qwen3asr.decoder.q4",
+        "required": false
+      },
+      {
+        "id": "model.qwen3asr.decoder.q8",
+        "required": false
+      }
+    ]
+  }
+}

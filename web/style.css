@@ -1,0 +1,463 @@
+/**
+ * SPDX-License-Identifier: Apache-2.0
+ * [INPUT]: The three-page Overview/Settings/Diagnostics markup plus live stage/owner/health classes.
+ * [OUTPUT]: A 390dp-first dark layout with 48dp touch targets, meters, and no page-level h-scroll.
+ * [POS]: Dependency-free Package visual layer; only the active page scrolls, never the whole body.
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+:root {
+  color-scheme: dark;
+  --bg:#090d12;
+  --card:#141b24;
+  --panel:#0d141d;
+  --line:#283545;
+  --text:#eef5fc;
+  --muted:#97a7b8;
+  --blue:#68a9ff;
+  --cyan:#4fd9e8;
+  --good:#5ddb9b;
+  --amber:#ffc66c;
+  --bad:#ff7e82;
+  /* 触控高度基准。Plan 要求主要按钮与导航 ≥48dp，写成变量免得逐处漂移。 */
+  --touch:48px;
+}
+* { box-sizing:border-box; }
+html { min-width:0; overflow-x:hidden; }
+body {
+  margin:0;
+  /* 整页不滚：滚的只有当前那一页。头部与导航任何时候都不该被滑走。 */
+  overflow:hidden;
+  padding:10px;
+  color:var(--text);
+  background:
+    radial-gradient(circle at 16% 0,#122640 0,transparent 34%),
+    radial-gradient(circle at 88% 8%,#173029 0,transparent 26%),
+    var(--bg);
+  font:15px/1.45 system-ui,sans-serif;
+}
+main {
+  display:flex;
+  flex-direction:column;
+  width:min(720px,100%);
+  /* 减掉 body 内边距与 Dev 横幅（fixed 覆盖层，高度由 JS 实测写进 --chrome-top） */
+  height:calc(100dvh - 20px - var(--chrome-top, 0px));
+  margin:var(--chrome-top, 0px) auto 0;
+}
+
+/* ---------- 头部 ---------- */
+header {
+  display:flex;
+  flex:0 0 auto;
+  justify-content:space-between;
+  align-items:center;
+  gap:10px;
+  padding-bottom:8px;
+}
+.head-left { min-width:0; }
+h1 { margin:0; font-size:1rem; letter-spacing:-.02em; }
+h2 { margin:0 0 4px; font-size:.9rem; }
+.subtitle,.note { margin:1px 0 0; color:var(--muted); font-size:.7rem; overflow-wrap:anywhere; }
+.header-right { display:flex; flex:none; align-items:center; gap:6px; }
+.badge {
+  flex:none;
+  padding:4px 8px;
+  border-radius:999px;
+  background:#29313c;
+  color:var(--muted);
+  font-size:.66rem;
+  font-weight:900;
+  letter-spacing:.04em;
+  white-space:nowrap;
+}
+.badge.ok { background:#123d2b; color:var(--good); }
+.badge.warn { background:#463723; color:var(--amber); }
+.badge.bad { background:#4b282d; color:var(--bad); }
+.badge.tag { background:#22262e; color:var(--muted); letter-spacing:.02em; text-transform:none; }
+.badge.mem { font-variant-numeric:tabular-nums; }
+.good { color:var(--good)!important; }
+.bad { color:var(--bad)!important; }
+
+/* ---------- 三页导航 ---------- */
+.tabs {
+  display:grid;
+  flex:0 0 auto;
+  grid-template-columns:repeat(3,1fr);
+  gap:6px;
+  margin-bottom:10px;
+}
+.tab {
+  min-height:var(--touch);
+  padding:0 6px;
+  border:1px solid var(--line);
+  border-radius:11px;
+  background:var(--panel);
+  color:var(--muted);
+  font:750 .84rem/1 system-ui,sans-serif;
+  cursor:pointer;
+  transition:border-color .18s,background .18s,color .18s;
+}
+.tab[aria-selected="true"] { border-color:var(--blue); background:#18202c; color:var(--blue); }
+
+/* ---------- 页面容器：只有它滚 ---------- */
+.page {
+  flex:1 1 auto;
+  min-height:0;
+  overflow-y:auto;
+  overscroll-behavior:contain;
+  padding-bottom:4px;
+}
+.page[hidden] { display:none; }
+
+.card {
+  margin-bottom:10px;
+  padding:12px;
+  border:1px solid var(--line);
+  border-radius:14px;
+  background:rgba(20,27,36,.95);
+  box-shadow:0 10px 26px #0005;
+}
+.card:last-child { margin-bottom:0; }
+.section-title { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }
+
+/* ---------- 事实格 ---------- */
+.facts,.rms-metrics,.kws-metrics,.vad-metrics,.asr-metrics {
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:7px;
+  margin:11px 0 0;
+}
+.facts > div,.rms-metrics > div,.kws-metrics > div,.vad-metrics > div,.asr-metrics > div {
+  min-width:0;
+  padding:8px;
+  border:1px solid var(--line);
+  border-radius:10px;
+  background:var(--panel);
+}
+.facts span,.rms-metrics span,.kws-metrics span,.vad-metrics span,.asr-metrics span {
+  display:block;
+  color:var(--muted);
+  font-size:.62rem;
+}
+.facts strong,.rms-metrics strong,.kws-metrics strong,.vad-metrics strong,.asr-metrics strong {
+  display:block;
+  margin-top:3px;
+  min-width:0;
+  color:#e6f1fc;
+  /* 长设备名/长路由不许撑破窄屏，也不许被裁到看不出是什么 */
+  overflow-wrap:anywhere;
+  font-size:.78rem;
+}
+/* 概览的三格在 390dp 下竖排更好读：一行一件事，不挤成三条竖缝 */
+.ov-facts { grid-template-columns:1fr; }
+.ov-facts strong { font-size:.86rem; }
+.states-grid { grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); }
+.states-grid strong { font-variant-numeric:tabular-nums; }
+
+/* ---------- 听写 ---------- */
+.listen-card button.wide { width:100%; margin-top:11px; }
+.listen-card.held { border-color:#5b4a22; }
+.listen-card.engaged { border-color:#2f6f52; }
+
+/* ---------- 流水线（阶段节点，非进度条） ---------- */
+.stages { margin:11px 0 0; padding:0; list-style:none; }
+.stage-row {
+  position:relative;
+  display:grid;
+  grid-template-columns:18px minmax(0,1fr) auto;
+  align-items:center;
+  gap:9px;
+  min-height:44px;
+  padding:5px 0;
+}
+/* 竖向连线：表示「流到下一站」，画在圆点下方的间隙里 */
+.stage-row + .stage-row::before {
+  content:"";
+  position:absolute;
+  left:8px;
+  top:-9px;
+  width:2px;
+  height:18px;
+  background:var(--line);
+}
+.stage-row.flow::before { background:var(--good); }
+.stage-row > i {
+  width:16px;
+  height:16px;
+  border:2px solid var(--line);
+  border-radius:50%;
+  background:var(--panel);
+}
+.stage-row > div { min-width:0; }
+.stage-row strong { display:block; color:#dce8f7; font-size:.84rem; }
+.stage-row small { display:block; color:var(--muted); font-size:.68rem; overflow-wrap:anywhere; }
+.stage-row.active > i { border-color:var(--good); background:var(--good); box-shadow:0 0 10px #5ddb9b66; }
+.stage-row.active strong { color:var(--good); }
+/* owner 是「谁能关门」，与「谁在工作」是两件事，所以是独立标记而不是同一种高亮。 */
+.own-tag {
+  flex:none;
+  padding:3px 7px;
+  border:1px solid var(--amber);
+  border-radius:999px;
+  color:var(--amber);
+  font-size:.6rem;
+  font-weight:800;
+  visibility:hidden;
+}
+.stage-row.owner .own-tag { visibility:visible; }
+
+/* ---------- 转写 ---------- */
+.wav-fact,.transcript-fact {
+  display:grid;
+  gap:3px;
+  margin-top:11px;
+  padding:10px;
+  border:1px solid var(--line);
+  border-radius:10px;
+  background:var(--panel);
+}
+.wav-fact span,.transcript-fact span { color:var(--muted); font-size:.62rem; }
+.wav-fact strong,.wav-fact small,.transcript-fact strong,.transcript-fact small {
+  min-width:0;
+  overflow-wrap:anywhere;
+}
+.transcript-fact strong { color:#e6f1fc; font-size:1rem; line-height:1.35; }
+.wav-fact strong { color:#e6f1fc; font-size:.76rem; }
+.wav-fact small,.transcript-fact small { color:var(--muted); font-size:.66rem; }
+.tx-list { margin:9px 0 0; padding:0; list-style:none; }
+.tx-list li {
+  display:grid;
+  grid-template-columns:minmax(0,1fr) auto;
+  align-items:start;
+  gap:8px;
+  padding:8px 0;
+  border-top:1px solid #22303f;
+}
+.tx-list p { margin:0; color:#dce8f7; font-size:.8rem; overflow-wrap:anywhere; }
+.tx-list small { display:block; margin-top:2px; color:var(--muted); font-size:.64rem; overflow-wrap:anywhere; }
+
+/* ---------- 诊断结论 ---------- */
+.diag-summary { margin:10px 0 0; padding:0; list-style:none; }
+.diag-summary li {
+  display:grid;
+  grid-template-columns:16px minmax(0,1fr);
+  gap:8px;
+  padding:5px 0;
+  font-size:.8rem;
+  overflow-wrap:anywhere;
+}
+.diag-summary li::before { content:"•"; color:var(--muted); }
+.diag-summary li.ok::before { content:"✓"; color:var(--good); }
+.diag-summary li.warn::before { content:"!"; color:var(--amber); }
+.diag-summary li.bad::before { content:"✕"; color:var(--bad); }
+.diag-summary li.unknown::before { content:"?"; color:var(--muted); }
+
+/* ---------- 表单 ---------- */
+label { display:block; margin:12px 0 5px; color:var(--muted); font-size:.74rem; }
+label .when {
+  float:right;
+  color:#7d8fa3;
+  font-size:.62rem;
+  font-style:normal;
+}
+.hint { margin:5px 0 0; color:#7d8fa3; font-size:.66rem; overflow-wrap:anywhere; }
+.hint code { font-size:.95em; }
+input[type="range"] { width:100%; accent-color:var(--blue); }
+input[type="number"],input[type="text"],select {
+  width:100%;
+  min-height:44px;
+  padding:0 9px;
+  border:1px solid var(--line);
+  border-radius:9px;
+  color:var(--text);
+  background:#0d141d;
+  font:inherit;
+}
+.inline-apply { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; }
+.unit-input { position:relative; }
+.unit-input input { padding-right:30px; }
+.unit-input span { position:absolute; right:8px; top:50%; color:var(--muted); transform:translateY(-50%); font-size:.7rem; }
+.gate-field { display:grid; grid-template-columns:minmax(0,1fr) 96px; align-items:center; gap:10px; }
+.config-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+.form-actions { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:10px; margin-top:14px; }
+.form-actions .message { flex:1 1 100%; }
+.form-actions button { flex:1 1 auto; }
+.toggle-line {
+  display:flex;
+  min-height:var(--touch);
+  align-items:center;
+  gap:9px;
+  margin:10px 0 0;
+  padding:8px 10px;
+  border:1px solid var(--line);
+  border-radius:9px;
+  background:var(--panel);
+  color:#dce8f7;
+}
+.toggle-line input { width:20px; height:20px; margin:0; accent-color:var(--good); }
+.toggle-line span { font-size:.76rem; }
+.actions { display:flex; gap:8px; margin-top:12px; }
+.actions button { flex:1; }
+button {
+  min-height:var(--touch);
+  padding:9px 14px;
+  border:1px solid transparent;
+  border-radius:10px;
+  background:#347cf0;
+  color:#fff;
+  font:750 .86rem/1.2 system-ui,sans-serif;
+  cursor:pointer;
+}
+button.secondary { background:#243143; color:#dce9fa; }
+button.danger { background:#522b31; color:#ffc4c7; }
+button:disabled { opacity:.5; cursor:not-allowed; }
+.setup-link {
+  display:inline-flex;
+  min-height:var(--touch);
+  align-items:center;
+  color:var(--blue);
+  font-size:.8rem;
+  font-weight:750;
+  text-decoration:none;
+}
+.message { min-height:1.3em; margin:8px 0 0; font-size:.76rem; overflow-wrap:anywhere; }
+
+/* ---------- 计量条 ---------- */
+.rms-bar {
+  position:relative;
+  height:44px;
+  margin-top:11px;
+  overflow:visible;
+  border:1px solid #314055;
+  border-radius:10px;
+  background:
+    repeating-linear-gradient(90deg,transparent 0,transparent calc(10% - 1px),#ffffff0c 10%),
+    #0a1119;
+}
+.rms-fill {
+  position:absolute;
+  inset:0 auto 0 0;
+  width:0;
+  border-radius:9px;
+  background:linear-gradient(90deg,#3079c9,var(--cyan));
+  box-shadow:0 0 18px #4fd9e833;
+  /* ⛔ 这里曾经是 `transition:width .16s linear`。值每 200ms 变一次，而过渡要 160ms——
+     动画永远跑不完，于是浏览器一直在做**布局驱动**的连续动画。真机实测：诊断页可见时
+     Chrome 21.5% 的一个核，同一页零推送只要 4.4%，差额几乎全在这三条量表上。
+     现在只留颜色过渡，宽度直接落位——量表本来就是读数，不是动效。 */
+  transition:background .18s ease;
+}
+.gate-open .rms-fill { background:linear-gradient(90deg,#2c9f72,var(--good)); box-shadow:0 0 20px #5ddb9b44; }
+.threshold-marker {
+  position:absolute;
+  top:-1px;
+  bottom:-1px;
+  width:2px;
+  background:var(--amber);
+  transform:translateX(-1px);
+}
+.threshold-marker span {
+  position:absolute;
+  top:-15px;
+  left:50%;
+  color:inherit;
+  transform:translateX(-50%);
+  font:700 .52rem/1 system-ui,sans-serif;
+}
+.rms-bar b {
+  position:absolute;
+  right:9px;
+  top:50%;
+  z-index:2;
+  transform:translateY(-50%);
+  color:#f4f9ff;
+  font:750 .78rem/1 ui-monospace,monospace;
+  text-shadow:0 1px 4px #000;
+}
+.bar-scale { display:flex; justify-content:space-between; margin-top:5px; color:#708195; font-size:.58rem; }
+.kws-meter,.vad-meter {
+  position:relative;
+  height:42px;
+  margin-top:11px;
+  overflow:hidden;
+  border:1px solid #314055;
+  border-radius:10px;
+  background:#0a1119;
+}
+.kws-fill,.vad-fill {
+  position:absolute;
+  inset:0 auto 0 0;
+  width:0;
+  border-radius:9px;
+  background:linear-gradient(90deg,#315f9b,var(--cyan));
+  box-shadow:0 0 18px #4fd9e833;
+  /* ⛔ 同上：宽度不做过渡。 */
+}
+.kws-fill.hit,.vad-fill.speech { background:linear-gradient(90deg,#2c9f72,var(--good)); }
+.kws-threshold,.vad-threshold { position:absolute; inset:0 auto 0 80%; z-index:2; width:2px; background:var(--amber); }
+.kws-meter b,.vad-meter b {
+  position:absolute;
+  left:9px;
+  right:9px;
+  top:50%;
+  z-index:3;
+  overflow:hidden;
+  transform:translateY(-50%);
+  color:#f4f9ff;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  font:750 .74rem/1 ui-monospace,monospace;
+  text-shadow:0 1px 4px #000;
+}
+.badge-stack { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:5px; }
+
+/* ---------- 折叠区 ---------- */
+.dev-zone,.raw { padding:12px; }
+.dev-zone > summary,.raw > summary {
+  min-height:26px;
+  color:var(--muted);
+  font-size:.76rem;
+  letter-spacing:.03em;
+  cursor:pointer;
+}
+.dev-zone > summary { color:var(--amber); font-weight:750; }
+.dev-zone button { width:100%; margin-top:10px; }
+pre {
+  max-height:340px;
+  overflow:auto;
+  margin:10px 0 0;
+  padding:10px;
+  border:1px solid var(--line);
+  border-radius:9px;
+  background:#0b1118;
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+  font:12px/1.45 ui-monospace,monospace;
+}
+.alerts ul { margin:8px 0 0; padding-left:18px; }
+.alerts li { color:var(--amber); font-size:.78rem; overflow-wrap:anywhere; }
+
+/* ---------- 窄屏 ---------- */
+@media (max-width:400px) {
+  body { padding:8px; }
+  .facts,.rms-metrics,.kws-metrics,.vad-metrics,.asr-metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .facts > div:last-child:nth-child(odd),
+  .rms-metrics > div:last-child:nth-child(odd),
+  .kws-metrics > div:last-child:nth-child(odd),
+  .vad-metrics > div:last-child:nth-child(odd),
+  .asr-metrics > div:last-child:nth-child(odd) { grid-column:1/-1; }
+  .ov-facts { grid-template-columns:1fr; }
+  .config-grid { grid-template-columns:1fr; }
+  .form-actions button { width:100%; }
+}
+@media (prefers-reduced-motion:reduce) {
+  *,*::before,*::after { scroll-behavior:auto!important; transition:none!important; animation:none!important; }
+}
+
+/* 记录分组（docs/061 §七/§八）。只列盘上那两组，不列全生命周期累计。 */
+.group-list { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 6px; }
+.group-list li {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 8px 10px; border-radius: 8px; background: var(--surface-2, rgba(255,255,255,.04));
+}
+.group-list strong { font-size: .9rem; }
+.group-list small { opacity: .72; font-size: .78rem; text-align: right; }

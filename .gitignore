@@ -1,0 +1,11 @@
+node_modules/
+.runtime/
+.runtime-dev/
+dist/
+*.log
+
+# Development checkpoint and SDK state: working tree only.
+# HANDOFF.md records which device, which mount and where local credentials live —
+# none of which belongs in a public source tree.
+HANDOFF.md
+.sdk/

@@ -1,0 +1,142 @@
+# Tagging produces the Release: the manifest version must equal the tag, every shipped
+# script must parse, every allowlisted file must exist, and the archive is built
+# reproducibly from public-files.txt with a SHA-256 beside it.
+#
+# Why reproducible: the Registry identifies a source_tar by hash. If the same input
+# produced a different file each time, "it installed locally but the catalog served
+# something else" becomes possible while both sides look correct. So the tar fixes
+# ordering, timestamps and ownership rather than inheriting the checkout's mtimes.
+#
+# Deliberately no third-party action for the release step — ubuntu-latest ships gh,
+# and that is one fewer supply-chain dependency on someone else's repository.
+name: release
+
+on:
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'existing tag to release'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Manifest version must match the tag
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="$(node -p "require('./termux-os.package.json').version")"
+          echo "tag=$tag manifest=$version"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag $tag does not match manifest version $version — align them before tagging"
+            exit 1
+          fi
+
+      - name: Syntax check every shipped script
+        run: |
+          set -euo pipefail
+          while read -r f; do
+            case "$f" in \#*|'') continue;; esac
+            case "$f" in *.mjs|*.js) echo "checking $f"; node --check "$f";; esac
+          done < public-files.txt
+
+      - name: Every allowlisted file must exist
+        run: |
+          set -euo pipefail
+          missing=0
+          while read -r f; do
+            case "$f" in \#*|'') continue;; esac
+            [ -f "$f" ] || { echo "::error::listed in public-files.txt but absent: $f"; missing=1; }
+          done < public-files.txt
+          exit $missing
+
+      - name: Forbidden content
+        # ⚠ 这道扫描本来只在 `pack` 与安装期跑，而 CI 是按 public-files.txt 自己打包的——
+        # 于是整条发布链路绕过了它，一个引用其他项目的注释一路进了公开归档，直到别人
+        # **安装**时才被拒。发布端不检查、只靠消费端兜底，就是把错误留到最贵的地方才发现。
+        #
+        # ⛔ 清单**不抄进这里**。它是一份「不许出现的字符串」的名单，而本文件也在公开树里、
+        # 也会被同一份名单扫——把名字写下来就是再发布一次。所以从 Framework 拉权威副本，
+        # 钉在一个具体 tag 上。
+        run: |
+          set -euo pipefail
+          # 取整个 tag 归档而不是单个文件：runtime-contract.mjs 有相对 import，
+          # 单独拉下来会以 ERR_MODULE_NOT_FOUND 失败。
+          curl -fsSL -o /tmp/fw.tar.gz \
+            "https://github.com/johnson-yo/termux-os-framework/archive/refs/tags/${FRAMEWORK_REF}.tar.gz"
+          mkdir -p /tmp/fw && tar -xzf /tmp/fw.tar.gz -C /tmp/fw --strip-components=1
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const { FORBIDDEN_PATTERNS } = await import("/tmp/fw/src/packages/runtime-contract.mjs");
+            const files = readFileSync("public-files.txt", "utf8").split("\n")
+              .map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+            let bad = 0;
+            for (const f of files) {
+              const text = readFileSync(f, "utf8");
+              text.split("\n").forEach((line, i) => {
+                for (const p of FORBIDDEN_PATTERNS) {
+                  if (p.re.test(line)) {
+                    console.log(`::error file=${f},line=${i + 1}::${p.why} — ${line.trim().slice(0, 100)}`);
+                    bad += 1;
+                  }
+                }
+              });
+            }
+            // ⚠ 刻意**不豁免** .md：Framework 的扫描跳过文档（NOTICE 要能提及来源），
+            // 但文档同样进归档，而泄漏最初就发生在一句注释和两份 .md 里。
+            console.log(bad ? `${bad} finding(s)` : "clean");
+            process.exit(bad ? 1 : 0);
+          '
+        env:
+          FRAMEWORK_REF: '0.2.23'
+
+      - name: Host test suites
+        run: |
+          set -euo pipefail
+          for t in test/*.mjs; do echo "== $t"; node "$t"; done
+
+      - name: Build reproducible archive
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          name="termux-speech-$tag"
+          mkdir -p "dist/$name"
+          while read -r f; do
+            case "$f" in \#*|'') continue;; esac
+            mkdir -p "dist/$name/$(dirname "$f")"
+            cp "$f" "dist/$name/$f"
+          done < public-files.txt
+          find "dist/$name" -exec touch -h -d '2020-01-01T00:00:00Z' {} +
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime='2020-01-01 00:00:00Z' --format=gnu \
+              -czf "dist/$name.tar.gz" -C dist "$name"
+          ( cd dist && sha256sum "$name.tar.gz" | tee "$name.tar.gz.sha256" )
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          sha="$(cut -d' ' -f1 "dist/termux-speech-$tag.tar.gz.sha256")"
+          notes="$(printf 'Termux Speech %s\n\nArchive SHA-256: `%s`\n\nThe Registry source_tar points at this tag GitHub archive; the asset here is a convenience copy of the same contents.\n' "$tag" "$sha")"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "dist/termux-speech-$tag.tar.gz" "dist/termux-speech-$tag.tar.gz.sha256" --clobber
+          else
+            gh release create "$tag" "dist/termux-speech-$tag.tar.gz" "dist/termux-speech-$tag.tar.gz.sha256" \
+              --title "Termux Speech $tag" --notes "$notes"
+          fi

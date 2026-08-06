@@ -1,0 +1,115 @@
+<!--
+  SPDX-License-Identifier: Apache-2.0
+  [INPUT]: Termux Speech Wake Words routes, Framework Browser Session, and setup.js/setup.css.
+  [OUTPUT]: Voice-enrolled keyword creation, build, one-shot test, stream test, and active-keyword selection.
+  [POS]: Wake Words 0.5.0 setup page migrated into Termux Speech; it receives pinyin text and never browser PCM.
+  [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+-->
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wake Words Setup</title>
+<link rel="stylesheet" href="setup.css">
+</head>
+<body>
+<main class="setup-main">
+  <header class="app-bar">
+    <div>
+      <p class="eyebrow">TERMUX AUDIO · KWS SETUP</p>
+      <h1>Wake Words <small>语音唤醒设置</small></h1>
+    </div>
+    <div class="head-actions">
+      <span id="service-pill" class="pill" title="KWS 状态">·</span>
+      <a href="./">回到 Audio</a>
+    </div>
+  </header>
+
+  <p id="banner" class="banner" hidden></p>
+
+  <section class="view">
+    <div class="step-card">
+      <h2>唤醒词</h2>
+      <p class="hint">给唤醒词起个名字，然后多说几遍。PCM 与 HTP 推理都留在 App，Setup 只接收拼音 token。</p>
+      <label class="more-row">选择已有
+        <select id="profile-picker"><option value="">—</option></select>
+      </label>
+      <div class="create-row">
+        <input id="display-name" maxlength="80" placeholder="新唤醒词名字，如 小明小明" autocomplete="off">
+        <button id="create-profile">新建</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="view-record" class="view" hidden>
+    <div class="active-card">
+      <div class="active-word">
+        <span class="dot-ok"></span>
+        <strong id="active-name">—</strong>
+      </div>
+      <span id="sample-count" class="active-state">还没录音</span>
+      <button id="select-active" class="ghost">设为当前</button>
+      <button id="delete-profile" class="danger ghost">删除</button>
+    </div>
+
+    <div class="step-card">
+      <div class="cue-box">
+        <span id="cue-kind" class="cue-label">第 1 遍</span>
+        <strong>用自然语气说出你的唤醒词</strong>
+        <span class="phrase-cue">“<span id="phrase-cue">—</span>”</span>
+      </div>
+      <button id="record-btn" class="record-btn">● 录这一条</button>
+      <button id="stop-btn" class="record-btn stop" hidden>■ 录完了</button>
+      <p id="record-note" class="note center">点一下，说出唤醒词；说完停顿一下会自动结束。</p>
+    </div>
+
+    <div class="step-card">
+      <h2>你的录音</h2>
+      <p class="hint tiny">多录几遍同一个词。录好后点「生成 / 更新匹配」，该词会自动成为 Audio 当前 Keyword。</p>
+      <div id="sample-list" class="sample-list">
+        <span class="hint tiny">还没有录音</span>
+      </div>
+      <button id="build-btn" class="wide">生成 / 更新匹配</button>
+      <div id="model-summary" class="model-summary" hidden></div>
+    </div>
+
+    <div class="step-card">
+      <h2>试一下（说一次）</h2>
+      <p class="hint tiny">先生成匹配，再说一次。拖动阈值只改变本次判定，不改已保存模型。</p>
+      <button id="test-btn" class="record-btn small">🎤 说一次测试</button>
+      <button id="test-stop" class="record-btn stop" hidden>■ 停止</button>
+      <p id="test-note" class="note center tiny">—</p>
+      <div class="threshold-row">
+        <span>阈值（越高越严）</span>
+        <input id="thresh" type="range" min="0.50" max="0.95" step="0.01" value="0.80">
+        <b id="thresh-val">0.80</b>
+      </div>
+      <div id="test-result" class="test-result" hidden></div>
+    </div>
+
+    <div class="step-card">
+      <h2>试一下（持续监听）</h2>
+      <p class="hint tiny">边说边看匹配度；够高即命中，但保持监听直到手动停止。</p>
+      <button id="stream-btn" class="record-btn small">▶ 开始流式测试</button>
+      <button id="stream-stop" class="record-btn stop" hidden>■ 停止</button>
+      <div class="meter">
+        <div id="meter-fill" class="meter-fill"></div>
+        <div id="meter-thr" class="meter-thr"></div>
+      </div>
+      <div class="stream-row">
+        <span id="stream-state" class="tiny">—</span>
+        <span>匹配 <b id="stream-score">0.00</b> · 命中 <b id="stream-count">0</b></span>
+      </div>
+      <p id="stream-note" class="note center tiny">—</p>
+    </div>
+  </section>
+
+  <p class="boundary">
+    模型来自 <code>model.wake-pinyin.app-htp</code>；这里保存的只有拼音模板和设置，没有 PCM/WAV。
+  </p>
+</main>
+<script src="/admin/session.js"></script>
+<script src="setup.js"></script>
+</body>
+</html>

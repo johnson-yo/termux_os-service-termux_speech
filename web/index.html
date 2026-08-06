@@ -1,0 +1,491 @@
+<!--
+  SPDX-License-Identifier: Apache-2.0
+  [INPUT]: Browser Session APIs/WS for health, listen mode, RMS/KWS/VAD/ASR, state bus, and transcripts.
+  [OUTPUT]: Three phone-first pages — Overview, Settings, Diagnostics — laid out for a 390dp width.
+  [POS]: Package-owned control page; it renders metadata only and never receives PCM or credentials.
+  [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+-->
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Termux Speech</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="head-left">
+      <h1>Termux Speech</h1>
+      <p id="pipeline-note" class="subtitle">正在读取 Live 状态…</p>
+    </div>
+    <div class="header-right">
+      <!-- 实时可用内存：切换 ASR 模型前的参考值。实测峰值 sensevoice 1210MB /
+           qwen3-q4 1899MB / qwen3-q8 2037MB，本机常见可用 2.2–3.0GB，余量很薄。
+           ⚠ 只是参考——docs/053 已证 MemAvailable 不预测大模型能否载入，不做任何自动决策。 -->
+      <span id="mem-avail" class="badge mem" title="实时可用内存（参考值）">MEM —</span>
+      <span id="pipeline-live" class="badge">CONNECTING</span>
+    </div>
+  </header>
+
+  <!--
+    三页导航。旧版把六个 Pipeline 阶段当主导航，于是「日常使用」和「排障」被迫共用一套入口——
+    窄屏上六个格子每个只有约 55px，既点不准也读不完。现在按**使用场景**分页：
+    概览＝日常要看的，设置＝要改的，诊断＝出事才看的。
+    ⚠ 六个阶段的详细数值一个都没删，全部搬进诊断页。
+  -->
+  <nav class="tabs" role="tablist" aria-label="Termux Speech 页面">
+    <button class="tab" role="tab" data-page="overview" aria-controls="page-overview">概览</button>
+    <button class="tab" role="tab" data-page="settings" aria-controls="page-settings">设置</button>
+    <button class="tab" role="tab" data-page="diagnostics" aria-controls="page-diagnostics">诊断</button>
+  </nav>
+
+  <!-- ============================================================
+       概览页 —— 日常使用真正需要的东西，不需要点开任何分页就能看完
+       ============================================================ -->
+  <section class="page" id="page-overview" role="tabpanel" hidden>
+    <section class="card">
+      <div class="section-title">
+        <div>
+          <h2>总体状态</h2>
+          <p id="health-note" class="note">正在读取…</p>
+        </div>
+        <span id="health-badge" class="badge">未知</span>
+      </div>
+      <div class="facts ov-facts">
+        <div><span>麦克风</span><strong id="ov-mic">—</strong></div>
+        <div><span>输入与路由</span><strong id="ov-route">—</strong></div>
+        <div><span>转写模型</span><strong id="ov-model">—</strong></div>
+      </div>
+    </section>
+
+    <!--
+      语音链。⚠ 停链**不是**关麦克风：它真的撤销 Mic 需求、释放唤醒组订阅、卸载
+      VAD/ASR 常驻，而 speech 服务本身继续运行、API 继续可用（docs/061 §二.1）。
+      三行状态各回答一个不同的问题，不可合并：
+        采集 = 麦克风此刻听不听得见（被电话抢占时是 silenced，不是「关了」）
+        唤醒 = RMS+KWS 有没有在守着
+        听写 = VAD+ASR 在不在内存里（unloaded/loading/active/warm/unloading）
+    -->
+    <section class="card chain-card">
+      <div class="section-title">
+        <div>
+          <h2>语音链</h2>
+          <p id="chain-detail" class="note">—</p>
+        </div>
+        <span id="chain-state" class="badge">未知</span>
+      </div>
+      <div class="facts ov-facts">
+        <div><span>采集</span><strong id="ov-capture">—</strong></div>
+        <div><span>唤醒 RMS+KWS</span><strong id="ov-wake">—</strong></div>
+        <div><span>听写 VAD+ASR</span><strong id="ov-dictation">—</strong></div>
+      </div>
+      <button id="chain-toggle" class="wide" type="button">停止语音链</button>
+      <p id="chain-note" class="message"></p>
+    </section>
+
+    <!--
+      听写 Listen。⚠ 这是**模式**不是一次触发：engaged 期间四条自动关门全部让位，
+      退出只由调用方负责。所以「谁持有它」必须显示出来——被 termux-ime 持有时
+      随手一点就关掉，会在用户正打字的时候把 ASR 收工。
+      停链状态下它照样可用：第一次会现场载入 VAD+ASR，那段时间如实显示「载入中」。
+    -->
+    <section class="card listen-card">
+      <div class="section-title">
+        <div>
+          <h2>听写 Listen</h2>
+          <p id="listen-detail" class="note">—</p>
+        </div>
+        <span id="listen-state" class="badge">未听写</span>
+      </div>
+      <button id="listen-toggle" class="wide" type="button">开始听写</button>
+      <p id="listen-note" class="message"></p>
+    </section>
+
+    <!--
+      流水线摘要。⛔ 不是进度条：它不是线性的，也没有百分比——KWS 命中可以直接开门跳过等待，
+      而 VAD 在 ASR 转写期间仍在切下一段。用阶段节点表示，并把两个**互不相同**的维度分开标：
+        active = 这一站此刻真的在干活
+        owner  = 这一站此刻持有关门权
+    -->
+    <section class="card">
+      <div class="section-title">
+        <div>
+          <h2>流水线</h2>
+          <p id="stage-note" class="note">—</p>
+        </div>
+      </div>
+      <ol class="stages">
+        <li class="stage-row" data-stage="input">
+          <i aria-hidden="true"></i>
+          <div><strong>收音</strong><small>—</small></div>
+          <span class="own-tag">关门权</span>
+        </li>
+        <li class="stage-row" data-stage="rms">
+          <i aria-hidden="true"></i>
+          <div><strong>音量门</strong><small>—</small></div>
+          <span class="own-tag">关门权</span>
+        </li>
+        <li class="stage-row" data-stage="kws">
+          <i aria-hidden="true"></i>
+          <div><strong>唤醒或直通</strong><small>—</small></div>
+          <span class="own-tag">关门权</span>
+        </li>
+        <li class="stage-row" data-stage="vad">
+          <i aria-hidden="true"></i>
+          <div><strong>语音切段</strong><small>—</small></div>
+          <span class="own-tag">关门权</span>
+        </li>
+        <li class="stage-row" data-stage="asr">
+          <i aria-hidden="true"></i>
+          <div><strong>语音识别</strong><small>—</small></div>
+          <span class="own-tag">关门权</span>
+        </li>
+      </ol>
+    </section>
+
+    <section class="card">
+      <div class="section-title">
+        <div>
+          <h2>转写结果</h2>
+          <p id="tx-note" class="note">—</p>
+        </div>
+        <button id="tx-copy-latest" class="secondary" type="button">复制最新</button>
+      </div>
+      <div class="transcript-fact">
+        <span>最新</span>
+        <strong id="tx-latest-text">尚未产生转写</strong>
+        <small id="tx-latest-meta">—</small>
+      </div>
+      <!--
+        记录分组（docs/061 §七/§八）。⛔ 这里**不显示全生命周期累计** —— 一个只会
+        单调上涨到几千的数字，对「现在怎么样」这个问题不提供任何信息。
+        显示的是：当前组是第几组、这一组收了多少（N/50）、盘上还留着哪两组、
+        以及那两组的音频还在不在。更旧的组只在 SQLite 里留下文字。
+      -->
+      <div class="facts group-facts">
+        <div><span>当前组</span><strong id="rec-group">—</strong></div>
+        <div><span>本组进度</span><strong id="rec-progress">—</strong></div>
+      </div>
+      <ul id="rec-groups" class="group-list"></ul>
+      <p id="rec-note" class="note">—</p>
+      <ul id="tx-list" class="tx-list"></ul>
+    </section>
+
+    <section class="card alerts" id="alerts" hidden>
+      <div class="section-title"><div><h2>需要注意</h2></div></div>
+      <ul id="alert-list"></ul>
+    </section>
+  </section>
+
+  <!-- ============================================================
+       设置页 —— 按用途分组，不按程序模块分组
+       ============================================================ -->
+  <section class="page" id="page-settings" role="tabpanel" hidden>
+    <form class="card" id="form-daily">
+      <div class="section-title">
+        <div>
+          <h2>日常设置</h2>
+          <p class="note">平时会改的几项。</p>
+        </div>
+      </div>
+
+      <label for="asr-model">转写模型<em class="when">下一段语音起生效</em></label>
+      <div class="inline-apply">
+        <select id="asr-model">
+          <option value="sensevoice">SenseVoice（快 · 峰值约 1.2G）</option>
+          <option value="qwen3-q4">Qwen3-ASR Q4（准 · 峰值约 1.9G）</option>
+          <option value="qwen3-q8">Qwen3-ASR Q8（准 · 峰值约 2.0G）</option>
+        </select>
+        <button id="asr-model-apply" class="secondary" type="button">切换</button>
+      </div>
+      <p id="asr-model-note" class="message"></p>
+
+      <label for="asr-language">识别语言<em class="when">即时生效</em></label>
+      <select id="asr-language">
+        <option value="auto">自动</option>
+        <option value="zh">普通话</option>
+        <option value="yue">粤语</option>
+        <option value="en">English</option>
+        <option value="ja">日本語</option>
+        <option value="ko">한국어</option>
+      </select>
+
+      <label for="active-keyword">唤醒词<em class="when">即时生效</em></label>
+      <select id="active-keyword"><option value="">尚未设置</option></select>
+      <a class="setup-link" href="setup.html">录入 / 生成唤醒词 →</a>
+
+      <label class="toggle-line" for="kws-cue-enabled">
+        <input id="kws-cue-enabled" type="checkbox">
+        <span>唤醒命中时播放提示音</span>
+      </label>
+
+      <label for="asr-end-keywords">结束关键词（逗号分隔）<em class="when">即时生效</em></label>
+      <input id="asr-end-keywords" type="text" placeholder="结束">
+      <label class="toggle-line" for="asr-keyword-enabled">
+        <input id="asr-keyword-enabled" type="checkbox">
+        <span>听到结束关键词就收工</span>
+      </label>
+
+      <div class="form-actions">
+        <p id="daily-note" class="message"></p>
+        <button id="save-daily" type="submit">保存日常设置</button>
+      </div>
+    </form>
+
+    <form class="card" id="form-detect">
+      <div class="section-title">
+        <div>
+          <h2>语音检测</h2>
+          <p class="note">决定「什么时候开始听」和「一段话怎么切」。</p>
+        </div>
+      </div>
+
+      <label for="open-threshold">音量门开启阈值<em class="when">即时生效</em></label>
+      <div class="gate-field">
+        <input id="open-threshold" type="range" min="0.001" max="0.200" step="0.001">
+        <input id="open-number" type="number" min="0.001" max="1" step="0.001" inputmode="decimal">
+      </div>
+      <p class="hint">判据是 1 秒滚动均值 <code>avg_1s</code>，不是瞬时值。合法范围 0.001–1。</p>
+
+      <div class="config-grid">
+        <div>
+          <label for="kws-timeout-seconds">唤醒倒计时<em class="when">即时生效</em></label>
+          <div class="unit-input">
+            <input id="kws-timeout-seconds" type="number" min="1" max="60" step="1" inputmode="numeric">
+            <span>s</span>
+          </div>
+        </div>
+        <div>
+          <label for="vad-timeout-seconds">切段倒计时<em class="when">即时生效</em></label>
+          <div class="unit-input">
+            <input id="vad-timeout-seconds" type="number" min="1" max="60" step="1" inputmode="numeric">
+            <span>s</span>
+          </div>
+        </div>
+        <div>
+          <label for="pcm-pool-seconds">PCM Pool（VAD 回溯）<em class="when">即时生效</em></label>
+          <div class="unit-input">
+            <input id="pcm-pool-seconds" type="number" min="0.5" max="6" step="0.1" inputmode="decimal">
+            <span>s</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="form-actions">
+        <p id="detect-note" class="message"></p>
+        <button id="save-detect" type="submit">保存语音检测</button>
+      </div>
+    </form>
+
+    <form class="card" id="form-recognition">
+      <div class="section-title">
+        <div>
+          <h2>识别与结束</h2>
+          <p class="note">决定「什么时候收工」。</p>
+        </div>
+      </div>
+      <label for="asr-timeout-seconds">无新结果倒计时<em class="when">即时生效</em></label>
+      <div class="unit-input">
+        <input id="asr-timeout-seconds" type="number" min="1" max="120" step="1" inputmode="numeric">
+        <span>s</span>
+      </div>
+      <label class="toggle-line" for="asr-timeout-enabled">
+        <input id="asr-timeout-enabled" type="checkbox">
+        <span>超时自动收工</span>
+      </label>
+      <p class="hint">听写 Listen 期间这两条都不生效——那时只有调用方能收工。</p>
+      <div class="form-actions">
+        <p id="recognition-note" class="message"></p>
+        <button id="save-recognition" type="submit">保存识别与结束</button>
+      </div>
+    </form>
+
+    <section class="card">
+      <div class="section-title">
+        <div>
+          <h2>进阶</h2>
+          <p id="connection-note" class="note">正在连接 Android App…</p>
+        </div>
+        <button id="refresh" class="secondary" type="button">刷新</button>
+      </div>
+      <div class="facts input-facts">
+        <div><span>当前配置</span><strong id="selected">—</strong></div>
+        <div class="route-fact">
+          <span>实际路由</span><strong id="routed">—</strong>
+        </div>
+        <div><span>PCM 直连</span><strong id="pcm-state">—</strong></div>
+        <div><span>麦克风持有者</span><strong id="mic-holders">—</strong></div>
+      </div>
+      <label for="input-device">输入设备<em class="when">即时生效</em></label>
+      <select id="input-device" aria-label="选择 Input Device">
+        <option value="system_default">系统默认</option>
+      </select>
+      <!--
+        ⚠ 这两个按钮写的是**永久收音**（App 的 `user.persistent`），不是「本次开始听」。
+        它跨停链、跨 App 重启存活，只有在这里明确关掉才会消失——语音链自己的麦克风
+        需求由启动/停止语音链管理，与这里无关。
+        旧版把它们叫「开启输入 / 关闭输入」，读起来像一个普通的开关，于是使用者点了一次
+        就在真机上留下了一份没有人认为自己开着的永久需求。
+      -->
+      <label>永久收音<em class="when">跨停链与重启</em></label>
+      <p class="note">
+        开启后麦克风由「你」持有：即使停止语音链，采集与前台服务也继续运行，直到在这里关闭。
+        只想用语音链的话不需要开它。
+      </p>
+      <div class="actions">
+        <button id="enable" type="button">开启永久收音</button>
+        <button id="disable" class="danger" type="button">关闭永久收音</button>
+      </div>
+      <p id="action-note" class="message"></p>
+    </section>
+  </section>
+
+  <!-- ============================================================
+       诊断页 —— 六个阶段的完整数值一个不少，出事才来看
+       ============================================================ -->
+  <section class="page" id="page-diagnostics" role="tabpanel" hidden>
+    <section class="card">
+      <div class="section-title">
+        <div><h2>诊断结论</h2></div>
+        <span id="ready-badge" class="badge">未知</span>
+      </div>
+      <!-- 资料不足时这里写「无法判定」，不猜。 -->
+      <ul id="diag-summary" class="diag-summary"></ul>
+    </section>
+
+    <section class="card diag-block" id="diag-input">
+      <div class="section-title">
+        <div><h2>INPUT · 收音</h2><p id="input-note" class="note">—</p></div>
+        <span id="input-state" class="badge">—</span>
+      </div>
+      <div class="facts"></div>
+    </section>
+
+    <section class="card diag-block rms-card" id="diag-rms">
+      <div class="section-title">
+        <div><h2>RMS Gate</h2></div>
+        <span id="rms-state" class="badge">CLOSED</span>
+      </div>
+      <div class="rms-metrics">
+        <div><span>LIVE</span><strong id="rms-current">—</strong></div>
+        <div><span>AVG · 1s</span><strong id="rms-avg">—</strong></div>
+        <div><span>PEAK · 10s</span><strong id="rms-peak">—</strong></div>
+      </div>
+      <div class="rms-bar" role="meter" aria-label="Live RMS" aria-valuemin="0" aria-valuemax="0.2">
+        <div id="rms-fill" class="rms-fill"></div>
+        <i id="rms-open-marker" class="threshold-marker open"><span>OPEN</span></i>
+        <b id="rms-bar-value">0.0000</b>
+      </div>
+      <div class="bar-scale"><span>0</span><span>显示范围 0–0.20</span><span>0.20</span></div>
+    </section>
+
+    <section class="card diag-block kws-card" id="diag-kws">
+      <div class="section-title">
+        <div><h2>KWS · 唤醒</h2><p id="kws-note" class="note">正在连接 App HTP 拼音 Provider…</p></div>
+        <span id="kws-state" class="badge">CONNECTING</span>
+      </div>
+      <div class="kws-metrics">
+        <div><span>KEYWORD</span><strong id="kws-keyword">未设置</strong></div>
+        <div><span>LIVE SCORE</span><strong id="kws-score">0.000</strong></div>
+        <div><span>COUNTDOWN</span><strong id="kws-countdown">—</strong></div>
+      </div>
+      <div class="kws-meter" role="meter" aria-label="Live KWS score" aria-valuemin="0" aria-valuemax="1">
+        <div id="kws-fill" class="kws-fill"></div>
+        <i id="kws-threshold" class="kws-threshold"></i>
+        <b id="kws-decoded">等待拼音 token</b>
+      </div>
+    </section>
+
+    <section class="card diag-block vad-card" id="diag-vad">
+      <div class="section-title">
+        <div><h2>VAD · 切段与 WAV</h2><p id="vad-note" class="note">—</p></div>
+        <span id="vad-state" class="badge">STANDBY</span>
+      </div>
+      <div class="vad-metrics">
+        <div><span>LIVE PROB</span><strong id="vad-probability">—</strong></div>
+        <div><span>COUNTDOWN</span><strong id="vad-countdown">—</strong></div>
+        <div><span>WAV TOTAL</span><strong id="vad-wav-total">0</strong></div>
+      </div>
+      <div class="vad-meter" role="meter" aria-label="Live VAD probability" aria-valuemin="0" aria-valuemax="1">
+        <div id="vad-fill" class="vad-fill"></div>
+        <i class="vad-threshold"></i>
+        <b id="vad-live-label">待机</b>
+      </div>
+      <div class="wav-fact">
+        <span>最近 WAV</span>
+        <strong id="vad-last-wav">尚未产出</strong>
+        <small id="vad-last-wav-detail">—</small>
+      </div>
+      <!--
+        丢弃诊断。⚠ 只保留**本次运行**的计数与最后原因，不建立新的永久累计历史
+        （docs/061 §四.3）。被丢的段没有 WAV、没有进 ASR、也没有转写——
+        所以如果不在这里说出来，它就是彻底不可见的。
+      -->
+      <div class="wav-fact">
+        <span>本次运行丢弃</span>
+        <strong id="vad-drops">0</strong>
+        <small id="vad-drop-detail">—</small>
+      </div>
+    </section>
+
+    <section class="card diag-block asr-card" id="diag-asr">
+      <div class="section-title">
+        <div><h2>ASR · 识别</h2><p id="asr-note" class="note">—</p></div>
+        <div class="badge-stack">
+          <span id="asr-ws" class="badge">WS OFFLINE</span>
+          <span id="asr-state" class="badge">STANDBY</span>
+          <span id="asr-precision" class="badge tag">—</span>
+        </div>
+      </div>
+      <div class="asr-metrics">
+        <div><span>CLOSE OWNER</span><strong id="asr-owner">—</strong></div>
+        <div><span>COUNTDOWN</span><strong id="asr-countdown">—</strong></div>
+        <div><span>TRANSCRIPTS</span><strong id="asr-total">0</strong></div>
+      </div>
+      <div class="transcript-fact">
+        <span>实时文字</span>
+        <strong id="asr-last-text">尚未产生转写</strong>
+        <small id="asr-last-detail">—</small>
+      </div>
+      <div id="asr-model-facts" class="facts"></div>
+    </section>
+
+    <section class="card diag-block" id="diag-output">
+      <div class="section-title">
+        <div><h2>OUTPUT · 状态总线</h2><p id="states-note" class="note">—</p></div>
+      </div>
+      <div id="states-grid" class="facts states-grid"></div>
+    </section>
+
+    <section class="card diag-block" id="diag-memory">
+      <div class="section-title"><div><h2>内存与 Swap</h2><p id="memory-note" class="note">—</p></div></div>
+      <div id="memory-grid" class="facts"></div>
+    </section>
+
+    <!--
+      开发者区域。`speech.idle` 会真的改变状态，所以默认锁住——
+      诊断页会被人在排障时反复滑动，一个裸露的按钮迟早被误触。
+    -->
+    <details class="card dev-zone">
+      <summary>开发者工具</summary>
+      <label class="toggle-line" for="dev-unlock">
+        <input id="dev-unlock" type="checkbox">
+        <span>我知道下面的操作会改变流水线状态</span>
+      </label>
+      <button id="force-idle" class="secondary" type="button" disabled>开发者 speech.idle</button>
+      <p id="dev-note" class="message"></p>
+    </details>
+
+    <details class="card raw" id="raw-details">
+      <summary>状态原始 JSON（展开才格式化）</summary>
+      <pre id="speech-input">（已折叠：点上方按钮展开原始 JSON）</pre>
+    </details>
+  </section>
+</main>
+<script src="/admin/session.js"></script>
+<script src="views.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
