@@ -931,7 +931,7 @@ const appJs = ['web/app.js', 'web/views.js']
 const styleCss = fs.readFileSync(path.join(root, 'web/style.css'), 'utf8');
 test(
   'Manifest declares every speech Capability and locates SenseVoice through assets, not paths',
-  manifest.version === '0.19.1'
+  manifest.version === '0.20.0'
     && manifest.id === 'github.termux-os.service.termux-speech'
     && manifest.capabilities.requires.some((item) => item.id === 'termux-os.app.api' && item.required)
     && manifest.capabilities.provides.some((item) => item.id === 'speech.input')
@@ -1018,8 +1018,22 @@ test(
       && /export async function installProvider/.test(modelsSource)
       && /route === '\/models\/install-provider'/.test(mainSource)
       && appJsModels.includes("'install-provider'")
+      // ⭐ 模型是**自己一个 tab**，不是设置页里的一节：在模型到位之前这个包做不了任何事。
+      && indexHtmlModels.includes('data-page="models"')
+      && indexHtmlModels.includes('id="page-models"')
       && indexHtmlModels.includes('id="models-list"')
       && appJsModels.includes('renderModels'),
+  );
+  test(
+    'no model, and no unreachable framework, can stop the service from starting',
+    /**
+     * ⚠ 真机上服务被一次启动期的 `fetch failed` 打死过——而后果不是「少个模型」，
+     * 是**模型页也打不开了**，那正是唯一能补模型的地方。缺什么都要能被看见并就地修好。
+     */
+    // 前处理数据解析失败要被接住并记下原因，而不是逃出去把进程带走。
+    /senseFrontendWhy = String\(error/.test(mainSource)
+      && /frontendRoot: senseFrontend\?\.root \?\? null/.test(mainSource)
+      && /lastTransportError/.test(fs.readFileSync(path.join(root, 'service/assets.mjs'), 'utf8')),
   );
   test(
     'the three kinds of "not here" stay three different answers',

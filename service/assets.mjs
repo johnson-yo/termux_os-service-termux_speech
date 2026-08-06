@@ -24,18 +24,41 @@ export async function resolveAssetRoot(id, { fetchImpl = fetch, timeoutMs = 8000
   if (!FRAMEWORK_URL || !SYSTEM_KEY) {
     throw new Error(`asset ${id}: no Framework credentials in the environment`);
   }
+  /**
+   * ⭐ **够不到框架要重试，够到了才算答案。**
+   *
+   * ⚠ 真机上服务被这一行打死过：受监管的服务在框架 HTTP 还没开始接受连接时就起来了，
+   * 第一次 `fetch` 抛 `fetch failed`，而这里立刻放弃 → 服务退出 → 重启 → 再来一遍。
+   * 症状是「资产不可达」，而资产就在盘上，框架一秒后也好好的。
+   *
+   * ⛔ 只对**传输失败**重试。「这个资产没登记」是一个确定的答案，重试它只是在等一件
+   * 不会发生的事。
+   */
   let payload;
-  try {
-    const response = await fetchImpl(`${FRAMEWORK_URL}/api/assets/${encodeURIComponent(id)}`, {
-      headers: { Authorization: `Bearer ${SYSTEM_KEY}` },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    payload = await response.json();
-    if (!response.ok || payload?.ok !== true) {
-      throw new Error(payload?.error ?? `HTTP ${response.status}`);
+  let lastTransportError = null;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    try {
+      const response = await fetchImpl(`${FRAMEWORK_URL}/api/assets/${encodeURIComponent(id)}`, {
+        headers: { Authorization: `Bearer ${SYSTEM_KEY}` },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      payload = await response.json();
+      if (!response.ok || payload?.ok !== true) {
+        throw Object.assign(new Error(payload?.error ?? `HTTP ${response.status}`), { answered: true });
+      }
+      lastTransportError = null;
+      break;
+    } catch (error) {
+      if (error?.answered) {
+        throw new Error(`asset ${id}: cannot reach the Framework asset registry: ${String(error?.message ?? error)}`);
+      }
+      lastTransportError = error;
+      await new Promise((resolve) => { setTimeout(resolve, 500 * (attempt + 1)); });
     }
-  } catch (error) {
-    throw new Error(`asset ${id}: cannot reach the Framework asset registry: ${String(error?.message ?? error)}`);
+  }
+  if (lastTransportError) {
+    throw new Error(`asset ${id}: cannot reach the Framework asset registry: `
+      + `${String(lastTransportError?.message ?? lastTransportError)} (after 6 attempts)`);
   }
   const asset = payload.asset ?? {};
   // ⚠ 「登记了」不等于「能用」：ready 才算数，理由要原样带出来。

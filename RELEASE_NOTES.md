@@ -1,5 +1,16 @@
 # Release notes — github.termux-os.service.termux-speech
 
+## 0.20.0
+
+- **模型 is its own tab.** Before a model is present this Package can do nothing, and asset
+  Packages do not appear on the Framework's own pages — so the one place to obtain them should be
+  as visible as 概览, not a section inside 设置.
+- **Nothing about a model can stop the service from starting.** On a second device the service was
+  killed at startup by a single `fetch failed` while the Framework's HTTP was still coming up: it
+  exited, restarted, and repeated, while the asset sat on disk the whole time. The consequence is
+  worse than a missing model — the page that fetches models could not be opened either.
+  Reaching the Framework is now retried; a real answer never is.
+
 ## 0.19.1
 
 - Declare `release.repository`. Without it the admin console's Update button for this Package

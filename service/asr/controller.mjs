@@ -175,14 +175,15 @@ export class AsrController {
     this.pendingFile = path.join(dataRoot, 'pending.v1.json');
     this.failedFile = path.join(dataRoot, 'failed.v1.jsonl');
     this.config = { ...config };
-    if (!frontendRoot) throw new Error('AsrController requires a resolved frontendRoot from the asset map');
+    // ⚠ 同上：缺前处理数据也不许把服务打死，否则那个能补它的页面就打不开了。
+    //    `modelReady` 一并把它算进去，转写请求会明确拒绝。
     /**
      * ⚠ 没有模型不是构造失败，是一个如实报出来的**未就绪**。
      *
      * 先前这里直接抛：干净设备上服务因此起不来，而使用者失去的恰好是那个能让他
      * 去取模型的界面。缺模型时照常构造，`ready` 为 false，转写请求明确拒绝并说明原因。
      */
-    this.modelReady = Boolean(ctxRoot || graphRoot);
+    this.modelReady = Boolean(frontendRoot && (ctxRoot || graphRoot));
     this.frontendRoot = frontendRoot;
     this.graphRoot = graphRoot;
     // EPContext wrapper 的檔名由 Asset Package 的 `files.graph` 決定；
@@ -190,8 +191,8 @@ export class AsrController {
     this.ctxPath = ctxRoot ? path.join(ctxRoot, 'model.onnx') : null;
     this.target = target;
     this.modelPath = graphRoot ? path.join(graphRoot, 'model.onnx') : null;
-    this.cmvnPath = path.join(frontendRoot, 'am.mvn');
-    this.tokensPath = path.join(frontendRoot, 'tokens.json');
+    this.cmvnPath = frontendRoot ? path.join(frontendRoot, 'am.mvn') : null;
+    this.tokensPath = frontendRoot ? path.join(frontendRoot, 'tokens.json') : null;
     this.graph = new ResidentGraph({
       android,
       id: residentId,

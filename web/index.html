@@ -37,6 +37,7 @@
   -->
   <nav class="tabs" role="tablist" aria-label="Termux Speech 页面">
     <button class="tab" role="tab" data-page="overview" aria-controls="page-overview">概览</button>
+    <button class="tab" role="tab" data-page="models" aria-controls="page-models">模型</button>
     <button class="tab" role="tab" data-page="settings" aria-controls="page-settings">设置</button>
     <button class="tab" role="tab" data-page="diagnostics" aria-controls="page-diagnostics">诊断</button>
   </nav>
@@ -182,12 +183,12 @@
   <!-- ============================================================
        设置页 —— 按用途分组，不按程序模块分组
        ============================================================ -->
-  <section class="page" id="page-settings" role="tabpanel" hidden>
-    <!--
-      模型。⭐ 放在设置页最前面，因为在模型到位之前，下面每一项都还谈不上。
-      资产包刻意不出现在 Framework 的 Package 页面里——一份模型权重属于需要它的那个包，
-      所以取得与删除都在这里。
-    -->
+  <!--
+    模型页。⭐ 独立成一个 tab 而不是塞在设置里：在模型到位之前，这个包做不了任何事，
+    而资产包不出现在 Framework 的 Package 页面上——这里是取得与删除模型的唯一入口，
+    它该和「概览」一样是一眼看得见的地方。
+  -->
+  <section class="page" id="page-models" role="tabpanel" hidden>
     <section class="card" id="card-models">
       <div class="section-title">
         <div>
@@ -200,7 +201,9 @@
       <div id="models-list" class="model-list"></div>
       <p class="hint">下载会持续几分钟到几十分钟，取决于模型大小与网络。期间可以离开这一页。</p>
     </section>
+  </section>
 
+  <section class="page" id="page-settings" role="tabpanel" hidden>
     <form class="card" id="form-daily">
       <div class="section-title">
         <div>

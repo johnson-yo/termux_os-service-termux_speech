@@ -514,8 +514,25 @@ const syncPcmDemand = () => {
  * ⚠ ctx 解析失敗的原因**必須留下來**。一個裸 catch 會把「本機沒有對應架構的 ctx」
  * 和「夠不到 Framework」壓成同一件事，然後默默去要那 937 MB。
  */
-const senseFrontend = await resolveAssetRoot('model.sensevoice.frontend');
-console.log(`[termux-speech] model.sensevoice.frontend ${senseFrontend.version} → ${senseFrontend.root}`);
+/**
+ * ⛔ **没有任何一个模型能把服务打死。**
+ *
+ * 前处理数据是必需资产，先前解析失败就直接抛。真机上它把服务打死过——而原因不是
+ * 「缺模型」，是启动时框架 HTTP 还没开始接受连接的一次 `fetch failed`：服务退出、
+ * 重启、再来一遍，而资产就在盘上。
+ *
+ * ⚠ 更要紧的是后果：服务死了，**模型页也就打不开了**，而那正是使用者唯一能用来
+ * 补模型的地方。一个「东西没到位」的状态必须能被看见并就地修好，不能表现为消失。
+ */
+let senseFrontend = null;
+let senseFrontendWhy = null;
+try {
+  senseFrontend = await resolveAssetRoot('model.sensevoice.frontend');
+  console.log(`[termux-speech] model.sensevoice.frontend ${senseFrontend.version} → ${senseFrontend.root}`);
+} catch (error) {
+  senseFrontendWhy = String(error?.message ?? error);
+  console.log(`[termux-speech] frontend data not available: ${senseFrontendWhy}`);
+}
 
 /**
  * ⭐ **启动只解析，绝不下载。**
@@ -570,7 +587,7 @@ asr = new AsrController({
   android,
   dataRoot: ASR_DATA_ROOT,
   config: cfg.asr,
-  frontendRoot: senseFrontend.root,
+  frontendRoot: senseFrontend?.root ?? null,
   graphRoot: senseGraph?.root ?? null,
   ctxRoot: senseCtx?.root ?? null,
   target: senseTarget,

@@ -2,7 +2,7 @@
   "schema": "termux-os.package.v1",
   "id": "github.termux-os.service.termux-speech",
   "name": "Termux Speech",
-  "version": "0.19.1",
+  "version": "0.20.0",
   "description": "Runs a last-owner RMS/KWS/VAD/ASR pipeline with App-HTP FireRedVAD, SenseVoice WAV transcription, a dictation listen mode, speech.idle, live transcript feeds, a switchable ASR model (SenseVoice / Qwen3-ASR Q4 / Q8), and a live available-memory readout.",
   "types": [
     "service"
