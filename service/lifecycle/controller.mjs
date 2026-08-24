@@ -1,7 +1,7 @@
 /**
  * SPDX-License-Identifier: Apache-2.0
- * [INPUT]: 注入的 mic 需求端、唤醒组、听写组、单调时钟与定时器；外部的 start/stop/engage/release 请求
- * [OUTPUT]: 唯一一份 chain / wake / dictation 状态，requester lease，以及 warm 倒计时
+ * [INPUT]: 注入的 mic 需求端、听写组、单调时钟与定时器；外部的 start/stop/engage/release 请求
+ * [OUTPUT]: 唯一一份 chain / dictation 状态，requester lease，以及 warm 倒计时
  * [POS]: docs/061 §五。此前「模型在不在」只能从「当前 owner 是谁」去猜，而那两件事本来就不是
  *        同一个问题——lease 说的是谁有资格关门，跟 VAD 图在不在内存里毫无关系。
  *        所有资源开关都必须经过这里，**串行**执行：并发的 stop 与 engage 如果各自跑一半，
@@ -15,14 +15,6 @@ export const CHAIN = Object.freeze({
   STARTING: 'starting',
   STOPPING: 'stopping',
   STOPPED: 'stopped',
-  ERROR: 'error',
-});
-
-export const WAKE = Object.freeze({
-  UNLOADED: 'unloaded',
-  LOADING: 'loading',
-  READY: 'ready',
-  UNLOADING: 'unloading',
   ERROR: 'error',
 });
 
@@ -58,7 +50,6 @@ class Serializer {
 export class LifecycleController {
   constructor({
     mic,
-    wake,
     dictation,
     warmTimeoutMs = 300_000,
     /**
@@ -67,7 +58,7 @@ export class LifecycleController {
      * 默认让它们**服务在就一直挂着**，因为闲置常驻几乎不要钱（图不用时匿名页被换进
      * ZRAM，docs/046 §6 实测闲置 12 分钟后物理驻留只剩 3.5 MB），而反复 load/unload
      * 是真花钱：ORT-QNN 分配器高水位只增不减（docs/053：0 session 仍占 612 MB），
-     * 真机上几轮 churn 就把 ort_rss 从 220 推到 692 MB，且每次唤醒多付约 2.5 秒。
+     * 真机上几轮 churn 就把 ort_rss 从 220 推到 692 MB，且每次重新进入处理多付约 2.5 秒。
      * **为省内存而周期性卸载，净效果是费内存。**
      */
     residency = 'service',
@@ -78,7 +69,6 @@ export class LifecycleController {
     onWarmUnload = () => {},
   }) {
     this.mic = mic;
-    this.wake = wake;
     this.dictation = dictation;
     this.warmTimeoutMs = Math.max(0, Number(warmTimeoutMs) || 0);
     this.residency = ['service', 'chain', 'warm'].includes(residency) ? residency : 'service';
@@ -89,7 +79,6 @@ export class LifecycleController {
     this.onWarmUnload = onWarmUnload;
 
     this.chain = CHAIN.STOPPED;
-    this.wakeState = WAKE.UNLOADED;
     this.dictationState = DICTATION.UNLOADED;
     /** 听写资源的代龄。每一次 load/unload 都 +1，故过期的 warm timer 认得出自己已经过时。 */
     this.dictationGeneration = 0;
@@ -126,7 +115,7 @@ export class LifecycleController {
       || this.dictationState === DICTATION.WARM;
   }
 
-  /** 需要 PCM 的条件：唤醒组在守着，或者有人在听写。 */
+  /** 需要 PCM 的条件：链或听写 requester 持有麦克风。 */
   wantsPcm() {
     return this.micHeld;
   }
@@ -135,7 +124,6 @@ export class LifecycleController {
     return {
       schema: 'termux-os.speech-lifecycle.v1',
       chain: this.chain,
-      wake: this.wakeState,
       dictation: this.dictationState,
       dictation_generation: this.dictationGeneration,
       residency: this.residency,
@@ -182,6 +170,12 @@ export class LifecycleController {
   }
 
   async loadDictation() {
+    /** 当前唯一的听写路径需要 FireRedVAD 与 SenseVoice 两张常驻图。 */
+    if (this.dictation.required?.() === false) {
+      this.lastError = null;
+      this.mark('dictation_not_required');
+      return { ok: true, reason: 'not_required' };
+    }
     if (this.dictationLoaded()) return { ok: true, reason: 'already_loaded' };
     this.dictationState = DICTATION.LOADING;
     this.mark('dictation_loading');
@@ -259,26 +253,15 @@ export class LifecycleController {
         this.mark('chain_start_failed');
         return { ok: false, reason: mic.reason, error: mic.error, value: this.snapshot() };
       }
-      this.wakeState = WAKE.LOADING;
-      try {
-        await this.wake.load();
-        this.wakeState = WAKE.READY;
-      } catch (error) {
-        this.wakeState = WAKE.ERROR;
-        this.lastError = `wake load failed: ${String(error?.message ?? error)}`;
-        this.chain = CHAIN.ERROR;
-        this.mark('chain_start_failed');
-        return { ok: false, reason: 'wake_load_failed', error: this.lastError, value: this.snapshot() };
-      }
       this.chain = CHAIN.STARTED;
       this.lastError = null;
       /**
        * ⭐ 预载听写组。docs/061 §二.3 说 Chain Start「**不要求**立即加载 VAD+ASR」——
        * 是不要求，不是不许。真机实测两条理由都指向预载：
-       *   ① 不预载时每次唤醒现场付 2558ms，而这正是唯一在意延迟的那条路径；
+       *   ① 不预载时每次进入处理现场付 2558ms，而这正是唯一在意延迟的那条路径；
        *   ② 反复 load/unload 把 ort_worker 的分配器高水位推上去（220 → 692MB），
        *      为省内存而周期性卸载，净效果是费内存。
-       * 载入失败**不算启动失败**：唤醒组照样守着，第一次唤醒时再试一次即可。
+       * 载入失败**不算启动失败**：链仍然可见，下一次进入处理时再试一次即可。
        */
       const preloaded = await this.loadDictation();
       if (preloaded.ok && this.leases.size === 0) this.dictationState = DICTATION.READY;
@@ -311,11 +294,8 @@ export class LifecycleController {
       this.cancelWarm();
 
       const errors = [];
-      try { await this.wake.unload(); this.wakeState = WAKE.UNLOADED; }
-      catch (error) { this.wakeState = WAKE.ERROR; errors.push(`wake: ${String(error?.message ?? error)}`); }
-
-      // `service` 策略下停链**不动那三张图**：它们闲着几乎不占物理内存，而卸了再载既慢
-      // 又会把分配器高水位推高。停链真正要放的是麦克风与唤醒组订阅，那两样才是持续成本。
+      // `service` 策略下停链**不动图**：它们闲着几乎不占物理内存，而卸了再载既慢
+      // 又会把分配器高水位推高。停链真正要放的是麦克风。
       if (this.residency !== 'service') {
         const unloaded = await this.unloadDictation(`chain_stop:${reason}`);
         if (!unloaded.ok && unloaded.error) errors.push(unloaded.error);
@@ -396,10 +376,10 @@ export class LifecycleController {
       this.dictationState = DICTATION.WARM;
       this.armWarm();
       if (this.chain === CHAIN.STARTED) {
-        // 基线是 Chain Started：Mic 继续供唤醒组使用，回到 RMS+KWS。
-        this.mark(`released_to_wake:${id}`);
+        // 基线是 Chain Started：Mic 继续由链上的 PCM consumers 使用。
+        this.mark(`released_to_ready:${id}`);
       } else {
-        // 基线是 Chain Stopped：立刻放 Mic，且**不得**顺手把唤醒组打开。
+        // 基线是 Chain Stopped：立刻放 Mic。
         await this.releaseMic();
         this.mark(`released_to_warm:${id}`);
       }

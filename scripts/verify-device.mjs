@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // [INPUT]: Framework URL/System Key, running Termux Speech instance, App cue/graph runtime, and external VAD/ASR files.
 // [OUTPUT]: `pass` / `fail` / `blocked` (exit 0/1/2). Checks cover live input, last-owner authority,
-//           cue, both HTP graphs, WAV/transcript feeds and speech.idle. `blocked` means a prerequisite
+//           the SenseVoice WAV spool, transcript feeds and speech.idle.
+//           `blocked` means a prerequisite
 //           is missing, so nothing was asserted — one cause, not fourteen downstream symptoms.
-// [POS]: Installed/Dev-compatible verification; it never prints credentials/audio and does not require a new physical Keyword hit.
+// [POS]: Installed/Dev-compatible verification; it never prints credentials or audio and does not require a new physical input event.
 // [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
 const BASE = process.env.TERMUX_OS_FRAMEWORK_URL ?? 'http://127.0.0.1:8980';
-const TOKEN = process.env.TERMUX_OS_SYSTEM_KEY ?? process.env.TERMUX_OS_TOKEN ?? '';
+const TOKEN = process.env.TERMUX_OS_SYSTEM_KEY ?? '';
 const BASE_PACKAGE_ID = 'github.termux-os.service.termux-speech';
 let packageId = process.env.TERMUX_OS_PACKAGE_ID ?? null;
 const checks = [];
@@ -115,12 +116,12 @@ const preflight = async () => {
     const payload = await response.json().catch(() => null);
     if (!response.ok || payload?.ok !== true) {
       note('framework', payload?.error ?? `HTTP ${response.status}`,
-        'check TERMUX_OS_FRAMEWORK_URL and TERMUX_OS_SYSTEM_KEY（token 每次全新装会轮替：~/framework.sh credentials）');
+        'check TERMUX_OS_FRAMEWORK_URL and TERMUX_OS_SYSTEM_KEY');
       return missing;   // 夠不到 Framework 時，後面每一項都只會重複同一個原因
     }
     packages = payload.packages;
   } catch (error) {
-    note('framework', String(error?.message ?? error), 'is the Framework running? ~/framework.sh start');
+    note('framework', String(error?.message ?? error), 'is the Framework service running?');
     return missing;
   }
 
@@ -180,6 +181,36 @@ if (blocked.length) {
   process.exit(2);
 }
 
+const transcribeExistingRecord = async (item) => {
+  await request('/asr/transcribe', {
+    method: 'POST',
+    body: { segment_id: item.segment_id },
+    timeoutMs: 15_000,
+  });
+  const result = await waitFor(async () => {
+    const [asrPayload, recordsPayload] = await Promise.all([
+      request('/asr'),
+      request('/records?limit=50'),
+    ]);
+    return {
+      asr: asrPayload.value,
+      item: recordsPayload.recent?.find((row) => row.segment_id === item.segment_id) ?? null,
+    };
+  }, (value) => value?.item?.backend === 'sensevoice'
+    && value?.asr?.transcripts?.last?.model?.id === 'sensevoice'
+    && value?.asr?.queue?.in_flight === null, 180_000);
+  if (result?.item?.backend !== 'sensevoice') {
+    throw new Error('SenseVoice spool result did not update the record backend');
+  }
+  if (result.asr?.transcripts?.last?.model?.id !== 'sensevoice') {
+    throw new Error('SenseVoice spool result did not report its model id');
+  }
+  if (result.asr?.model?.session_loaded !== true) {
+    throw new Error('SenseVoice spool path did not leave its resident loaded');
+  }
+  return result;
+};
+
 await check('input_device_route', async () => {
   const payload = await request('/devices');
   if (!Array.isArray(payload.inputs) || payload.inputs.length === 0) throw new Error('no input devices');
@@ -217,7 +248,7 @@ await check('speech_input_pipeline_contract', async () => {
     || value.pipeline?.close_policy !== 'last_downstream_owner') {
     throw new Error('last-owner Pipeline lease missing');
   }
-  if (value.pcm_pool?.owner !== 'termux-speech-vad' || value.pcm_pool?.used_by_kws !== false) {
+  if (value.pcm_pool?.owner !== 'termux-speech-vad') {
     throw new Error('VAD Pool ownership is wrong');
   }
   const serialized = JSON.stringify(value);
@@ -231,29 +262,12 @@ await check('speech_input_pipeline_contract', async () => {
   return `ready=${value.ready}; owner=${value.pipeline.owner}; gate=${value.rms_gate.state}; pool=${value.pcm_pool.duration_ms}/${value.pcm_pool.configured_ms}ms`;
 });
 
-await check('pinyin_kws_and_countdown', async () => {
-  const payload = await waitFor(
-    () => request('/kws'),
-    (result) => result.value?.provider?.connected === true
-      && result.value?.provider?.models_ready === true,
-  );
-  const value = payload?.value;
-  if (value?.provider?.connected !== true) throw new Error(value?.reason ?? 'pinyin WS not connected');
-  if (value.provider.model_asset !== 'model.wake-pinyin.app-htp') {
-    throw new Error(`wrong KWS model Asset: ${value.provider.model_asset}`);
-  }
-  if (value.provider.models_ready !== true) throw new Error(value.reason ?? 'KWS HTP model not ready');
-  if (Number(value.countdown?.timeout_ms) < 1000) throw new Error('KWS countdown unavailable');
-  if (typeof value.cue?.enabled !== 'boolean') throw new Error('KWS cue setting missing');
-  return `asset=${value.provider.model_asset}@${value.provider.model_version}; keyword=${value.profile?.display_name ?? 'setup-required'}; timeout=${value.countdown.timeout_ms}ms; cue=${value.cue.enabled}`;
-});
-
 await check('vad_model_pool_and_wav_contract', async () => {
   const value = (await request('/vad')).value;
   if (value?.schema !== 'termux-os.speech-vad.v1') throw new Error('wrong VAD schema');
   if (value.model?.files_present !== true) throw new Error('FireRedVAD model/cmvn missing');
   if (value.model.runtime !== 'android-app-ort-qnn-htp') throw new Error('wrong VAD runtime');
-  if (Number(value.pcm_pool?.configured_ms) > 6000 || value.pcm_pool?.used_by_kws !== false) {
+  if (Number(value.pcm_pool?.configured_ms) > 6000) {
     throw new Error('VAD Pool limit/ownership wrong');
   }
   if (Number(value.countdown?.timeout_ms) < 1000 || value.countdown?.resets_on !== 'wav_output') {
@@ -268,15 +282,13 @@ await check('vad_model_pool_and_wav_contract', async () => {
 });
 
 await check('single_current_close_owner', async () => {
-  const [pipelinePayload, kwsPayload, vadPayload, asrPayload] = await Promise.all([
+  const [pipelinePayload, vadPayload, asrPayload] = await Promise.all([
     request('/pipeline'),
-    request('/kws'),
     request('/vad'),
     request('/asr'),
   ]);
   const pipeline = pipelinePayload.value;
   const actual = [
-    kwsPayload.value?.countdown?.authoritative === true ? 'speech.kws' : null,
     vadPayload.value?.countdown?.authoritative === true ? 'speech.vad' : null,
     asrPayload.value?.authority?.active === true ? 'speech.asr' : null,
   ].filter(Boolean);
@@ -288,6 +300,10 @@ await check('single_current_close_owner', async () => {
 });
 
 await check('resident_graphs_declared_and_loaded', async () => {
+  const current = (await request('/asr')).value;
+  if (current?.model?.id !== 'sensevoice' || current.ready !== true) {
+    throw new Error(current?.last_error ?? 'SenseVoice is not the ready current ASR model');
+  }
   const descriptor = await discoverApp();
   const [vad, asr] = await Promise.all([request('/vad'), request('/asr')]);
   const wanted = [vad.value?.model?.session, asr.value?.model?.session];
@@ -396,19 +412,28 @@ await check('sensevoice_contract_and_htp_runtime', async () => {
   return `resident=${resident}; precision=qnn-context; output=${output.name}; argmax=${output.data.length}`;
 });
 
+await check('sensevoice_selection_and_wav_spool', async () => {
+  const recordsPayload = await request('/records?limit=50');
+  const item = recordsPayload.recent?.find((row) => row.status === 'succeeded' && row.wav_path);
+  if (!item) throw new Error('no existing succeeded record with WAV for SenseVoice spool verification');
+  const result = await transcribeExistingRecord(item);
+  return `sensevoice: selected_ready=true; session_loaded=${result.asr.model.session_loaded}; `
+    + `record_backend=${result.item.backend}`;
+});
+
 await check('rolling_pool_and_bounded_record_store', async () => {
   const live = await request('/live');
   const pool = live.pcm_pool;
   const gate = live.rms_gate;
   const records = live.records;
-  // Pool 必须在门关着时也在滚：`avg_1s` 的滞后让 OPEN 晚 300–400 ms，
-  // 门后才开始缓冲等于从 timeline 头部啃掉唤醒词。
+  // Pool 必须在门关着时也在滚：门前的 RMS decision window 也可能让 OPEN 晚，
+  // 门后才开始缓冲等于从 timeline 头部丢掉语音起始。
   if (pool?.rolling !== 'always') throw new Error('Pool is not rolling unconditionally');
   if (gate?.state === 'closed' && pool?.writing !== true) {
     throw new Error('Pool stopped writing while the Gate is closed');
   }
-  if (!Array.isArray(gate?.open_keys) || !gate.open_keys.includes('kws_hit')) {
-    throw new Error('the Gate does not advertise the KWS hit as a second opening key');
+  if (!Array.isArray(gate?.open_keys) || !gate.open_keys.includes('explicit_listen')) {
+    throw new Error('the Gate does not advertise the explicit listen opening key');
   }
   // 保留量的判据换成了记录组：⛔ 稳定态盘上最多两组，更旧的先归档进 SQLite 再删 WAV。
   // 允许短暂出现三组——最旧那组还有 item 没转写完时不许归档（把不知道的结论写进库）。
@@ -455,21 +480,6 @@ await check('speech_activity_and_transcript_feeds', async () => {
     throw new Error('speech.transcript feed contract missing');
   }
   return `activity=${activity.observations.length}; transcripts=${transcripts.observations.length}`;
-});
-
-await check('wake_cue_hardware_endpoint', async () => {
-  const descriptor = await discoverApp();
-  const result = await appRequest(descriptor, '/api/android/audio/cue', {
-    method: 'POST',
-    body: { cue: 'wake' },
-    timeoutMs: 10_000,
-  });
-  if (result?.cue !== 'wake' || !result?.cue_id
-    || Number(result?.pcm_frames) <= 0 || result?.pcm_left_app !== false) {
-    throw new Error('App wake cue did not play');
-  }
-  const durationMs = Math.round(Number(result.pcm_frames) * 1000 / Number(result.sample_rate));
-  return `duration=${durationMs}ms; playback=${result.playback_ms}ms; route=${result.routed_device?.product_name ?? result.routed_device?.type_name ?? 'system'}`;
 });
 
 await check('developer_speech_idle_reset', async () => {

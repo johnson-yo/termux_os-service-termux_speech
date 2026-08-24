@@ -1,7 +1,7 @@
 /**
  * SPDX-License-Identifier: Apache-2.0
- * [INPUT]: A short-lived termux-os.app.api descriptor converted to `/api/android/mic/stream`.
- * [OUTPUT]: A reconnecting authenticated binary PCM client plus truthful transport counters.
+ * [INPUT]: A short-lived termux-os.app.api descriptor converted to the RMS-only or PCM mic WS.
+ * [OUTPUT]: Reconnecting authenticated RMS/PCM clients plus truthful transport counters.
  * [POS]: Direct App→Termux Speech hot path; credentials and PCM never pass through Framework Core or the browser.
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -19,11 +19,22 @@ export const PCM_STREAM_FORMAT = Object.freeze({
   frame_bytes: 3_200,
 });
 
-export const pcmWebSocketDescriptor = (descriptor) => {
+export const pcmWebSocketDescriptor = (descriptor, preRollMs = 0) => {
   const endpoint = new URL(descriptor.baseUrl);
   endpoint.protocol = endpoint.protocol === 'https:' ? 'wss:' : 'ws:';
   endpoint.pathname = '/api/android/mic/stream';
-  endpoint.search = '';
+  /**
+   * ⭐ `rms=1`：App 逐帧给出**它自己量到的** RMS，锚与那一帧成对到达。
+   *
+   * RMS 是硬件侧的量测，权威在 App —— 采集循环本来就每帧算一次。此前它只在
+   * `mic/status` 的快照里，而快照答不了「这个数是哪一帧的」，于是这里只能拿着
+   * 已经收到的 PCM 再算一遍，两处判据从此可以各自漂移。
+   * ⚠ App 太旧时不带这个字段，下游会如实回落到本地计算（见 main.mjs 的 frameRms）。
+   */
+  const boundedPreRoll = Math.max(0, Math.min(25_600, Number(preRollMs) || 0));
+  endpoint.search = boundedPreRoll > 0
+    ? `?rms=1&pre_roll_ms=${boundedPreRoll}`
+    : '?rms=1';
   endpoint.hash = '';
   return {
     endpoint: endpoint.toString(),
@@ -246,11 +257,16 @@ export class PcmWs {
       capture_generation: Number(anchor.capture_generation) || 0,
       boot_id: typeof anchor.boot_id === 'string' ? anchor.boot_id : null,
       gap: anchor.gap === true,
+      pre_roll: anchor.pre_roll === true,
+      // ⚠ 缺席即 null，⛔ 不填 0：0 是「一片死寂」这个断言，与「没测到」是两回事。
+      rms: Number.isFinite(Number(anchor.rms)) ? Number(anchor.rms) : null,
     };
     this.anchorsReceived += 1;
     this.framesSinceAnchor = 0;
     // 锚自己声明「此前有个洞」时，把这个事实交给下游一次——正在形成的段必须为此作废。
-    this.pendingGap = this.anchor.gap;
+    // App 内 history 补出的第一帧不是采集断点；普通新订阅仍保留连接边界 gap。
+    this.pendingGap = this.anchor.gap
+      || (this.pendingGap && this.anchor.pre_roll !== true);
   }
 
   handlePcm(frame) {
@@ -270,6 +286,12 @@ export class PcmWs {
     const appFrameSeq = anchor ? anchor.frame_seq + this.framesSinceAnchor : null;
     const gap = this.pendingGap;
     this.pendingGap = false;
+    /**
+     * ⚠ 必须在自增**之前**取：`framesSinceAnchor === 0` 才是「紧跟着锚的那一帧」。
+     * 自增之后再判，恰好把唯一该带 rms 的那一帧判成不带——而下游会**静默回落**
+     * 到本地计算，于是这个改动看起来完全生效，实际上一个 App 的值都没用上。
+     */
+    const anchoredFrame = this.framesSinceAnchor === 0;
     this.framesSinceAnchor += 1;
     if (this.onFrame) this.onFrame(frame, {
       frame_seq: this.frameSeq,
@@ -280,6 +302,11 @@ export class PcmWs {
       app_frame_seq: appFrameSeq,
       capture_generation: anchor?.capture_generation ?? null,
       boot_id: anchor?.boot_id ?? null,
+      /**
+       * ⭐ 只有**逐帧锚**才配得上这一帧。周期锚每 50 帧一个，把它的 rms 摊给中间
+       * 那 49 帧，就又变回了「快照冒充逐帧」——那正是这次改动要消除的东西。
+       */
+      rms: anchoredFrame ? (anchor?.rms ?? null) : null,
       gap,
     });
   }
@@ -307,3 +334,94 @@ export class PcmWs {
     if (this.onState) this.onState(this.snapshot());
   }
 }
+
+/**
+ * 与 [PcmWs] 共用同一条 WS 传输实现，但只接受逐帧 RMS 文本。
+ * 协议层若意外收到 binary，会计数并丢弃，测试/诊断可以证明 RMS-only 没有越界。
+ */
+export class RmsWs extends PcmWs {
+  constructor({ onRms = null, onState = null } = {}) {
+    super({ onState });
+    this.onRms = typeof onRms === 'function' ? onRms : null;
+    this.rmsFrames = 0;
+    this.binaryFrames = 0;
+    this.lastRms = null;
+    this.lastAppFrameSeq = null;
+    this.seenFrame = false;
+  }
+
+  connect() {
+    this.lastAppFrameSeq = null;
+    super.connect();
+  }
+
+  handlePcm(frame) {
+    this.binaryFrames += 1;
+    this.lastError = `rms-only protocol violation: binary PCM ${frame.length} bytes`;
+    this.emitState();
+  }
+
+  handleAnchor(payload) {
+    let anchor;
+    try { anchor = JSON.parse(payload.toString('utf8')); } catch { return; }
+    if (anchor?.schema !== MIC_ANCHOR_SCHEMA) {
+      this.unknownTextFrames += 1;
+      return;
+    }
+    const frameSeq = Number(anchor.frame_seq) || 0;
+    const rms = Number(anchor.rms);
+    if (!Number.isFinite(rms)) {
+      this.lastError = 'rms-only frame missing finite rms';
+      this.emitState();
+      return;
+    }
+    const gap = anchor.gap === true
+      || (this.seenFrame && this.lastAppFrameSeq !== null && frameSeq !== this.lastAppFrameSeq + 1);
+    this.seenFrame = true;
+    this.lastAppFrameSeq = frameSeq;
+    this.lastRms = rms;
+    this.rmsFrames += 1;
+    this.anchorsReceived += 1;
+    this.lastFrameAtMs = Date.now();
+    this.lastError = null;
+    if (this.onRms) this.onRms({
+      frame_seq: frameSeq,
+      app_frame_seq: frameSeq,
+      mono_ms: Number(anchor.mono_ms) || null,
+      frame_ms: Number(anchor.frame_ms) || PCM_STREAM_FORMAT.frame_ms,
+      capture_generation: Number(anchor.capture_generation) || null,
+      boot_id: typeof anchor.boot_id === 'string' ? anchor.boot_id : null,
+      rms,
+      gap,
+      observed_at_ms: this.lastFrameAtMs,
+    });
+  }
+
+  snapshot(nowMs = Date.now()) {
+    const base = super.snapshot(nowMs);
+    return {
+      ...base,
+      schema: 'termux-os.rms-stream.v1',
+      endpoint: this.endpoint ? '/api/android/mic/rms' : null,
+      frame_seq: this.rmsFrames,
+      bytes_total: 0,
+      rms_frame_count: this.rmsFrames,
+      binary_frames: this.binaryFrames,
+      last_rms: this.lastRms,
+      last_app_frame_seq: this.lastAppFrameSeq,
+    };
+  }
+}
+
+export const rmsWebSocketDescriptor = (descriptor) => {
+  const endpoint = new URL(descriptor.baseUrl);
+  endpoint.protocol = endpoint.protocol === 'https:' ? 'wss:' : 'ws:';
+  endpoint.pathname = '/api/android/mic/rms';
+  endpoint.search = '';
+  endpoint.hash = '';
+  return {
+    endpoint: endpoint.toString(),
+    headers: { Authorization: descriptor.authorization },
+    provider: 'termux-os.app.api',
+  };
+};

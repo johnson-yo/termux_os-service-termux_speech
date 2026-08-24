@@ -1,7 +1,7 @@
 /**
  * SPDX-License-Identifier: Apache-2.0
  * [INPUT]: The state domains map (`/state/ws`) plus `/listen` and record payloads, already fetched.
- * [OUTPUT]: `window.SpeechViews` — shared formatters plus every Overview/Diagnostics render function.
+ * [OUTPUT]: `window.SpeechViews` — shared formatters plus the three product-page render functions.
  * [POS]: Pure presentation half of the Package page; it performs no I/O and holds no credentials.
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -91,10 +91,17 @@
     return Number.isFinite(at) && Date.now() - at < 3500;
   };
 
+  const getPkgPrefix = () => {
+    if (typeof window !== 'undefined' && window.TERMUX_SPEECH_PKG) return window.TERMUX_SPEECH_PKG;
+    if (typeof location !== 'undefined') {
+      const match = location.pathname.match(/^(\/api\/packages\/[^\/]+)/);
+      if (match) return match[1];
+    }
+    return '/api/packages/github.termux-os.service.termux-speech';
+  };
+
   const MODEL_LABELS = Object.freeze({
     sensevoice: 'SenseVoice',
-    'qwen3-q4': 'Qwen3-ASR Q4',
-    'qwen3-q8': 'Qwen3-ASR Q8',
   });
   const modelLabel = (id) => MODEL_LABELS[id] ?? String(id ?? '—');
 
@@ -191,14 +198,14 @@
       push('bad', `收音不可用：${REASON_TEXT[value.reason] ?? value.reason}`);
     }
     if (live?.vad?.model?.files_present === false) push('bad', 'FireRedVAD 模型文件缺失');
-    // 问的是「我选的这个模型在不在」，所以看 selected 而不是那个只答 SenseVoice 的 files_present。
+    // 问的是「我选的 backend 能不能工作」，文件型和 App session 型各自回答。
     const selected = live?.asr?.model?.selected;
-    if (selected?.files_present === false) {
-      push('bad', `${modelLabel(selected.id)} 模型文件缺失：${(selected.missing ?? []).join('、') || '清单未提供'}`);
+    if (selected?.ready === false) {
+      push('bad', `${modelLabel(selected.id)} 未就绪：${(selected.missing ?? []).join('、')
+        || selected.reason || '无法判定'}`);
     }
     if (live?.vad?.last_error) push('bad', `VAD 异常：${live.vad.last_error}`);
     if (live?.asr?.last_error) push('bad', `ASR 异常：${live.asr.last_error}`);
-    if (live?.kws?.ready === false && live.kws.reason) push('warn', `唤醒未就绪：${live.kws.reason}`);
     if (live?.states?.last_error) push('warn', `状态总线异常：${live.states.last_error}`);
     if (live?.memory?.low_memory === true) push('warn', '系统报告低内存');
     if (live?.memory?.error) push('warn', `内存读数取不到：${live.memory.error}`);
@@ -217,37 +224,12 @@
     if (value.ready !== true) {
       return { label: '启动中', tone: 'warn', note: REASON_TEXT[value.reason] ?? '正在就绪' };
     }
-    return { label: '正常', tone: 'ok', note: '收音、唤醒、切段、识别全部就绪' };
+    return { label: '正常', tone: 'ok', note: '收音、切段、识别全部就绪' };
   };
 
   /* ------------------------------------------------------------------
      概览
      ------------------------------------------------------------------ */
-  function renderOverview(live) {
-    const value = live?.input;
-    const alerts = collectAlerts(live);
-    const health = deriveHealth(live, alerts);
-    setBadge($('health-badge'), health.label, health.tone);
-    setNote($('health-note'), health.note, health.tone === 'ok' ? 'good' : health.tone === 'bad' ? 'bad' : '');
-
-    const mic = micState(value);
-    $('ov-mic').textContent = `${mic.label} · ${mic.detail}`;
-    const routed = value?.selection?.routed_device ?? value?.selection?.preferred_device;
-    const routeClass = live?.states?.published?.['audio.input.route'];
-    $('ov-route').textContent = `${labelDevice(routed)}（${ROUTE_LABELS[routeClass] ?? '无法判定'}）`;
-    const model = live?.asr?.model;
-    // ⚠ 说的是**被选中的那一档**在不在，不是 SenseVoice 在不在。
-    $('ov-model').textContent = model
-      ? `${modelLabel(model.selected?.id ?? model.model)}${
-        model.selected?.files_present === false ? ' · ⚠ 模型文件缺失' : ''}`
-      : '无法判定';
-
-    const list = $('alert-list');
-    $('alerts').hidden = alerts.length === 0;
-    if (list) {
-      textList(list, alerts, (item) => item.tone);
-    }
-  }
 
   const DROP_REASONS = Object.freeze({
     tts_overlap: '与本机 TTS 播放重叠',
@@ -256,9 +238,6 @@
 
   const CHAIN_LABELS = Object.freeze({
     started: '运行中', starting: '启动中', stopping: '停止中', stopped: '已停链', error: '错误',
-  });
-  const WAKE_LABELS = Object.freeze({
-    unloaded: '未加载', loading: '加载中', ready: '守候中', unloading: '卸载中', error: '错误',
   });
   const DICTATION_LABELS = Object.freeze({
     unloaded: '未加载', loading: '加载中', ready: '就绪', active: '听写中',
@@ -271,7 +250,7 @@
 
   /**
    * 语音链。⚠ 三行回答三个**不同的**问题，任何两行都不能互相推断：
-   * 采集被电话抢占时是 `silenced` 而唤醒组仍然 ready（需求没变，只是听不见）；
+   * 采集被电话抢占时仍然保留处理需求（需求没变，只是听不见）；
    * 听写 `warm` 时模型在内存里但没有人在用。把它们合成一个「开/关」会让停链前后
    * 看起来一模一样，而那正是这一轮要修的东西。
    */
@@ -294,7 +273,7 @@
     const detail = failure ? `失败：${failure}`
       : !lifecycle ? '正在读取…'
         : started
-          ? '麦克风与唤醒组在守着；说出唤醒词即可进入听写。'
+          ? '麦克风与识别链在运行；检测到语音后进入切段与识别。'
           : `服务仍在运行、API 仍可用；麦克风已释放。${
             resident ? '三张识别图仍挂在内存里（闲置几乎不占用），故随时可直接开始听写。'
               : '模型已卸载，第一次听写需要现场加载。'}`;
@@ -304,67 +283,16 @@
       ? `${CAPTURE_LABELS[capture.capture?.state ?? 'unknown'] ?? '无法判定'}${
         capture.stale ? ' · 事件断线，读数已陈旧' : ''}`
       : '无法判定';
-    $('ov-wake').textContent = lifecycle ? (WAKE_LABELS[lifecycle.wake] ?? '无法判定') : '—';
     $('ov-dictation').textContent = lifecycle
       ? `${DICTATION_LABELS[lifecycle.dictation] ?? '无法判定'}${
         lifecycle.dictation === 'warm' && warmMs !== null ? ` · 剩 ${seconds(warmMs)}` : ''}`
       : '—';
 
-    const toggle = $('chain-toggle');
-    if (toggle) {
-      toggle.textContent = pending === 'stop' ? '正在停止…'
-        : pending === 'start' ? '正在启动…'
-          : started ? '停止语音链' : '启动语音链';
-      toggle.className = started ? 'wide danger' : 'wide';
-      toggle.disabled = pending !== null || chain === null;
-    }
     const card = qs('.chain-card');
     if (card) card.classList.toggle('stopped', chain === 'stopped');
     return { chain, started, requesters: lifecycle?.requesters ?? [] };
   }
 
-  /**
-   * 听写 Listen 的状态显示。
-   *
-   * ⚠ 「正在启动 / 正在退出」不是后端状态——后端的 enter/exit 是同步的一次 HTTP，
-   * 没有中间态可读。它们是**本页自己的请求还在飞**，所以由调用方用 `pending` 传进来，
-   * 而不是从 `/listen` 里读一个不存在的字段（那正是 docs/056 的形状）。
-   */
-  function renderListen(listen, { pending = null, failure = null } = {}) {
-    const card = qs('.listen-card');
-    const engaged = listen?.engaged === true;
-    const requester = listen?.requester ?? null;
-    const mine = requester === 'webui';
-    const held = engaged && !mine;
-
-    const label = pending === 'enter' ? '正在启动'
-      : pending === 'exit' ? '正在退出'
-        : failure ? '操作失败'
-          : !engaged ? '未听写'
-            : mine ? '本页听写中' : '外部持有';
-    const tone = failure ? 'bad' : pending ? 'warn' : engaged ? (mine ? 'ok' : 'warn') : '';
-    setBadge($('listen-state'), label, tone);
-
-    const detail = failure ? `失败：${failure}`
-      : !engaged ? '流水线按正常的唤醒词流程工作。'
-        : `由 ${requester ?? '未知调用方'} 持有 · 原因 ${listen?.reason ?? '未提供'} · 已持续 ${
-          listen?.engaged_at_ms ? seconds(Date.now() - listen.engaged_at_ms) : '—'}`;
-    setNote($('listen-detail'), detail, failure ? 'bad' : '');
-
-    const toggle = $('listen-toggle');
-    if (toggle) {
-      toggle.textContent = pending === 'enter' ? '正在启动…'
-        : pending === 'exit' ? '正在退出…'
-          : engaged ? (mine ? '停止听写' : `停止听写（${requester} 持有）`) : '开始听写';
-      toggle.className = engaged ? 'wide danger' : 'wide';
-      toggle.disabled = pending !== null;
-    }
-    if (card) {
-      card.classList.toggle('engaged', engaged && mine);
-      card.classList.toggle('held', held);
-    }
-    return { engaged, requester, mine, held };
-  }
 
   /*
    * 点亮有两个**互不相同**的维度，混为一谈就会说谎：
@@ -372,108 +300,23 @@
    *   active —— 这一站此刻真的在干活
    *   owner  —— 这一站此刻持有关门权（PipelineLease）
    *
-   * 首个 WAV 发布后 owner 就交给了 ASR，但 VAD **仍在切下一段**。用
+   * CAM++ USER 确认后 owner 仍可留在 VAD，而 VAD **仍在切下一段**。用
    * `owner === stage` 当唯一依据，ASR 一开始转写 VAD 就无故变暗——
    * 那是把「谁能关门」误读成了「谁在工作」。lease 从来只回答后一个问题。
    */
-  const STAGES = Object.freeze(['input', 'rms', 'kws', 'vad', 'asr']);
+  const STAGES = Object.freeze(['input', 'rms', 'vad', 'asr']);
   const stageCells = new Map();
 
-  /**
-   * ⚠ 这些字段现在直接读**顶层的域**。它们过去是从 `live.value`（speech.input 投影）里读的，
-   * 而那份投影只是把顶层这五个对象原样嵌了一遍——同一批数据每次都发两份。
-   */
-  function renderStages(live, listen) {
-    const value = live?.input;
-    const stream = live?.pcm_stream;
-    const gate = live?.rms_gate;
-    const kws = live?.kws;
-    const vad = live?.vad;
-    const asr = live?.asr;
-    const owner = (live?.pipeline?.owner ?? 'speech.rms').replace('speech.', '');
-    const bypassed = listen?.engaged === true;
-
-    const frameFresh = value?.pcm?.recording === true
-      && stream?.connected === true
-      && number(stream.last_frame_age_ms) !== null
-      && number(stream.last_frame_age_ms) < 1000;
-    const gateOpen = gate?.available === true && gate?.pcm_admission === 'allow';
-    const hit = recentHit(kws?.last_hit);
-    const vadArmed = vad?.handoff?.active === true;
-    const asrBusy = ['queued', 'transcribing'].includes(asr?.state);
-
-    const active = {
-      input: frameFresh,
-      rms: gateOpen,
-      kws: owner === 'kws',
-      vad: vadArmed,                       // ← 交权给 ASR 之后依然为真
-      asr: asrBusy || owner === 'asr',
-    };
-    const ownerStage = STAGES.includes(owner) ? owner : 'rms';
-
-    const detail = {
-      input: frameFresh
-        ? `${deviceName(value?.selection?.routed_device)} · 帧龄 ${stream.last_frame_age_ms} ms`
-        : value?.pcm?.recording ? '已开启但帧不新鲜' : '未采集',
-      rms: `${gateOpen ? '已开' : gate?.open_armed === false ? '待重置' : '待命'} · AVG ${
-        fixed(gate?.decision_value, 3)} / 阈值 ${fixed(gate?.open_threshold, 3)}`,
-      // 直通必须说清楚是直通。把它画成一次 HIT 是纯粹的谎话。
-      kws: bypassed
-        ? '直通／已绕过唤醒'
-        : `${hit ? '刚刚命中' : owner === 'kws' ? '正在聆听'
-          : STAGES.indexOf(owner) > 2 ? '本轮已通过'
-            : kws?.profile?.built ? '等待音量门' : '唤醒词尚未生成'} · ${
-          kws?.profile?.display_name ? `「${kws.profile.display_name}」` : '未设置'} ${fixed(kws?.stream?.score, 2)}`,
-      vad: `${vad?.activity?.active === true ? '检测到语音' : vadArmed ? '寻找切点' : '待机'} · p=${
-        fixed(vad?.activity?.probability, 2)} · ${vad?.wav?.segments_published ?? 0} 段`,
-      asr: `${(asr?.state ?? 'standby')
-        .replace('transcribing', '转写中')
-        .replace('queued', '排队中')
-        .replace('listening', '聆听中')
-        .replace('standby', '待机')} · ${asr?.transcripts?.published_this_run ?? 0} 条 · ${
-        asr?.last_inference_ms ?? '—'} ms`,
-    };
-
-    for (const stage of STAGES) {
-      // 节点引用缓存：`querySelector` 每次都要重新遍历 DOM，而这五格从不改变身份。
-      let cell = stageCells.get(stage);
-      if (!cell) {
-        cell = qs(`.stage-row[data-stage="${stage}"]`);
-        if (!cell) continue;
-        stageCells.set(stage, cell);
-      }
-      setText(cell.querySelector('small'), detail[stage]);
-      setClass(cell, 'active', active[stage] === true);
-      setClass(cell, 'owner', stage === ownerStage);
-      // 流进这一站的那段连线。第一站没有入边。
-      setClass(cell, 'flow', active[stage] === true && STAGES.indexOf(stage) > 0);
-    }
-
-    const remaining = owner === 'kws' ? kws?.countdown?.remaining_ms
-      : owner === 'vad' ? vad?.countdown?.remaining_ms
-        : owner === 'asr' ? asr?.ending?.remaining_ms : null;
-    setNote($('stage-note'), owner === 'rms'
-      ? (frameFresh ? `待机于音量门 · 关门权 rms` : 'PCM 未采集，流水线停在收音')
-      : `${owner} 持关门权${bypassed ? '（听写模式：不自动收工）' : ` · 倒计时 ${seconds(remaining)}`}`);
-
-    const badge = owner === 'rms' ? (frameFresh ? 'IDLE' : value?.pcm?.recording ? 'STALE' : 'IDLE')
-      : owner.toUpperCase();
-    setBadge($('pipeline-live'), badge, owner === 'rms' ? (frameFresh ? '' : 'warn') : 'ok');
-    setText($('pipeline-note'), owner === 'rms'
-      ? (frameFresh ? `待机 · AVG ${fixed(gate?.decision_value, 3)}` : 'PCM 未采集')
-      : `${owner.toUpperCase()} 持关门权 · 倒计时 ${seconds(remaining)}`);
-  }
 
   /* ------------------------------------------------------------------
      转写
      ------------------------------------------------------------------ */
   const transcriptMeta = (record) => [
     clock(record?.observed_ms),
-    modelLabel(record?.model?.id),
+    modelLabel(record?.backend ?? record?.model?.id),
     record?.timing?.inference_ms !== undefined && record?.timing?.inference_ms !== null
       ? `${record.timing.inference_ms} ms` : null,
     record?.segment_id ? `segment=${record.segment_id}` : null,
-    record?.end_gate?.keyword_matched ? `结束词「${record.end_gate.keyword_matched}」` : null,
   ].filter(Boolean).join(' · ');
 
   /**
@@ -481,67 +324,134 @@
    * 而那个数字对「现在怎么样」不提供任何信息，只会单调上涨。
    * 这里说的是：当前第几组、收了多少、盘上留着哪两组、音频还在不在。
    */
-  function renderRecords(records) {
-    const active = records?.active;
-    $('rec-group').textContent = active
-      ? `第 ${active.group_seq} 组（${active.group_id}）` : '尚未开始';
-    // ⚠ 「转写中」不再从组里读：组里每一条都已经有结论了（准入后移之后没有 pending）。
-    // 还在转写的段是 ASR 队列的事实，由 `renderAsr` 那边显示。
-    $('rec-progress').textContent = active ? active.progress : '—';
+  /** 复制按钮要的那句话。由 [renderAsrLive] 唯一写入，见下。 */
+  let latestForCopy = '';
+  const latestText = () => latestForCopy;
 
-    const list = $('rec-groups');
-    if (list) {
-      list.replaceChildren(...(records?.groups ?? []).map((group) => {
-        const li = document.createElement('li');
-        const name = document.createElement('strong');
-        name.textContent = `第 ${group.group_seq} 组`;
-        const meta = document.createElement('small');
-        const stateText = group.state === 'completed' ? '已完成'
-          : group.state === 'active' ? '收集中' : group.state;
-        meta.textContent = `${stateText} · ${group.item_count}/${records.group_size} · 音频${
-          group.wav_available ? '在盘上' : '已归档'}`;
-        li.append(name, meta);
-        return li;
-      }));
+  /**
+   * ⭐ **概览与诊断的 ASR 文字由这一个函数写**（docs/075 收尾）。
+   *
+   * ⚠ 修的是两件事：
+   *   ① 页面此前只看得见 commit；现在统一显示上游半快门的 incomplete 当前句，
+   *      说话人不必等整句定稿才看到已经识别到的文字。
+   *   ② 概览读记录组、诊断读 `asr.transcripts.last`（旧版控制器自己的最后一条），
+   *      这两者必须保持同一份公共事实。
+   * ⛔ 所以这里不是「把两处改成一样」——是**只留一个写入点**。两处各写各的，
+   *   迟早会在某个分支上再次分岔，而分岔的那天没人会记得。
+   */
+  function renderAsrLive(value) {
+    const current = value?.current?.status === 'incomplete' ? value.current : null;
+    const committed = value?.committed ?? null;
+    const currentText = String(current?.text ?? '');
+    const currentBackend = current?.backend ?? value?.current_backend ?? value?.backend;
+
+    // 半快门是正在识别；没有半快门时不要把上一句 final 挂在 current 上。
+    const liveText = currentText || (current ? '正在识别…' : '等待语音…');
+    const liveMeta = '';
+
+    // 已定稿那一行：优先用记录组；记录组尚未刷新时用同一份 public.latest 兜底。
+    const latest = value?.latest ?? null;
+    const doneText = committed?.text || latest?.text || '尚未产生转写';
+
+    // ⚠ `duration_ms` 是记录组投影里那个名字（docs/087 §15）；前面几个是旧形状的兼容读法。
+    const audioMs = Number(committed?.duration_ms ?? committed?.audio?.duration_ms
+      ?? committed?.audio_duration_ms ?? latest?.audio_duration_ms
+      ?? latest?.audio?.duration_ms ?? latest?.duration_ms);
+    const inferMs = Number(committed?.timing?.inference_ms ?? committed?.inference_ms ?? latest?.inference_ms ?? latest?.timing?.inference_ms);
+    let doneMeta = '—';
+    if (Number.isFinite(audioMs) && audioMs > 0 && Number.isFinite(inferMs) && inferMs > 0) {
+      const speed = (audioMs / inferMs).toFixed(1).replace(/\.0$/, '');
+      doneMeta = `${Math.round(audioMs)}ms => ${Math.round(inferMs)}ms | ${speed}x`;
+    } else if (Number.isFinite(inferMs) && inferMs > 0) {
+      doneMeta = `${Math.round(inferMs)}ms`;
     }
 
-    const archive = records?.archive;
-    const rotation = records?.last_rotation;
-    $('rec-note').textContent = !records ? '—'
-      : archive && archive.available === false
-        ? `⚠ 归档不可用（${archive.last_error ?? '未提供原因'}）：轮转已暂停，音频不会被删除。`
-        : `更旧的组已归档：${archive?.groups ?? 0} 组 / ${archive?.items ?? 0} 条**只剩文字**，音频已删除。${
-          rotation?.skipped ? ` 上次轮转跳过 ${rotation.skipped}（${rotation.reason}）。` : ''}`;
+    /**
+     * ⭐ **一个写入点写所有位置**（docs/075）。0.21.4 把概览那一对 id 从
+     * `tx-*` 换成了 `ov-current` / `ov-latest`——⛔ 换 id 不等于可以再开一个渲染器：
+     * 两处各写各的，迟早在某个分支上再次分岔。
+     */
+    for (const [textId, metaId] of [['ov-current', 'tx-live-meta'], ['asr-live-text', 'asr-live-meta']]) {
+      const node = $(textId);
+      if (!node) continue;
+      node.textContent = liveText;
+      node.closest('.live-fact')?.classList.toggle('is-idle', !current);
+      if ($(metaId)) $(metaId).textContent = liveMeta;
+    }
+    for (const [textId, metaId] of [['ov-latest', 'tx-latest-meta'], ['asr-last-text', 'asr-last-detail']]) {
+      if ($(textId)) $(textId).textContent = doneText;
+      if ($(metaId)) $(metaId).textContent = doneMeta;
+    }
+    /**
+     * ⭐ 复制按钮读的是**同一个渲染器算出来的那一份**，⛔ 不是从 DOM 里抠字符串：
+     *   页面上的占位文案（「尚未产生转写」）是文案，不是转写结果。
+     * ⚠ 没有 commit 时按钮 disabled——一个按下去什么都不发生的按钮，
+     *   和一个复制了「尚未产生转写」六个字的按钮，都在骗人。
+     */
+    latestForCopy = committed?.text ?? latest?.text ?? '';
+    for (const id of ['tx-copy-latest', 'copy-latest']) {
+      if ($(id)) $(id).disabled = !committed;
+    }
+    return committed;
   }
 
   function renderTranscripts(records, onCopy) {
-    const latest = records.at(-1) ?? null;
-    $('tx-latest-text').textContent = latest
-      ? (latest.text || '（空白结果）')
-      : '尚未产生转写';
-    $('tx-latest-meta').textContent = latest ? transcriptMeta(latest) : '—';
-    $('tx-copy-latest').disabled = !latest;
+    const list = $('tx-history-list') || $('tx-list');
+    if (!list) return records.at(-1) ?? null;
 
-    const list = $('tx-list');
-    // 最新的在上面：日常使用最关心的永远是刚说完的那一句。
-    const rows = [...records].slice(0, -1).reverse();
+    // 最新 10 条，上新下旧（10条以后的不显示）
+    const rows = [...records].slice(-10).reverse();
     list.replaceChildren(...rows.map((record) => {
       const li = document.createElement('li');
-      const body = document.createElement('div');
-      const text = document.createElement('p');
-      text.textContent = record.text || '（空白结果）';
-      const meta = document.createElement('small');
-      meta.textContent = transcriptMeta(record);
-      body.append(text, meta);
-      const copy = document.createElement('button');
-      copy.type = 'button';
-      copy.className = 'secondary';
-      copy.textContent = '复制';
-      copy.addEventListener('click', () => onCopy(record.text ?? ''));
-      li.append(body, copy);
+      li.className = 'tx-history-item';
+
+      // 1. 日期时间
+      const timeDiv = document.createElement('div');
+      timeDiv.className = 'tx-time';
+      const atMs = Number(record.observed_ms) || (record.completed_at ? Date.parse(record.completed_at) : null) || Date.now();
+      const d = new Date(atMs);
+      const yyyy = d.getFullYear();
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const dd = String(d.getDate()).padStart(2, '0');
+      const hh = String(d.getHours()).padStart(2, '0');
+      const min = String(d.getMinutes()).padStart(2, '0');
+      const ss = String(d.getSeconds()).padStart(2, '0');
+      timeDiv.textContent = `${yyyy}-${mm}-${dd} ${hh}:${min}:${ss}`;
+
+      // 2. 内容
+      const textDiv = document.createElement('div');
+      textDiv.className = 'tx-text';
+      textDiv.textContent = record.text || '（空白结果）';
+
+      // 3. 音频 audio tag (格式参考 My Voice)
+      /**
+       * ⭐ **音频不在了就不要画播放器**（docs/091 PART G）。
+       * ⚠ 旧行为是「只要有 segment_id 就画」——于是被 `history.wav_keep` 淘汰掉的
+       *   那些句子仍然带着一个**必然 404/410** 的播放器：点下去没有任何反应，
+       *   而使用者没有任何办法知道那是「过期了」还是「坏了」。
+       */
+      const audioWrap = document.createElement('div');
+      audioWrap.className = 'tx-audio-wrap';
+      if (record.segment_id && record.audio_available === false) {
+        const gone = document.createElement('span');
+        gone.className = 'tx-audio-gone';
+        gone.textContent = '音频已过期';
+        audioWrap.append(gone);
+      } else if (record.segment_id) {
+        const audio = document.createElement('audio');
+        audio.controls = true;
+        audio.preload = 'none';
+        audio.setAttribute('controlslist', 'nodownload noplaybackrate nofullscreen');
+        audio.setAttribute('disableremoteplayback', '');
+        audio.disableRemotePlayback = true;
+        audio.src = `${getPkgPrefix()}/records/audio?segment_id=${encodeURIComponent(record.segment_id)}`;
+        audioWrap.append(audio);
+      }
+
+      li.append(timeDiv, textDiv, audioWrap);
       return li;
     }));
-    return latest;
+    return records.at(-1) ?? null;
   }
 
   /* ------------------------------------------------------------------
@@ -552,48 +462,145 @@
     if (!el) return;
     const mb = Number(memory?.avail_mb);
     if (!Number.isFinite(mb) || mb <= 0) {
-      setBadge(el, 'MEM —', '');
+      el.innerHTML = '<span class="muted" style="font-size:0.62rem;">MEM —</span>';
       el.title = memory?.error
         ? `内存读数取不到：${memory.error}`
         : '内存读数（尚未取到第一笔）';
       return;
     }
-    const g = (v) => (Number.isFinite(Number(v)) ? `${(Number(v) / 1024).toFixed(2)}G` : '—');
+    const toG = (v) => (Number.isFinite(Number(v)) ? `${(Number(v) / 1024).toFixed(2)}G` : '—');
     const used = Number(memory?.used_mb);
     const total = Number(memory?.total_mb);
     const swap = Number(memory?.swap_used_mb);
-    // 显示「已用 / 总量」而不是只显示可用：使用者的心智模型就是这个。
-    // ZRAM 并列，因为模型的匿名脏页大多在那儿——不显示它，就会看到
-    // 「换了更大的模型，可用内存反而变多」这种自相矛盾的读数。
-    const swapPart = Number.isFinite(swap) && swap > 0 ? ` · ZRAM ${g(swap)}` : '';
-    const tone = memory?.low_memory || mb < 1900 ? 'bad' : mb < 2100 ? 'warn' : 'ok';
-    setBadge(el, `MEM ${g(used)}/${g(total)}${swapPart}`, tone);
+    const swapTotal = Number(memory?.swap_total_mb) || 8192; // 8.00GB ZRAM baseline
+
+    // MEM 独立负载与比例（绿，橙，红）
+    const memPct = total > 0 && Number.isFinite(used) ? Math.min(100, Math.max(0, (used / total) * 100)) : 0;
+    const memTone = memory?.low_memory || mb < 1200 || memPct >= 88 ? 'bad' : (mb < 2000 || memPct >= 75) ? 'warn' : 'ok';
+
+    // ZRAM 独立负载与比例（绿，橙，红）
+    const swapVal = Number.isFinite(swap) ? swap : 0;
+    const swapPct = swapTotal > 0 && Number.isFinite(swap) ? Math.min(100, Math.max(0, (swapVal / swapTotal) * 100)) : 0;
+    const swapTone = swapPct >= 80 ? 'bad' : swapPct >= 50 ? 'warn' : 'ok';
+
+    el.className = 'mem-cols';
+    el.innerHTML = `
+      <div class="mem-item mem-${memTone}">
+        <span class="mem-lbl">MEM</span>
+        <span class="mem-bracket">[</span><div class="mem-bar"><div class="mem-fill" style="width:${memPct.toFixed(1)}%;"></div><span class="mem-val">${toG(used)}</span></div><span class="mem-bracket">]</span>
+        <span class="mem-total">${toG(total)}</span>
+      </div>
+      <div class="mem-item mem-${swapTone}">
+        <span class="mem-lbl">ZRAM</span>
+        <span class="mem-bracket">[</span><div class="mem-bar"><div class="mem-fill" style="width:${swapPct.toFixed(1)}%;"></div><span class="mem-val">${Number.isFinite(swap) ? toG(swap) : '0.00G'}</span></div><span class="mem-bracket">]</span>
+        <span class="mem-total">${toG(swapTotal)}</span>
+      </div>
+    `;
+
     el.title = [
-      `已用 ${used} MB / 总量 ${total} MB（读自 /proc/meminfo）`,
-      `可用 ${mb} MB —— 这是 MemAvailable，含可回收的页快取，不等于「总量减去已用」`,
-      Number.isFinite(swap) ? `ZRAM 已用 ${swap} MB —— 闲置的模型权重大多被压在这里` : '',
+      `MEM 已用 ${used} MB / 总量 ${total} MB (${memPct.toFixed(1)}%)`,
+      `可用 ${mb} MB —— MemAvailable`,
+      Number.isFinite(swap) ? `ZRAM 已用 ${swap} MB / 总量 ${swapTotal} MB (${swapPct.toFixed(1)}%)` : '',
       Number.isFinite(Number(memory?.app_avail_mb))
-        ? `App 口径 availMem ${memory.app_avail_mb} MB（与上面的 MemAvailable 不是同一个数）` : '',
-      '',
-      '⚠ 载入更大的模型时这个数可能不降反升：内核为腾地方回收掉的，',
-      '   比模型实际驻留的还多。要看单个模型的代价请用下面的实测峰值。',
-      '转写峰值实测：SenseVoice≈1.2G / Qwen3-Q4≈1.9G / Qwen3-Q8≈2.0G',
+        ? `App 口径 availMem ${memory.app_avail_mb} MB` : '',
     ].filter(Boolean).join('\n');
   }
 
-  function renderMemoryDetail(memory) {
-    facts($('memory-grid'), [
-      ['MemTotal', memory?.total_mb ? `${memory.total_mb} MB` : null],
-      ['MemAvailable', memory?.avail_mb ? `${memory.avail_mb} MB` : null],
-      ['已用（总量−可用）', memory?.used_mb ? `${memory.used_mb} MB` : null],
-      ['ZRAM / Swap 已用', memory?.swap_used_mb !== null && memory?.swap_used_mb !== undefined
-        ? `${memory.swap_used_mb} MB` : null],
-      ['App availMem', memory?.app_avail_mb ? `${memory.app_avail_mb} MB` : null],
-      ['App low_memory', memory?.low_memory === true ? '是' : memory?.low_memory === false ? '否' : null],
+  /**
+   * 声纹前景门（docs/081）。⭐ 只显示，**不判断**：`ok` / `reason` / `authority`
+   * 都由服务端算好，页面照抄。自己再判一次「算不算 stale」，就会出现两个答案。
+   * ⚠ 「未校准」必须**明说会安全放行**——一个写着「未校准」却不说后果的提示，
+   *   使用者会以为它正在丢东西。
+   */
+  const SPKGATE_REASON = Object.freeze({
+    gate_disabled: '未启用',
+    profile_missing: '还没有声纹',
+    calibration_not_acknowledged: '阈值尚未确认',
+    profile_changed: '声纹已重建，阈值需要重新确认',
+    window_changed: '窗长改过，阈值需要重新确认',
+    threshold_changed: '阈值改过，需要重新确认',
+    calibrated: '已校准',
+  });
+
+  function renderSpeakerGate(gate, foreground) {
+    const enabled = gate?.enabled === true;
+    const ok = gate?.ok === true;
+    /**
+     * ⭐ 三态，不是两态：`ok` 说「校准齐了」，`armed` 说「可以拒绝了」。
+     *   ⚠ 真机上这两者差了一整轮事故——门写着 `calibrated` 却一次都没认出使用者，
+     *   于是连拒 4 段输入。把它们压成一个徽章，那一轮就完全看不出来。
+     */
+    const armed = gate?.armed === true;
+    setBadge($('spkgate-badge'), !enabled ? 'OFF' : !ok ? 'BYPASS' : armed ? 'ARMED' : 'WATCHING',
+      !enabled ? '' : armed ? 'ok' : 'warn');
+    $('spkgate-authority').textContent = ({
+      speaker: '声纹门', rms: '音量门（docs/079）', off: '不判段，全部放行',
+    })[foreground?.authority] ?? '—';
+    $('spkgate-profile').textContent = gate?.profile_ready
+      ? `已登记 · ${String(gate.profile_fingerprint ?? '').slice(0, 12)}` : '未登记';
+    const cfg = gate?.uservad_config ?? {};
+    $('spkgate-calib').textContent = number(cfg.threshold) === null ? '—'
+      : `${fixed(cfg.threshold, 2)} / ${cfg.window_ms} ms`;
+    $('spkgate-state').textContent = !enabled ? '未启用'
+      : !gate?.running ? '未在收音'
+        : `${gate?.state === 'USER' ? '登记用户' : '其他'} · ${fixed(gate?.last_similarity, 3)}`;
+    const warn = $('spkgate-warning');
+    if (enabled && ok && !armed) {
+      warn.hidden = false;
+      warn.className = 'message warn';
+      warn.textContent = '已启用，但这套校准下「还没认出过你一次」—— '
+        + '在它至少判出一个「是你」之前，一律放行（既不挡背景，也不会挡你的语音输入）。'
+        + '如果说了话仍然一直不 ARMED，多半是阈值对这份声纹太高，去 Speaker Lab 重新定。';
+    } else if (enabled && !ok) {
+      warn.hidden = false;
+      warn.className = 'message warn';
+      warn.textContent = `${SPKGATE_REASON[gate?.reason] ?? gate?.reason}`
+        + ' —— 现在会安全放行，不会丢掉任何一段。到 Speaker Lab 确认阈值后才会开始判。';
+    } else {
+      warn.hidden = true;
+      warn.textContent = '';
+    }
+    $('spkgate-enabled').checked = enabled;
+  }
+
+  /**
+   * 「收音与语音链」——产品侧的两个动作与它们的前提。
+   *
+   * ⭐ 它回答的是**使用者的**问题：现在还在收音吗、还有谁在用、按下去会发生什么。
+   * ⛔ 不显示 lease id、consumer 名、graph、holder——那些在诊断页。
+   * ⚠ 「还在收音」的判据是 `pcm_consumers` 的**聚合**（docs/077），
+   *   ⛔ 不是「语音链起没起」：链停了别人照样可以持有麦克风。
+   */
+  function renderAudioControl(lifecycle, consumers, input, listen) {
+    const chain = lifecycle?.chain ?? null;
+    const started = chain === 'started';
+    const recording = input?.pcm?.recording === true;
+    const holders = consumers?.pcm_holders ?? [];
+    const others = (input?.demand?.holders ?? []).filter((id) => !String(id).startsWith('termux-speech'));
+
+    setBadge($('ac-badge'), recording ? '正在收音' : '未收音', recording ? 'ok' : '');
+    facts($('ac-facts'), [
+      ['麦克风', recording ? '开着' : '已停'],
+      ['语音链', started ? '运行中' : chain === 'stopped' ? '已停止' : '无法判定'],
+      ['本包在用', holders.length ? `${holders.length} 项` : '无'],
+      /**
+       * ⭐ **语音输入此刻归谁**（docs/060）：它随时会被别的 package（如 termux-ime）
+       *   接管，而一个显示着几分钟前归属的页面，比不显示更糟。
+       * ⚠ `直通` 指调用方直接请求听写——那是它进来的方式，不是别的状态。
+       */
+      ['语音输入归谁', listen?.engaged === true
+        ? `${listen.requester ?? '未知调用方'}`
+        : '无人'],
+      /** ⚠ 别人也持着麦克风时必须说出来：那时「停止收音」不会让绿点熄灭。 */
+      ['其他持有者', others.length ? others.join('、') : '无'],
     ]);
-    setNote($('memory-note'), memory?.error
-      ? `App 内存接口取不到：${memory.error}（/proc 读数仍然有效）`
-      : '读自 /proc/meminfo；仅供参考，不参与任何自动决策。', memory?.error ? 'bad' : '');
+
+    const chainBtn = $('ac-chain');
+    if (chainBtn) {
+      setText(chainBtn, started ? '停止语音链' : '启动语音链');
+      chainBtn.className = started ? 'secondary' : 'primary';
+      chainBtn.disabled = chain === null;
+    }
   }
 
   function renderInputDiag(value) {
@@ -615,9 +622,31 @@
   function renderRms(gate) {
     const current = number(gate?.current) ?? 0;
     const gateOpen = gate?.available === true && gate?.pcm_admission === 'allow';
+    /** 兼容已打开的旧 DOM：dev 版直改文件后，节点缺失也不能让倒计时消失。 */
+    let camCountdown = $('rms-cam-countdown');
+    if (!camCountdown) {
+      const card = qs('.rms-card');
+      const bar = card?.querySelector('.rms-bar');
+      if (card && bar) {
+        camCountdown = document.createElement('p');
+        camCountdown.id = 'rms-cam-countdown';
+        camCountdown.className = 'note';
+        card.insertBefore(camCountdown, bar);
+      }
+    }
+    const admission = gate?.automatic_cam_admission ?? {};
+    const remaining = number(admission.remaining_seconds);
+    setText(camCountdown, admission.active === true && remaining !== null
+      ? `CAM++ 等待确认 USER 倒计时：${Math.max(0, Math.ceil(remaining))} 秒`
+      : admission.confirmed_user_at_ms
+        ? `CAM++ USER 已确认（${admission.user_state ?? 'USER'}）`
+        : gateOpen ? 'CAM++ 等待确认 USER' : 'CAM++ 等待确认 USER：等待 RMS 开门');
     $('rms-current').textContent = fixed(gate?.current);
-    $('rms-avg').textContent = fixed(gate?.avg_1s);
+    $('rms-avg').textContent = fixed(gate?.avg_100ms ?? gate?.decision_value);
     $('rms-peak').textContent = fixed(gate?.peak_10s);
+    setText($('rms-threshold'), fixed(gate?.open_threshold));
+    setText($('rms-admission'), gateOpen
+      ? 'open · PCM 进入 CAM++ / VAD' : 'waiting · PCM 只进滚动环');
     $('rms-bar-value').textContent = current.toFixed(4);
     setStyle($('rms-fill'), 'width', percent(current, RMS_BAR_MAX));
     setStyle($('rms-open-marker'), 'left', percent(gate?.open_threshold, RMS_BAR_MAX));
@@ -630,47 +659,25 @@
     qs('.rms-card')?.classList.toggle('gate-open', gateOpen);
   }
 
-  function renderKws(kws, pipeline) {
-    const owner = pipeline?.owner ?? 'speech.rms';
-    const stream = kws?.stream;
-    const score = number(stream?.score) ?? 0;
-    const threshold = number(stream?.threshold ?? kws?.profile?.threshold) ?? 0.8;
-    const hit = recentHit(kws?.last_hit);
-    const connected = kws?.provider?.connected === true;
-    const built = kws?.profile?.built === true;
-    $('kws-keyword').textContent = kws?.profile?.display_name ?? '未设置';
-    $('kws-score').textContent = score.toFixed(3);
-    $('kws-countdown').textContent = seconds(kws?.countdown?.remaining_ms);
-    setStyle($('kws-fill'), 'width', percent(score));
-    $('kws-fill').className = `kws-fill ${score >= threshold ? 'hit' : ''}`.trim();
-    setStyle($('kws-threshold'), 'left', percent(threshold));
-    $('kws-decoded').textContent = stream?.decoded_text || '等待拼音 token';
-    qs('.kws-meter')?.setAttribute('aria-valuenow', String(score));
-    // 状态取自 lease：GATED 表示门还没开，KWS 此刻并不工作。
-    const stateText = hit ? 'HIT'
-      : owner === 'speech.kws' ? 'LISTEN'
-        : !connected ? 'CONNECTING'
-          : !built ? 'SETUP' : 'GATED';
-    setBadge($('kws-state'), stateText, hit || owner === 'speech.kws' ? 'ok' : connected ? '' : 'warn');
-    setNote($('kws-note'), !connected
-      ? `Provider 未连接：${kws?.reason ?? kws?.provider?.last_error ?? 'connecting'}`
-      : !kws?.provider?.models_ready ? 'HTP 拼音模型加载中'
-        : !built ? '请到设置页录入并生成唤醒词'
-          : `Provider ${stream?.speaking ? '分段中' : '空闲'} · 拼音 ${stream?.count ?? 0} 次命中 · 已拒绝 ${
-            kws?.rejected_hits ?? 0} 次门外命中`, connected ? 'good' : 'bad');
-  }
-
-  function renderVad(vad) {
+  function renderVad(vad, cam, listen, pipeline) {
     const probability = number(vad?.activity?.probability);
     const active = vad?.activity?.active === true;
     const handoff = vad?.handoff?.active === true;
+    const camLive = cam?.active === true || cam?.automatic_cam_live === true;
     const last = vad?.wav?.last_segment;
+    const mode = listen?.engaged === true ? 'FireRedVAD · 手动'
+      : cam?.vad_mode === 'camplus_automatic' ? 'CAM++VAD · 自动' : '未启用';
+    setText($('vad-mode'), `VAD 模式：${mode}`);
     $('vad-probability').textContent = fixed(probability, 3);
     $('vad-countdown').textContent = seconds(vad?.countdown?.remaining_ms);
     $('vad-wav-total').textContent = String(vad?.wav?.segments_published ?? 0);
     setStyle($('vad-fill'), 'width', percent(probability));
     $('vad-fill').className = `vad-fill ${active ? 'speech' : ''}`.trim();
     $('vad-live-label').textContent = active ? '语音中' : handoff ? '寻找切点' : '待机';
+    setText($('vad-owner'), pipeline?.owner ?? (listen?.engaged ? 'speech.vad' : 'speech.rms'));
+    setText($('vad-live'), listen?.engaged
+      ? (active || handoff ? 'FireRedVAD 正在处理' : 'FireRedVAD 等待声音')
+      : camLive ? 'CAM++ live inference' : 'CAM++ waiting for RMS');
     qs('.vad-meter')?.setAttribute('aria-valuenow', String(probability ?? 0));
     setBadge($('vad-state'), active ? 'SPEECH' : handoff ? 'PROCESSING' : 'IDLE', active || handoff ? 'ok' : '');
     setNote($('vad-note'), vad?.last_error
@@ -678,8 +685,8 @@
       : handoff
         ? `回溯 ${seconds(vad?.handoff?.pre_roll_ms)} · 推理 ${vad?.last_inference_ms ?? '—'} ms · 梯度切句 ${
           vad?.gradient?.cuts ?? 0} 次`
-        : `模型${vad?.model?.files_present ? '已就位' : '缺失'} · 常驻 ${
-          vad?.model?.residency?.declared ? '已声明' : '未声明'}`,
+        : `模型${vad?.model?.files_present ? '已就绪' : '缺失'} · ${
+          listen?.engaged ? '手动 FireRedVAD' : camLive ? '自动 CAM++ live' : '等待 RMS 准入'}`,
     vad?.last_error ? 'bad' : vad?.model?.files_present ? 'good' : 'bad');
     $('vad-last-wav').textContent = last?.wav_path ?? '尚未产出';
     $('vad-last-wav-detail').textContent = last
@@ -701,36 +708,65 @@
           lastDrop ? ` · 最后一次：${DROP_REASONS[lastDrop.reason] ?? lastDrop.reason}` : ''}`;
   }
 
-  function renderAsr(asr, pipeline) {
+  function renderAsr(asr, pipeline, asrBackend) {
     const owner = pipeline?.owner ?? 'speech.rms';
     const authoritative = asr?.authority?.active === true && owner === 'speech.asr';
-    const last = asr?.transcripts?.last;
     const state = asr?.state?.toUpperCase() ?? 'IDLE';
+    const selected = asr?.model?.selected;
+    const runtimeReady = selected?.ready === true;
     setBadge($('asr-state'), state,
       asr?.last_error ? 'bad' : ['QUEUED', 'TRANSCRIBING', 'LISTENING'].includes(state) ? 'ok' : '');
     $('asr-owner').textContent = authoritative ? 'speech.asr' : owner;
     $('asr-countdown').textContent = seconds(asr?.ending?.remaining_ms);
     $('asr-total').textContent = String(asr?.transcripts?.total ?? 0);
-    $('asr-last-text').textContent = last?.text || '尚未产生转写';
-    $('asr-last-detail').textContent = last
-      ? `segment=${last.segment_id} · ${last.timing?.inference_ms ?? '—'} ms · ${last.model?.precision ?? 'unknown'}`
-      : '—';
-    setBadge($('asr-precision'),
-      `${asr?.model?.precision ?? '—'} · ${asr?.model?.htp ?? '—'} · QNN ${asr?.model?.qnn ?? '—'}`, 'tag');
-    setNote($('asr-note'), asr?.last_error
-      ? `ASR 异常：${asr.last_error}`
-      : authoritative
-        ? `关键词=${asr?.ending?.keyword_enabled ? 'ON' : 'OFF'} · 超时=${asr?.ending?.timeout_enabled ? 'ON' : 'OFF'}`
-        : `队列 ${asr?.queue?.depth ?? 0} · 常驻 ${asr?.model?.residency?.declared ? '已声明' : '未声明'}`,
-    asr?.last_error ? 'bad' : 'good');
-    const selected = asr?.model?.selected;
+    const modelName = modelLabel(selected?.id ?? asr?.model?.model ?? 'sensevoice');
+    const htp = asr?.model?.htp ?? 'v73';
+    const qnn = asr?.model?.qnn ? `QNN ${asr?.model?.qnn}` : 'QNN 2.47';
+    setBadge($('asr-precision'), `${modelName} (${htp}|${qnn})`, 'tag');
+    const elNote = $('asr-note');
+    if (elNote) {
+      if (asr?.last_error) {
+        setNote(elNote, `ASR 异常：${asr.last_error}`, 'bad');
+      } else {
+        const depth = Math.max(0, Math.min(5, Number(asr?.queue?.depth) || 0));
+        const qHtml = Array.from({ length: 5 }, (_, i) => (i < depth
+          ? '<span class="q-sq full">■</span>'
+          : '<span class="q-sq empty">□</span>'
+        )).join(' ');
+        if (elNote.innerHTML !== qHtml) {
+          elNote.innerHTML = qHtml;
+        }
+        elNote.className = 'note asr-queue-note';
+      }
+    }
+    /**
+     * ⭐ **automatic 与「本包觉得自己 ready」是两行**（docs/090 §5）。
+     * ⚠ 真机上它们曾经一个说已就绪、一个一个字都跑不出来；写成一行就永远看不见那件事。
+     */
+    // ⚠ 本函数里 `state` 已经是 ASR 状态字符串（第一行就被占了）——
+    //   readiness 必须作为参数传进来，⛔ 不许在这里再造一个同名的东西。
+    const executable = asrBackend?.app_executable ?? null;
+    const autoReady = asrBackend?.automatic_ready;
+    const lastAsrError = asrBackend?.app_asr_error ?? null;
     facts($('asr-model-facts'), [
       ['当前档位', modelLabel(selected?.id ?? asr?.model?.model)],
-      ['选中档位资产', selected
-        ? (selected.files_present ? '已就位' : `缺失：${(selected.missing ?? []).join('、')}`)
-        : null],
-      ['常驻运行时', asr?.model?.runtime],
-      ['常驻 session', asr?.model?.session],
+      ['选中档位状态', selected?.ready === true ? '已就绪'
+        : selected?.reason ?? '无法判定'],
+      ['自动转写可执行', autoReady === true ? '可执行'
+        : autoReady === false ? `未就绪：${executable?.reason ?? executable?.state ?? '未知'}`
+          : 'App 尚未上报'],
+      ['执行体', executable?.resident_id ?? executable?.session ?? null],
+      ...(executable?.ambiguous === true
+        // 同一个模型有多个已加载常驻：不是错误，但必须看得见——⛔ 静默取第一个会让
+        // 一次重复声明泄漏永远查不出来。
+        ? [['⚠ 重复常驻', (executable.candidates ?? []).join(' / ')]]
+        : []),
+      ...(lastAsrError
+        ? [['最近一次自动转写错误',
+          `${lastAsrError.kind}×${lastAsrError.count}：${lastAsrError.error}`]]
+        : []),
+      ['运行时', asr?.model?.runtime],
+      ['当前 session', asr?.model?.session ?? (selected?.session_loaded ? 'App session' : null)],
       ['SenseVoice 资产', asr?.model?.files_present === true ? '已就位'
         : asr?.model?.files_present === false ? '缺失' : null],
       ['CTC 输出名', asr?.model?.output_name],
@@ -754,25 +790,6 @@
     return `${count} 条 · 最近：${reason}`;
   }
 
-  // 状态总线：我们写出去的事实 + 读回来的别人的事实。写者只有一个，读者随意——
-  // 这个分工必须在页面上看得见。
-  function renderStates(states) {
-    const rows = [
-      ...Object.entries(states?.published ?? {}).map(([k, v]) => [`↑ ${k}`, v]),
-      ...Object.entries(states?.observed ?? {}).map(([k, v]) => [
-        `↓ ${k}`,
-        v?.live ? v.value : `${v?.value ?? '—'}（${v?.stale_reason ?? 'not live'}）`,
-      ]),
-    ];
-    facts($('states-grid'), rows);
-    if (!rows.length) $('states-grid').textContent = '尚未推送';
-    // ⚠ 回传抑制不再落在门上（docs/061 §四.2），这里也就不该再显示一个不存在的 echo_guard——
-    // 读一个后端已经不发的字段，永远得到 undefined，而 undefined 看起来和「一切正常」一样。
-    setNote($('states-note'),
-      `已推送 ${states?.writes ?? 0} 次${states?.last_error ? ` · 总线异常：${states.last_error}` : ''}`,
-      states?.last_error ? 'bad' : 'good');
-  }
-
   /**
    * 人类可读的诊断结论。
    * ⚠ 每一条要么由后端事实推出，要么明说「无法判定」——前端不许猜故障原因。
@@ -790,18 +807,11 @@
       const gateOpen = gate?.available === true && gate?.pcm_admission === 'allow';
       add(gateOpen ? 'ok' : '',
         gate?.available === false
-          ? '音量门不可用：PCM 不可用是安全兜底，此时两把钥匙都不开门。'
+          ? '音量门不可用：PCM 不可用是安全兜底，此时不会向下游送入语音段。'
           : gateOpen
-            ? `音量门已开（AVG ${fixed(gate?.decision_value, 3)} ≥ 阈值 ${fixed(gate?.open_threshold, 3)}）。`
-            : `音量门闭合中，等待 AVG ${fixed(gate?.decision_value, 3)} 越过阈值 ${
+            ? `音量门已开（AVG 100ms ${fixed(gate?.decision_value, 3)} ≥ 阈值 ${fixed(gate?.open_threshold, 3)}）。`
+            : `音量门闭合中，等待 AVG 100ms ${fixed(gate?.decision_value, 3)} 越过阈值 ${
               fixed(gate?.open_threshold, 3)}${gate?.open_armed === false ? '（且需先掉回阈值以下重置）' : ''}。`);
-
-      const kws = live.kws;
-      if (listen?.engaged) add('ok', '听写模式已启用：唤醒被直通绕过，自动收工全部让位。');
-      else if (kws?.provider?.connected !== true) {
-        add('bad', `唤醒不可用：拼音 Provider 未连接（${kws?.provider?.last_error ?? kws?.reason ?? '原因未提供'}）。`);
-      } else if (kws?.profile?.built !== true) add('warn', '唤醒词尚未生成，请到设置页录入。');
-      else add('ok', `唤醒就绪：「${kws.profile.display_name}」，已拒绝 ${kws.rejected_hits ?? 0} 次门外命中。`);
 
       const vad = live.vad;
       if (vad?.model?.files_present !== true) add('bad', 'FireRedVAD 模型文件缺失，切段无法工作。');
@@ -809,28 +819,51 @@
       else if (vad?.activity?.processed_frames > 0) {
         add('ok', `切段正常：已处理 ${vad.activity.processed_frames} 帧，本次运行产出 ${
           vad?.wav?.segments_published ?? 0} 段。`);
-      } else add('unknown', '切段无法判定：本次运行还没有处理过任何一帧（尚未被唤醒过）。');
+      } else add('unknown', '切段无法判定：本次运行还没有处理过任何一帧。');
 
       const asr = live.asr;
       const selected = asr?.model?.selected;
       if (asr?.last_error) add('bad', `识别异常：${asr.last_error}`);
       else if (!selected) {
         add('unknown', '识别档位的资产无法判定：后端没有报告被选中的那一档。');
-      } else if (selected.files_present !== true) {
-        // 缺失要说出缺的是哪个文件——只说「缺失」等于让人自己去猜。
-        add('bad', `${modelLabel(selected.id)} 模型文件缺失：${(selected.missing ?? []).join('、') || '未提供清单'}`);
+      } else if (selected.ready !== true) {
+        // 文件型 backend 报缺哪个文件；App 型 backend 报 session 的真实原因。
+        const detail = (selected.missing ?? []).join('、') || selected.reason || '未就绪';
+        add('bad', `${modelLabel(selected.id)} 未就绪：${detail}`);
       } else {
         add('ok', `识别就绪：${modelLabel(selected.id)}，本次运行 ${
           asr?.transcripts?.published_this_run ?? 0} 条。`);
       }
 
-      // 常驻声明。App 侧 worker 重生或 recycle 之后要靠它自动补齐，
-      // 「未声明」意味着下一次唤醒要现场付载入——恰好把代价放在唯一在意延迟的那条路径上。
-      const residents = live.service?.residents;
-      if (!residents) add('unknown', '常驻声明无法判定：本轮还没有跑过一次对账。');
-      else if (/=declared(;|$)/.test(residents) && !/=(?!declared)/.test(residents)) {
-        add('ok', `常驻已声明：${residents}`);
-      } else add('warn', `常驻声明未完成：${residents}`);
+      /** 常驻图是资源事实，不能冒充当前 active；当前活动看明确的 live 投影。 */
+      const cam = live.speaker_activity;
+      if (cam?.vad_mode === 'camplus_automatic') {
+        add(cam.active === true ? 'ok' : 'warn', cam.active === true
+          ? 'CAM++ 正在接收 RMS 准入的 PCM。'
+          : 'CAM++ 图已就绪，但 RMS 未准入，当前没有 CAM++ 推理。');
+      } else if (listen?.engaged) {
+        add('ok', '手动模式由 FireRedVAD 接收 PCM。');
+      }
+
+      /**
+       * ⭐ 谁在执行高频判决。**这一行是事实陈述**：`executor` 由后端按
+       * 「执行体真的在跑吗」算出来，⛔ 页面不许从配置值去猜（docs/087 P3）。
+       */
+      if (cam?.executor === 'app') {
+        const app = cam.app ?? {};
+        add(app.app_profile_ready === true ? 'ok' : 'warn',
+          `VAD / 声纹执行者：App（状态 ${app.app_state ?? '—'} · 声纹${
+            app.app_profile_ready === true ? `已同步 ${app.profile_fingerprint ?? ''}` : '未就绪'
+          } · 转移 ${app.transitions ?? 0} 次 · 段落 ${app.segments_delivered ?? 0} 段）。`);
+        // ⭐ 这条正是 P3 的目的：平时不再搬 PCM。把它摆出来，好过让人去猜。
+        const holders = live.pcm_consumers?.pcm_holders ?? [];
+        add(holders.length === 0 ? 'ok' : 'warn', holders.length === 0
+          ? '官方链当前没有任何 PCM 消费者（PCM 不出 App）。'
+          : `仍有 PCM 消费者：${holders.join('、')}。`);
+        if (app.last_error) add('bad', `App 执行体异常：${app.last_error}`);
+      } else if (cam?.executor_mode && cam.executor_mode !== 'legacy_speech') {
+        add('warn', `VAD / 声纹执行者：本包（已选 ${cam.executor_mode}，但 App 执行体没有接手）。`);
+      }
 
       const observed = live.states?.observed ?? {};
       const tts = observed['speech.tts'];
@@ -844,37 +877,10 @@
     setBadge($('ready-badge'), ready ? 'READY' : 'NOT READY', ready ? 'ok' : 'warn');
   }
 
-  /**
-   * ⭐ 原始 JSON **只在使用者展开时才格式化**（docs/061 §六）。
-   *
-   * 它曾经无条件跑 `JSON.stringify(value, null, 2)`——14KB 的对象、每秒四次、
-   * 而且诊断页是 `hidden` 不是卸载，所以看不见的时候照跑。真机实测：诊断页可见时
-   * Chrome renderer 从 6.35% 涨到 14.26%，这一句是主因。
-   */
-  let rawOpen = false;
-  const renderRaw = (live) => {
-    const box = $('speech-input');
-    if (!box) return;
-    if (!rawOpen) { box.textContent = '（已折叠：点上方按钮展开原始 JSON）'; return; }
-    box.textContent = live ? JSON.stringify(live, null, 2) : '—';
-  };
-  const setRawOpen = (open, live) => { rawOpen = open === true; renderRaw(live); };
-
-  function renderDiagnostics(live, listen) {
-    renderDiagSummary(live, listen);
-    renderInputDiag(live?.input);
-    renderRms(live?.rms_gate);
-    renderKws(live?.kws, live?.pipeline);
-    renderVad(live?.vad);
-    renderAsr(live?.asr, live?.pipeline);
-    if (live?.states) renderStates(live.states);
-    renderMemoryDetail(live?.memory);
-    renderRaw(live);
-  }
-
   window.SpeechViews = {
-    setRawOpen,
     $,
+    /** ⚠ 产品页也要写文本；⛔ 不在 app.js 再抄一份「只在变了时才写」的守卫。 */
+    setText,
     qs,
     number,
     fixed,
@@ -885,24 +891,19 @@
     modelLabel,
     MODEL_LABELS,
     RMS_BAR_MAX,
-    renderOverview,
     renderChain,
-    renderRecords,
-    renderListen,
-    renderStages,
     renderTranscripts,
+    renderAsrLive,
+    latestText,
     renderMemory,
-    renderDiagnostics,
-    // ⭐ 诊断页按域拆开暴露。整块重画意味着一次音量变化要跑九个渲染器，
+    // ⭐ 按域拆开暴露。整块重画意味着一次音量变化要跑九个渲染器，
     // 而其中八个的数据一个字都没变（真机实测：诊断页可见时这件事值 18.4% 的一个核）。
     renderDiagSummary,
+    renderAudioControl,
     renderInputDiag,
     renderRms,
-    renderKws,
     renderVad,
     renderAsr,
-    renderStates,
-    renderMemoryDetail,
-    renderRaw,
+    renderSpeakerGate,
   };
 })();

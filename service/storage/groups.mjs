@@ -40,6 +40,11 @@ const readJson = (file) => {
 /**
  * item → feed observation。字段名与旧 feed 保持一致：消费者读的是名字，不是来源。
  */
+const sourceKindOf = (item) => item?.source_kind
+  ?? (item?.source === 'app_segment' ? 'app_segment' : null);
+const audioAvailableOf = (item) => item?.audio_available === true
+  || (sourceKindOf(item) === 'app_segment' && item?.audio_available !== false);
+
 const feedRecord = (item, seq) => ({
   schema: 'termux-os.speech-transcript.v1',
   seq,
@@ -50,9 +55,12 @@ const feedRecord = (item, seq) => ({
   final: true,
   language: item.language ?? null,
   model: item.model ?? null,
+  backend: item.backend ?? null,
   timing: { inference_ms: item.inference_ms ?? null },
-  end_gate: { keyword_matched: item.keyword_matched ?? null },
   group_id: item.group_id,
+  duration_ms: item.duration_ms ?? null,
+  audio_available: audioAvailableOf(item),
+  source_kind: sourceKindOf(item),
 });
 
 export class RecordGroups {
@@ -86,6 +94,14 @@ export class RecordGroups {
     }
     this.lastRotation = null;
     this.lastError = null;
+    /**
+     * ⭐ **最新的那一句**，两条处理门共用的唯一来源。
+     *
+     * ⚠ 概览页曾读记录组、诊断页读 `asr.transcripts.last`（那是 **SenseVoice 控制器**
+     *   自己的最后一条）——于是选 Audio8 时诊断页永远显示「尚未产生转写」，而句子
+     *   正在一条条落库。两个页面问的是同一个问题，就必须读同一个字段。
+     */
+    this.lastSentence = null;
     /**
      * ⭐ transcript feed 的游标（docs/061 §七）。
      *
@@ -154,16 +170,29 @@ export class RecordGroups {
       this.refreshGroup(group);
     }
     this.state.groups = this.state.groups.filter((group) => group.state !== 'lost' || true);
+    this.hydrateLastSentence();
     this.persist();
     void this.rotate();
     return { notes, snapshot: this.snapshot() };
   }
 
+  /**
+   * ⭐ **一个 commit = 一个句子**（docs/075 §8）。「50 句」数的是**句子**，不是 item。
+   *
+   * ⚠ 失败的 item 仍然要留在组里（它是这一段音频的结论），但它**不是一句话**——
+   *   把它算进 50，一组里就可能只有 43 句真话，而这一组存在的理由正是「50 句上下文」。
+   *   两个数分开：`item_count` 是盘上有几条，`sentence_count` 是这组有几句。
+   */
+  sentencesIn(items) {
+    return items.filter((item) => item.status === 'succeeded').length;
+  }
+
   refreshGroup(group, items = this.readItems(group.group_id)) {
     group.item_count = items.length;
+    group.sentence_count = this.sentencesIn(items);
     // 每个 item 写下去就是终态，故「已终结几条」恒等于「有几条」，不再单独记。
     if (group.state === 'archived' || group.state === 'lost') return group;
-    const full = items.length >= this.groupSize;
+    const full = group.sentence_count >= this.groupSize;
     if (full) {
       if (group.state !== 'completed') {
         group.state = 'completed';
@@ -184,6 +213,7 @@ export class RecordGroups {
       group_seq: seq,
       state: 'active',
       item_count: 0,
+      sentence_count: 0,
       created_at: new Date(this.now()).toISOString(),
       completed_at: null,
     };
@@ -209,21 +239,41 @@ export class RecordGroups {
     if (!segmentId) throw new Error('record item requires a segment_id');
     const succeeded = outcome.status === 'succeeded';
     let group = this.activeGroup();
-    if (!group || group.item_count >= this.groupSize) group = this.openGroup();
+    // ⚠ 从盘上现算，不信内存里那个字段：它可能是旧版状态文件里根本没有的东西，
+    //   而「组满了没有」错一次就会有第 51 句挤进上一组。
+    if (group && this.sentencesIn(this.readItems(group.group_id)) >= this.groupSize) group = null;
+    if (!group) group = this.openGroup();
     const items = this.readItems(group.group_id);
     if (items.some((item) => item.segment_id === segmentId)) {
       return { admitted: false, reason: 'duplicate_segment', segment_id: segmentId };
     }
+    const appOwned = segment.source_kind === 'app_segment' || segment.source === 'app_segment';
     const wavPath = path.join(this.groupDir(group.group_id), `${segmentId}.wav`);
     let wavAvailable = false;
-    try {
-      if (segment.wav_path && fs.existsSync(segment.wav_path)) {
-        fs.renameSync(segment.wav_path, wavPath);
-        wavAvailable = true;
+    if (!appOwned) {
+      try {
+        if (segment.wav_path && fs.existsSync(segment.wav_path)) {
+          fs.renameSync(segment.wav_path, wavPath);
+          wavAvailable = true;
+        }
+      } catch (error) {
+        this.lastError = `wav move failed: ${String(error?.message ?? error)}`;
       }
-    } catch (error) {
-      this.lastError = `wav move failed: ${String(error?.message ?? error)}`;
     }
+    /**
+     * ⭐ **App 段落的音频「在不在」是由结构保证的，⛔ 不是 admit 那一刻的一张快照。**
+     *
+     * 判据链是硬的：这条 item 在**活组**里（`recent`/`find` 只读活组），
+     * 而活组最多两组 = 100 句（过渡期 150），App 侧的上限 `history.wav_keep`
+     * 默认 200 **高于**那个天花板 ⇒ 只要它还出现在列表里，App 那边就还有它。
+     * 一组被归档时它就整组从活组消失，⛔ 根本不会被显示。
+     *
+     * ⚠ 存快照的后果两个方向都发生过：`archive_wav` 还没写好就 admit ⇒
+     * 一条**刚转写完**的句子显示「音频已过期」；反过来存了 true 又被淘汰 ⇒
+     * 一个必然 404 的播放器。**一个由别人拥有的事实，不要在自己这边存一份副本。**
+     */
+    const audioAvailable = appOwned ? true : wavAvailable;
+    const sourceKind = segment.source_kind ?? (appOwned ? 'app_segment' : null);
     const item = {
       schema: ITEM_SCHEMA,
       segment_id: segmentId,
@@ -232,13 +282,26 @@ export class RecordGroups {
       status: succeeded ? 'succeeded' : 'failed',
       wav_path: wavAvailable ? wavPath : null,
       wav_available: wavAvailable,
+      audio_available: audioAvailable,
+      audio_source: appOwned ? 'app' : wavAvailable ? 'speech' : null,
+      source_kind: sourceKind,
       segment_start_ms: segment.start_ms ?? null,
       segment_end_ms: segment.end_ms ?? null,
       duration_ms: segment.duration_ms ?? null,
       text: succeeded ? (outcome.text ?? '') : null,
       model: outcome.model ?? null,
+      /**
+       * 这一句是哪条处理门产出的。⚠ 与 `model` 分开：`model` 是权重的名字，
+       * `backend` 是那扇门的名字——同一组里两条门混着是允许的（docs/075 §9），
+       * 而「这一组是怎么来的」只有逐句记下来才答得出。
+       */
+      backend: outcome.backend ?? null,
       inference_ms: outcome.inference_ms ?? null,
-      error: outcome.error ?? (wavAvailable ? null : 'WAV was not available at admit time'),
+      // ⚠ 「本该有 WAV 却没拿到」才是错误。听写链（docs/065）的 PCM 从不离开 App，
+      //    它本来就没有 WAV——把那当成错误会让每一条正常的听写记录都带着一句假报警。
+      error: outcome.error
+        ?? (!appOwned && segment.wav_path && !wavAvailable ? 'WAV was not available at admit time' : null),
+      source: outcome.source ?? 'segment',
       created_at: new Date(this.now()).toISOString(),
       completed_at: new Date(this.now()).toISOString(),
     };
@@ -247,10 +310,10 @@ export class RecordGroups {
       item.feed_seq = this.nextFeedSeq();
       item.utterance_id = outcome.utterance_id ?? null;
       item.language = outcome.language ?? null;
-      item.keyword_matched = outcome.keyword_matched ?? null;
       item.observed_ms = outcome.observed_ms ?? this.now();
     }
     items.push(item);
+    if (succeeded) this.lastSentence = this.sentenceView(item);
     this.writeItems(group.group_id, items);
     this.refreshGroup(group, items);
     this.persist();
@@ -275,11 +338,18 @@ export class RecordGroups {
       item.status = outcome.status === 'succeeded' ? 'succeeded' : 'failed';
       item.text = outcome.status === 'succeeded' ? (outcome.text ?? '') : item.text;
       item.model = outcome.model ?? item.model;
+      item.backend = outcome.backend ?? item.backend;
       item.inference_ms = outcome.inference_ms ?? item.inference_ms;
       item.error = outcome.error ?? null;
       item.completed_at = new Date(this.now()).toISOString();
-      // ⚠ 游标不动：重转写改的是同一句话的内容，不是一句新话。重新发号会让
-      // 每个持久化游标的消费者把它当成新句子再读一遍。
+      /**
+       * ⭐ **「最近识别」要跟着改写走**（docs/091 §使用者反馈④）。
+       * ⚠ 这里原本不动 `lastSentence`：于是 A+B 的 B 定稿之后，页面上那一行仍然是
+       *   上一句——内容明明更新了，显示却停在旧的，看起来像「没有提交」。
+       * ⛔ 但游标（`feed_seq`）仍然不动：重转写改的是同一句话的内容，不是一句新话，
+       *   重新发号会让每个持久化游标的消费者把它当成新句子再读一遍。
+       */
+      if (item.status === 'succeeded') this.lastSentence = this.sentenceView(item);
       this.writeItems(group.group_id, items);
       this.refreshGroup(group, items);
       this.persist();
@@ -287,6 +357,45 @@ export class RecordGroups {
       return { updated: true, group_id: group.group_id, item_seq: item.item_seq };
     }
     return { updated: false, reason: 'unknown_segment' };
+  }
+
+  /** 一句话的对外形状。⚠ 只有一个构造处，页面与 API 不会各拼一份。 */
+  sentenceView(item) {
+    if (!item) return null;
+    return {
+      text: item.text ?? '',
+      backend: item.backend ?? null,
+      model: item.model ?? null,
+      group_id: item.group_id,
+      item_seq: item.item_seq,
+      feed_seq: item.feed_seq ?? null,
+      inference_ms: item.inference_ms ?? null,
+      /**
+       * ⭐ **原音频时长**。item 上一直有它，而这个投影把它丢了——
+       * 于是概览那行「原音频 => 推理 | 倍速」永远算不出来，只能退化成一个推理毫秒数。
+       * ⚠ 少一个字段不会报错：`undefined` 与「这条记录没有音频」在下游长得一样。
+       */
+      duration_ms: item.duration_ms ?? null,
+      audio_available: audioAvailableOf(item),
+      audio_source: item.audio_source ?? null,
+      source_kind: sourceKindOf(item),
+      segment_id: item.segment_id ?? null,
+      at_ms: Date.parse(item.completed_at) || null,
+    };
+  }
+
+  /** 启动时把它从盘上补回来：重启不该让「最新一句」变成「还没说过话」。 */
+  hydrateLastSentence() {
+    for (const group of [...this.liveGroups()].reverse()) {
+      const items = this.readItems(group.group_id);
+      for (let i = items.length - 1; i >= 0; i -= 1) {
+        if (items[i].status === 'succeeded') {
+          this.lastSentence = this.sentenceView(items[i]);
+          return this.lastSentence;
+        }
+      }
+    }
+    return null;
   }
 
   /** 盘上还留着的组（未归档、未丢失），按序号升序。 */
@@ -375,11 +484,21 @@ export class RecordGroups {
     const rows = [];
     for (const group of [...this.liveGroups()].reverse()) {
       for (const item of this.readItems(group.group_id).reverse()) {
-        rows.push(item);
+        rows.push(this.#withLiveAudio(item));
         if (rows.length >= bounded) return rows;
       }
     }
     return rows;
+  }
+
+  /**
+   * 读取时补上 App 段落的音频可用性。⭐ 同 [admit] 的理由：它是结构保证的。
+   * ⚠ 这一步也**修好了老记录**——admit 时序修复之前落库的那些带着 `false`，
+   *   而它们的音频其实一直都在。⛔ 不去改盘上的旧数据：那是历史，改它才是错的。
+   */
+  #withLiveAudio(item) {
+    if (item?.source_kind !== 'app_segment' || item.audio_available === true) return item;
+    return { ...item, audio_available: true, audio_source: 'app' };
   }
 
   /**
@@ -418,7 +537,8 @@ export class RecordGroups {
       active: active ? {
         group_id: active.group_id,
         group_seq: active.group_seq,
-        progress: `${active.item_count}/${this.groupSize}`,
+        progress: `${active.sentence_count ?? 0}/${this.groupSize}`,
+        sentence_count: active.sentence_count ?? 0,
         item_count: active.item_count,
       } : null,
       // ⚠ 只报「盘上还有哪两组」，**不报全生命周期累计** —— 那正是这一轮要拿掉的东西。
@@ -427,6 +547,7 @@ export class RecordGroups {
         group_seq: group.group_seq,
         state: group.state,
         item_count: group.item_count,
+        sentence_count: group.sentence_count ?? 0,
         created_at: group.created_at,
         completed_at: group.completed_at,
         wav_available: true,

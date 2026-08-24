@@ -23,6 +23,12 @@ export class ResidentGraph {
   constructor({
     android, id, model, ctxKey = null, heal = null, estMemMb = 0, priority = 50,
     /**
+     * 跑在哪个后端。默认 `htp`——既有五张图一行不改。
+     * ⭐ `cpu` 是给 CAM++ 声纹图用的：它没有 HTP ctx，也不该去抢 NPU
+     *   （实测手机 CPU 上 3 秒的段 40 ms，本来就付得起）。
+     */
+    backend = 'htp',
+    /**
      * ⭐ 模型的**绝对路径**，来自 Framework 的 Asset map。
      *
      * ⚠ 只给 `model`（一个名字）时，App 会按它自己的 `htp_models_dir` 去拼路径——
@@ -40,6 +46,7 @@ export class ResidentGraph {
     this.android = android;
     this.id = id;
     this.model = model;
+    this.backend = backend;
     this.modelPath = modelPath;
     this.ctxPath = ctxPath;
     this.ctxKey = ctxKey;
@@ -55,7 +62,7 @@ export class ResidentGraph {
     const body = {
       worker: 'ort',
       model: this.model,
-      backend: 'htp',
+      backend: this.backend,
       pinned: true,
       priority: this.priority,
       est_mem_mb: this.estMemMb,
@@ -93,6 +100,16 @@ export class ResidentGraph {
       if (Number(error?.status) !== 404) throw error;
     }
     this.declared = false;
+  }
+
+  /**
+   * 服务重启后的事实对账只同步本地镜像，不触碰 App 的声明或会话。
+   * 这样 UI 不会把「App 已有」误画成「本包未声明」，也不会为了修显示而 churn 图。
+   */
+  reconcileDeclared(declared) {
+    this.declared = declared === true;
+    if (!this.declared) this.lastDeclaredAtMs = null;
+    return this.snapshot();
   }
 
   /** 本条声明的 io 缓存（输出名探一次永久记住）；未就绪时返回 null 而不是抛。 */

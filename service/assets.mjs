@@ -73,7 +73,7 @@ export async function resolveAssetRoot(id, { fetchImpl = fetch, timeoutMs = 8000
  * ⭐ **ASR 模型不是安装依赖，是「开始听写」时的依赖。**
  *
  * 一台机器只会用到一个 ASR 档位，而是哪一个要等使用者选。装的时候全下等于
- * SenseVoice 的 ctx 478MB + 源图 937MB + Qwen 编码器 376MB + 两档解码器 1.5GB，
+ * SenseVoice 的 ctx 478MB + 源图 937MB，
  * 其中绝大部分永远不会被加载一次。所以缺的时候就地取一次，取完再问一遍。
  *
  * ⚠ 这不是「另一种安装」：只有 manifest 里标了 `optional` 的资产走得通这条路，

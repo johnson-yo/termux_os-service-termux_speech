@@ -28,15 +28,17 @@ const INVISIBLE = new RegExp(
 const EDGE_SPACE = /^\s+|\s+$/gu;
 
 /**
- * ⛔ 只有**规范化之后没有可见内容**才算空白。
+ * ⛔ 只有**规范化之后包含文字或数字**才算 meaningful。
  *
- * 标点-only（「。。。」「?!」）**不算空白**：使用者可能真的只说了一个语气，
- * 而且 CTC 解码器对真正的空结果给的是空串（id 0 是 blank，`<|zh|>` 一类标签会被剥掉），
- * 我们不需要替它猜。
+ * 标点/符号-only（「。。。」「?!」「★」）是 ASR 的无意义结果：它不进 transcript、
+ * records 或 feed。正文里的标点保留，所以「期待。」仍然是正常句子。
  */
 export function normalizeTranscript(raw) {
   const source = String(raw ?? '');
   const text = source.normalize('NFC').replace(INVISIBLE, '').replace(EDGE_SPACE, '');
+  if (text.length > 0 && PUNCTUATION_OR_SYMBOL_ONLY.test(text)) {
+    return { text: '', isBlank: true, reason: 'punctuation_only' };
+  }
   if (text.length > 0) return { text, isBlank: false, reason: null };
   // 三种空白分开记：它们对应三种不同的上游故障，压成一个 reason 就查不动了。
   const reason = source.length === 0 ? 'empty'
@@ -44,6 +46,8 @@ export function normalizeTranscript(raw) {
       : 'whitespace_only';
   return { text: '', isBlank: true, reason };
 }
+
+const PUNCTUATION_OR_SYMBOL_ONLY = /^[\p{P}\p{S}\s]+$/u;
 
 /**
  * 空白诊断计数器。⛔ 只留 count / last reason / last timestamp——

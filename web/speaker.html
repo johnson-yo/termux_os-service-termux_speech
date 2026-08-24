@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Speaker Lab · CAM++ 校准</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="speaker.css">
+</head>
+<body>
+<!--
+  docs/080 声纹登记 + 实时滑窗 USER-VAD。
+  ⛔ 到 similarity 与 episode WAV 为止：不调 SenseVoice、不写 records、不占 50 句 group。
+  ⛔ 只是多开一个 PCM 水龙头（consumer `speaker`）——开它不关别人，关它不动别人。
+  ⚠ 内容必须放在 `.page` 里：`body{overflow:hidden}` 是全站刻意的，只有 `.page` 会滚。
+-->
+<main>
+  <header class="lab-head">
+    <div>
+      <h1>Speaker Lab</h1>
+      <!--
+        ⚠ 0.21.5：登记的**正式入口是主页面的「我的声音」tab**，不是这一页。
+          两个地方叫同一个名字，使用者分不清哪个才算数。
+        ⭐ 这一页只剩它独有的那件事：看分数分布、调阈值窗长、跑实时测试。
+      -->
+      <p class="note" id="scope">CAM++ 校准台 · 开发者工具。登记与启用请用主页面的「我的声音」。</p>
+    </div>
+    <a class="secondary" href="index.html">← 返回</a>
+  </header>
+  <section class="page">
+
+  <!--
+    ⭐ 这一页的**默认形态是产品流程**：三步走完就能用，全程不需要理解 CAM++ / 阈值 / 窗长。
+    校准台仍在（下面的开发者工具里），⛔ 但它不再是使用者打开这一页看到的第一样东西。
+    ⚠ 生产链状态必须**长在动手的那一处**。真机踩过：使用者在这一页重建了声纹，
+      正式声纹门当场退回安全放行（正确），而这一页什么都没说——于是接下来整轮测试里
+      背景的话照样进了 ASR，看起来像「门坏了」。后果发生在别处，提示就该出现在这里。
+  -->
+  <section class="card" id="card-voice">
+    <div class="section-title"><div><h2>登记我的声音 <span id="prod-badge" class="badge">—</span></h2>
+      <p class="note" id="prod-note">—</p></div></div>
+
+    <!-- ⚠ 失败必须看得见，而且要出现在**使用者正在看的那一屏**：
+         旧代码把错误写进 `#test-note`，那个节点现在折叠在开发者工具里面。 -->
+    <p class="note" id="page-error" hidden></p>
+    <div id="profile-facts" class="facts"></div>
+
+    <h3 class="step">第 1 步 · 录几段自己的话</h3>
+    <p class="note" id="enroll-note">点「开始录样本」，用平时的音量和距离说几句话，
+      每次停顿自动切一段。建议录 5 段，<b>至少 3 段</b>。</p>
+    <div class="row">
+      <button id="enroll-start">开始录样本</button>
+      <button id="enroll-stop" class="secondary">停止</button>
+      <span id="mode-badge" class="badge">IDLE</span>
+    </div>
+    <!-- ⭐ 每一段都能**试听 / 删除 / 重录**——录坏的那一段不该逼使用者从头再来。 -->
+    <ul id="enrollments" class="clip-list"></ul>
+
+    <h3 class="step">第 2 步 · 生成声纹</h3>
+    <p class="note">把上面的样本合成一份「你的声音长什么样」。样本增删之后要重新生成。</p>
+    <div class="row">
+      <button id="profile-build">生成声纹</button>
+      <button id="profile-clear" class="secondary">清除全部</button>
+    </div>
+
+    <h3 class="step">第 3 步 · 启用</h3>
+    <!--
+      ⚠ 旧文案是「确认当前阈值」——它问的是一个使用者不该需要知道的量。
+        产品语义是「我录好了，开始用它」；阈值确认只是这句话的实现。
+    -->
+    <p class="note">启用前，常驻助手会<b>把所有声音都放进来</b>（不会漏掉你，但也挡不住背景）。
+      启用之后它才会只认你的声音。</p>
+    <div class="row">
+      <button id="prod-ack">完成登记并启用</button>
+    </div>
+  </section>
+
+  <!--
+    ⭐ 以下全部是**开发者/校准**内容：默认折叠。
+    ⛔ 它们里面的参数（threshold / window_ms / step_ms / head_trim / tail_margin）
+      是**校准台的**参数，看起来像官方设置会误导人——所以它们只出现在这里面。
+  -->
+  <details id="dev-lab">
+  <summary>开发者工具 · Speaker Lab（校准、实时测试、参数）</summary>
+  <p class="note">CAM++ CPU 滑窗 · 到 similarity 为止 · 不跑 ASR · 不写记录。
+    ⛔ 这里的数字用于调试与校准，<b>不是产品设置</b>。</p>
+  <div id="lab-facts" class="facts"></div>
+
+  <section class="card">
+    <div class="section-title"><div><h2>② 实时 USER-VAD</h2>
+      <p class="note" id="test-note">—</p></div></div>
+    <div class="row">
+      <button id="test-start">开始实时测试</button>
+      <button id="test-stop" class="secondary">停止</button>
+      <span id="state-badge" class="badge">OTHER</span>
+      <span id="vad-badge" class="badge tag">VAD —</span>
+      <span id="label-badge" class="badge tag">标签 —</span>
+    </div>
+    <!--
+      ⭐ 四个量必须同屏：raw similarity / 越阈 / on-off streak / 最终状态。
+         少了它们，「模型没认出来」和「迟滞还没数够」在页面上长得一模一样。
+    -->
+    <canvas id="tl" height="150"></canvas>
+    <p class="note tl-legend">上：CAM++ similarity（虚线 = threshold） · 下：FireRedVAD 概率 ·
+      底条：<span class="keep">USER</span> / <span class="muted">OTHER</span>。
+      ⛔ VAD 只是显示，<b>不切 CAM++ 的窗</b>。</p>
+    <div id="live-facts" class="facts"></div>
+  </section>
+
+  <!--
+    docs/084 CAM++ HTP 验收模式。⛔ 与②那套 CPU USER-VAD 是**两条独立的链**：
+    ②是 docs/080/081 的校准台（CPU、动态 T），这里是固定 [1,148,80] 的 QNN2.47 HTP ctx。
+    ⚠ backend / graph / compute_unit 必须显示出来——CPU 也能算出一个分数，
+      不写明就分不清此刻跑在哪，那正是这类验收最容易骗人的地方。
+  -->
+  <section class="card" id="cam-card">
+    <div class="section-title"><div><h2>③ CAM++ Activity Test（HTP）<span id="cam-badge" class="badge">OFF</span></h2>
+      <p class="note" id="cam-note">用①登记好的声纹，实时看 CAM++ 在 HTP 上的打分与 USER 状态；
+        每切出一段就存一个可试听的 WAV。⛔ 不进 ASR、不写记录、不占 50 句。</p></div></div>
+    <div class="row">
+      <button id="cam-start">开始 Activity Test</button>
+      <button id="cam-stop" class="secondary">停止</button>
+      <span id="cam-backend" class="badge tag">backend —</span>
+      <span id="cam-graph" class="badge tag">graph —</span>
+      <span id="cam-profile" class="badge tag">profile —</span>
+    </div>
+    <div class="row">
+      <label class="inline">句首模式
+        <select id="cam-headmode"></select></label>
+      <label class="inline">头部裁剪 head_trim
+        <select id="cam-head"></select></label>
+      <label class="inline">尾部余量 tail_margin
+        <select id="cam-tail"></select></label>
+      <label class="inline">半快门等待 grace
+        <select id="cam-grace"></select></label>
+      <span class="note">⭐ <b>小停顿只是半快门</b>（先记下句尾但不封段），
+        等待期内又开口就<b>并回同一段</b>；<b>确认没有后续才落全快门</b> = commit。
+        ⛔ 检测晚≠音频晚：切点按 <code>first_maybe_end − 1500ms + 余量</code> 反推。
+        改完**下一段立即生效**。优先「不切字」，其次才是「尾巴短」。</span>
+    </div>
+    <div class="row cam-live">
+      <span class="cam-state" id="cam-state">OTHER</span>
+      <span class="cam-sim" id="cam-sim">—</span>
+      <span class="badge tag" id="cam-userseen">USER_SEEN no</span>
+      <span class="badge tag" id="cam-cand">candidate —</span>
+    </div>
+    <div id="cam-facts" class="facts"></div>
+    <p class="note">最近的分数（每 300 ms 一点，新的在右）：</p>
+    <div id="cam-history" class="cam-history"></div>
+    <p class="note" id="cam-last">—</p>
+  </section>
+
+  <section class="card">
+    <div class="section-title"><div><h2>③b 切出来的片段（可试听）</h2>
+      <p class="note" id="cam-seg-note">每次 speaker_exit / vad_silence commit 存一段
+        16k mono PCM16 WAV，只留最近 30 条。点▶直接听 CAM++ 到底切了什么。</p></div></div>
+    <ul id="cam-segments" class="clip-list"></ul>
+  </section>
+
+  <section class="card">
+    <div class="section-title"><div><h2>③ 参数（改完下一个窗立即生效）</h2>
+      <p class="note" id="cfg-note">—</p></div></div>
+    <div class="row">
+      <label class="inline">window_ms<select id="cfg-window_ms"></select></label>
+      <label class="inline">step_ms<input id="cfg-step_ms" type="number" step="50" min="50"></label>
+      <label class="inline">threshold<input id="cfg-threshold" type="number" step="0.01" min="-1" max="1"></label>
+      <label class="inline">on_windows<input id="cfg-on_windows" type="number" step="1" min="1"></label>
+      <label class="inline">off_windows<input id="cfg-off_windows" type="number" step="1" min="1"></label>
+      <button id="cfg-save" class="secondary">应用</button>
+    </div>
+    <p class="note" id="recal-note"></p>
+  </section>
+
+  <section class="card">
+    <div class="section-title"><div><h2>④ 场景标签与分数分布</h2>
+      <p class="note">标签<b>只用于统计和回看</b>，绝不参与 USER-VAD 判决。</p></div></div>
+    <div class="row" id="label-row"></div>
+    <p id="label-ack" class="note">点一个标签开始记录；⛔ 标签只进统计，绝不参与判决。</p>
+    <p id="label-count" class="note">—</p>
+    <div id="label-stats" class="facts"></div>
+    <p class="note" id="suggest-note">—</p>
+    <div class="row">
+      <button id="suggest-apply" class="secondary">采用建议阈值</button>
+      <button id="labels-clear" class="secondary">清空统计</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="section-title"><div><h2>⑤ 最近 USER episode（可试听）</h2>
+      <p class="note" id="episodes-note">按最终 USER 状态录：进 USER 开始、出 USER 后再收 1 秒。
+        只留最近 10 个，更旧的连 WAV 一起删。</p></div>
+      <button id="purge" class="secondary">清空</button></div>
+    <ul id="episodes" class="clip-list"></ul>
+  </section>
+  </details>
+
+  </section>
+</main>
+<script src="/admin/session.js"></script>
+<script src="speaker.js"></script>
+</body>
+</html>

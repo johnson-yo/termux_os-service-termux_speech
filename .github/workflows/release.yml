@@ -102,7 +102,7 @@ jobs:
             process.exit(bad ? 1 : 0);
           '
         env:
-          FRAMEWORK_REF: '0.2.23'
+          FRAMEWORK_REF: '0.2.39'
 
       - name: Host test suites
         run: |

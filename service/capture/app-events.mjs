@@ -23,6 +23,34 @@ export class AppEventsClient {
     clearTimer = clearTimeout,
   } = {}) {
     this.onChange = onChange;
+    /**
+     * 拍手开门的回调。⭐ 判据是**计数递增**而不是布尔：
+     * 布尔无法区分「新的一次」与「同一次的重复推送」，而事件总线本就允许重复。
+     */
+    this.onGateOpen = () => {};
+    /**
+     * 每收到一次 gate 事实就调用（⛔ 不只在开门时）。
+     * ⚠ 模式必须**每一帧都跟随**：只在开门时同步的话，切到拍掌之后
+     *   在第一次拍掌之前，音量那条路仍然开着。
+     */
+    this.onGateFacts = () => {};
+    /**
+     * App 内说话人活动执行体的低频事实（docs/087 P3）。
+     * ⛔ 与 gate 同一形状：**载荷带着递增计数**，消费方据此做 exactly-once。
+     */
+    this.onActivity = () => {};
+    this.activity = null;
+    /**
+     * App 侧 policy 的**生效**事实。⭐ 本包据此调自己的 `UserWatchdog` 长度——
+     * ⛔ 不轮询、⛔ 不各存一份（各存一份的症状是「界面上倒计时变了，门却按旧的关」）。
+     */
+    this.onPolicy = () => {};
+    this.policy = null;
+    /** App 的 segment 结果事实（docs/088 P4）。⛔ 只转发，判断在消费方。 */
+    this.onSegment = () => {};
+    this.segment = null;
+    this.gateOpens = null;
+    this.gate = null;
     this.now = now;
     this.WebSocketImpl = WebSocketImpl;
     this.setTimer = setTimer;
@@ -139,9 +167,57 @@ export class AppEventsClient {
     this.lastEvent = typeof frame?.event === 'string' ? frame.event : null;
     const data = frame?.data ?? {};
     if (data.capture && typeof data.capture === 'object') this.capture = data.capture;
+    if (data.gate && typeof data.gate === 'object') this.observeGate(data.gate);
+    if (data.activity && typeof data.activity === 'object') this.observeActivity(data.activity, bootId);
+    if (data.policy && typeof data.policy === 'object') this.observePolicy(data.policy);
+    if (data.segment && typeof data.segment === 'object') this.observeSegment(data.segment, bootId);
     this.intervals.ingest(data.playing, bootId);
     this.onChange();
     return frame;
+  }
+
+  /**
+   * App 的 Gate 事实。
+   *
+   * ⭐ **P2：volume 与 feature 对本包完全等价。** 两种模式都由 App 判定，
+   *   本包只消费「开了第几次」。⚠ P1 时这里还有一句 `mode !== 'feature' → return`——
+   *   那时 volume 仍由本包的 RmsGate 判，不挡住就会同一扇门被开两次。
+   *   P2 把 admission 整个收回 App 之后那句必须删：留着的话
+   *   **volume 模式下门永远不会开**，而两边看起来都正常。
+   *   `mode` 从此只是 metadata，⛔ 不参与判断。
+   * ⚠ 计数**倒退**说明 App 重生过（计数器归零），此时只重新对齐基线，⛔ 不当成一次开门。
+   */
+  observeGate(gate) {
+    this.gate = gate;
+    try { this.onGateFacts(gate); } catch { /* 观测不得影响事件流 */ }
+    const opens = Number(gate.opens);
+    if (!Number.isFinite(opens)) return;
+    const previous = this.gateOpens;
+    this.gateOpens = opens;
+    if (previous === null || opens <= previous) return;
+    if (gate.testing === true) return;      // 测试模式只打分，⛔ 不驱动任何下游
+    try { this.onGateOpen(gate); } catch { /* 观测不得影响事件流 */ }
+  }
+
+  /** App 的 segment 结果事实。⛔ 只转发，exactly-once 在消费方（它才知道自己消费到哪）。 */
+  observeSegment(segment, bootId = null) {
+    this.segment = segment;
+    try { this.onSegment(segment, bootId ?? this.bootId); } catch { /* 观测不得影响事件流 */ }
+  }
+
+  /** App 的 policy 事实。⛔ 只转发，判断在调用方。 */
+  observePolicy(policy) {
+    this.policy = policy;
+    try { this.onPolicy(policy); } catch { /* 观测不得影响事件流 */ }
+  }
+
+  /**
+   * App 执行体的活动事实。⛔ 这里**只转发**——exactly-once 与回填的判据在
+   * `speaker/app-activity.mjs` 里，因为那是它自己的状态；观测层不许持有产品判据。
+   */
+  observeActivity(activity, bootId = null) {
+    this.activity = activity;
+    try { this.onActivity(activity, bootId ?? this.bootId); } catch { /* 观测不得影响事件流 */ }
   }
 
   /** watchdog 用：读 `/api/android/mic/status` 得到的那份 capture 快照同样喂进来。 */
@@ -170,6 +246,25 @@ export class AppEventsClient {
     return this.capture?.valid_pcm_emitting === true;
   }
 
+  /**
+   * ⭐ **麦克风此刻还在录吗** —— 由持有它的 App 回答。
+   *
+   * ⚠ 这与本包那条 RMS 观测流的新鲜度是两件事。P2 把 admission 搬进 App 之后，
+   *   观测流可以整条不在而麦克风好好的；拿观测流当麦克风的生死判据，
+   *   会让 `openFromRequest` 的安全兜底每次都静默拒绝开门。
+   * @returns `true`/`false` = App 明确的事实；`null` = 不知道（没连上、
+   *   事实已陈旧、或 App 压根没报这个字段），此时调用方该退回自己的观测。
+   */
+  captureLive() {
+    if (!this.connected) return null;                 // 断线 ⇒ 手里的事实已陈旧
+    const capture = this.capture;
+    if (!capture || typeof capture !== 'object') return null;
+    if (typeof capture.recording === 'boolean') return capture.recording;
+    const state = this.captureState();
+    if (state === 'unknown') return null;
+    return state === 'active';
+  }
+
   snapshot(nowMs = this.now()) {
     return {
       schema: 'termux-os.speech-capture-observer.v1',
@@ -185,6 +280,13 @@ export class AppEventsClient {
       // 断线后这份 capture 仍是我们最后知道的事实，但它已经**陈旧**。
       stale: !this.connected,
       capture: this.capture,
+      /**
+       * App 的 Gate 事实。⭐ 让它可见，否则「拍掌为什么没开门」只能靠猜——
+       * 是没收到事件、还是收到了但 App 处在 volume 模式、还是模板没就绪，
+       * 这三件事在没有这份快照时长得一模一样。
+       */
+      gate: this.gate,
+      gate_opens_seen: this.gateOpens,
       tts: this.intervals.snapshot(),
       last_error: this.lastError,
     };

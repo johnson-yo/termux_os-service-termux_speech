@@ -155,6 +155,53 @@ test(
   );
 }
 
+{
+  const facts = { value: 0 };
+  const paced = new StateHub({
+    builders: { fast: () => ({ value: facts.value }) },
+    hot: ['fast'],
+    minIntervalMs: 0,
+  });
+  paced.build();
+  const started = Date.now();
+  const waiting = paced.watch(paced.version, paced.bootId, 2000, 100);
+  const keepAlive = setTimeout(() => {}, 3000);
+  setTimeout(() => {
+    facts.value = 1;
+    paced.markHot();
+    paced.schedule();
+  }, 20);
+  const result = await waiting;
+  clearTimeout(keepAlive);
+  const payload = JSON.parse(result.json);
+  test(
+    'A10b observer cadence throttles stable-state rebuilds without delaying a changed fact forever',
+    Date.now() - started >= 80 && payload.domains.fast.value === 1,
+  );
+}
+
+{
+  const facts = { value: 0 };
+  const paced = new StateHub({
+    builders: { fast: () => ({ value: facts.value }) },
+    hot: ['fast'],
+    minIntervalMs: 0,
+  });
+  paced.build();
+  const keepAlive = setTimeout(() => {}, 3000);
+  facts.value = 1;
+  paced.markHot();
+  const trigger = await paced.watch(paced.version, paced.bootId, 2000, 0);
+  const started = Date.now();
+  const waiting = paced.watch(trigger.version - 1, paced.bootId, 2000, 100);
+  const result = await waiting;
+  clearTimeout(keepAlive);
+  test(
+    'A10c a pre-existing version still respects the observer cadence',
+    Date.now() - started >= 80 && JSON.parse(result.json).domains.fast.value === 1,
+  );
+}
+
 /**
  * ⚠ 断言必须**限定在那个函数体内**。写成 `/const ingestPcmFrame[\s\S]*?project\(/`
  * 会一路贪到几百行之外 `refresh()` 里那个完全正当的 `project()`，于是这条测试
@@ -258,10 +305,21 @@ test(
    B. 前端订阅
    ══════════════════════════════════════════════════════════════ */
 test(
+  /**
+   * ⚠ 判据从「全文不许出现 `setInterval`」收紧成它**自己的名字**所说的那件事：
+   *   不许有固定的高频 `/live` 轮询。
+   * ⭐ 0.21.4 的「我的声音」在**正在录样本**时按 1.2s 拉一次 `/speaker/state`——
+   *   段是后端按停顿切出来的，不轮询使用者要等按下停止才看见自己刚说的几段。
+   *   它离开那一页就 clear、录完就停，⛔ 不是心跳。
+   * ⛔ 仍然禁止的：任何 `/live` 轮询、任何快于 1 秒的定时器。
+   */
   'B1 页面没有 250ms 的 /live 定时器，一个固定高频轮询都不剩',
-  !/setInterval/.test(appJs)
-    && !appJs.includes("request('/live')")
-    && !/loadLive/.test(appJs),
+  !appJs.includes("request('/live')")
+    && !/loadLive/.test(appJs)
+    // 每一个 setInterval 的周期都必须 >= 1000ms，且不许打 /live
+    && [...appJs.matchAll(/setInterval\([^,]+,\s*(\d+)\)/g)]
+      .every(([, ms]) => Number(ms) >= 1000)
+    && !/setInterval\([^)]*live/i.test(appJs),
 );
 
 test(
@@ -288,15 +346,20 @@ test(
 
 test(
   'B5 WS 重连不会叠加 listener：重连前后都只有一个 socket 对象持有回调',
-  /socket\.onclose = \(\) => \{[\s\S]*?if \(stateSocket !== socket\) return;/.test(appJs)
+  /socket\.onclose = \(\) => \{\s*if \(stateSocket !== socket \|\| stateConnectionGeneration !== generation\) return;/.test(appJs)
     && !appJs.includes("socket.addEventListener('message'"),
 );
 
 test(
+  /**
+   * ⚠ 举例用的那个区域从 `records` 换成 `activity`：0.21.4 把记录组卡移出概览，
+   *   而「声音活动」成了本轮最要紧的按域订阅（它决定一开口有没有反应）。
+   * ⭐ 判据没变：区域的依赖必须**显式声明**，且只有被触及的域才重画。
+   */
   'B6 单个域变化只触发对应区域，区域的依赖是显式声明的',
   appJs.includes('const REGIONS = [')
     && appJs.includes('if (!needs.some((domain) => touched.has(domain))) continue;')
-    && appJs.includes("['records', ['records'],"),
+    && appJs.includes("['overview-activity', ['rms_gate', 'public', 'speaker_activity', 'pipeline', 'vad', 'asr'],"),
 );
 
 test(
@@ -306,18 +369,17 @@ test(
 );
 
 test(
-  'B8 诊断页的大 JSON 只在使用者展开时格式化，看不见就不算',
-  viewsJs.includes('if (!rawOpen) {')
-    && appJs.includes("$('raw-details')?.addEventListener('toggle'")
-    && !/function renderDiagnostics[\s\S]*?JSON\.stringify\(live, null, 2\)/.test(viewsJs),
+  'B8 旧诊断 JSON 不再进入产品页，页面不会隐藏一整份调试 payload',
+  !viewsJs.includes('renderRaw')
+    && !viewsJs.includes('renderDiagnostics')
+    && !appJs.includes('raw-details'),
 );
 
 test(
-  'B9 诊断区按域拆开，且在它那一页不可见时根本不画',
-  appJs.includes('if (DIAGNOSTIC_REGION(name) && !diagnosticsVisible) continue;')
-    && appJs.includes("['diag-rms', ['rms_gate'], () => V.renderRms(domains.rms_gate)]")
-    // 一次音量变化不许再把九个诊断渲染器全跑一遍
-    && !appJs.includes('V.renderDiagnostics(domains, listenState)]'),
+  'B9 产品区域按域拆开，且不在不可见 tab 上重绘',
+  appJs.includes('if (!regionVisible(name)) continue;')
+    && appJs.includes("['overview-rms', ['rms_gate']")
+    && !appJs.includes('V.renderDiagnostics(domains, listenState)'),
 );
 
 test(
@@ -326,11 +388,17 @@ test(
 );
 
 test(
+  /**
+   * ⚠ `requester !== 'webui'` 换成了 `holder !== 'webui'`：承载这条判断的按钮
+   *   从 `listen-toggle` 换到了 `man-toggle`（0.21.4 收敛成一个入口）。
+   * ⭐ 语义没变，所以判据只放宽到「有没有把别人的持有当回事」这一步。
+   */
   'B11 Chain / Listen / Mic / Group 的语义没有回退',
   appJs.includes("request(started ? '/chain/stop' : '/chain/start'")
-    && appJs.includes("requester !== 'webui'")
+    && /holder[\s\S]{0,200}!== 'webui'/.test(appJs)
     && viewsJs.includes('CAPTURE_LABELS')
-    && viewsJs.includes("$('rec-progress')"),
+    && appJs.includes("$('man-toggle')")
+    && !viewsJs.includes("$('rec-progress')"),
 );
 
 /* ══════════════════════════════════════════════════════════════
@@ -349,11 +417,17 @@ test(
  * 每秒 5 次推送再叠 5.54%——主要代价不是解析或重绘，是把渲染进程叫醒本身。
  */
 test(
-  'B12b 页面按它正在看什么要节奏：诊断 200ms、其余 1 秒，切页换订阅',
-  appJs.includes('const STATE_INTERVAL_MS = { diagnostics: 200, other: 1000 };')
+  'B12b 页面按它正在看什么要节奏：Overview/听写中 400ms、静息 1 秒，变了才换订阅',
+  // RMS gate remains a 100ms service path; the browser only needs a 2.5Hz projection.
+  appJs.includes('const STATE_INTERVAL_MS = { overview: 400, live: 400, other: 1000 };')
     && appJs.includes('/state/ws?interval_ms=')
-    && appJs.includes('if (wantedInterval() !== socketIntervalMs) {')
+    && appJs.includes('const retuneStateSocket = () => {')
+    && appJs.includes('if (wantedInterval() === socketIntervalMs) return;')
     && packageSource.includes("Number(query.get('interval_ms')) || 1000")
+    && packageSource.includes('interval_ms=${intervalMs}')
+    && packageSource.includes('serviceStateWatch(')
+    && mainSource.includes('normalizeWatchInterval(')
+    && mainSource.includes('X-Termux-State-Version')
     // 服务端仍有自己那条与载荷无关的硬上限，客户端只能要求**更慢**
     && read('service/state-hub.mjs').includes('export const MIN_PUSH_INTERVAL_MS = 200;'),
 );

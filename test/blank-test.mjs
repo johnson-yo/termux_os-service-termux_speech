@@ -62,9 +62,8 @@ const nonBlankCases = [
   ['正常英文', 'hello world', 'hello world'],
   ['两端有空白的中文', '  你好  ', '你好'],
   ['夹着零宽字符的中文', '你​好', '你好'],
-  // ⛔ 标点-only **不算空白**：使用者可能真的只说了一个语气。
-  ['标点 only（不算空白）', '。。。', '。。。'],
-  ['问号叹号 only（不算空白）', '?!', '?!'],
+  ['正文带句号', '期待。', '期待。'],
+  ['正文带问号', '你好吗？', '你好吗？'],
 ];
 for (const [label, input, expected] of nonBlankCases) {
   const value = normalizeTranscript(input);
@@ -100,7 +99,14 @@ test('B5 空白原因可区分，不压成一个笼统的 blank',
     snapshot.count === 2
       && snapshot.last_reason === 'whitespace_only'
       && typeof snapshot.last_at_ms === 'number'
-      && Object.keys(snapshot).length === 3);
+    && Object.keys(snapshot).length === 3);
+
+for (const [label, input] of [['中文标点', '。。。'], ['ASCII 标点', '?!'],
+  ['空白加标点', ' \n？！\t '], ['Unicode 符号', '★※']]) {
+  const value = normalizeTranscript(input);
+  test(`B6 ${label} 视为 punctuation_only 空白`,
+    value.isBlank === true && value.text === '' && value.reason === 'punctuation_only');
+}
 }
 
 /* ══════════════════════════════════════════════════════════════

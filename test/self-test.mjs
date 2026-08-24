@@ -1,8 +1,8 @@
 /**
  * SPDX-License-Identifier: Apache-2.0
- * [INPUT]: Isolated v4 config, App transports, last-owner lease, KWS/VAD/ASR, profiles, and WebUI fixtures.
+ * [INPUT]: Isolated v4 config, App transports, last-owner lease, VAD/ASR, and WebUI fixtures.
  * [OUTPUT]: Truthful Package self-test PASS/FAIL lines without requiring a phone or model inference.
- * [POS]: Device-independent gate for RMS→KWS→VAD/WAV→SenseVoice plus speech.idle.
+ * [POS]: Device-independent gate for RMS→FireRedVAD→WAV→SenseVoice plus speech.idle.
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 import fs from 'node:fs';
@@ -13,7 +13,6 @@ import { writeStatus, readStatus } from '../service/status.mjs';
 import {
   loadConfig,
   saveAsrConfig,
-  saveKwsConfig,
   saveRmsGateConfig,
   saveVadConfig,
 } from '../service/config.mjs';
@@ -25,16 +24,6 @@ import {
 } from '../service/app-api.mjs';
 import { PcmWs, pcmWebSocketDescriptor } from '../service/pcm-ws.mjs';
 import { RmsGate } from '../service/rms-gate.mjs';
-import { KwsGateLease } from '../service/kws/gate-lease.mjs';
-import { buildTemplates, scorePinyin } from '../service/kws/pinyin-scorer.mjs';
-import { PinyinWs } from '../service/kws/pinyin-ws.mjs';
-import {
-  createProfile,
-  getProfile,
-  listProfiles,
-  saveSamplePinyin,
-  setProfileModel,
-} from '../service/kws/profile-store.mjs';
 import { projectSpeechInput } from '../service/speech-input.mjs';
 import { computeFbank, loadCmvn } from '../service/vad/fbank.mjs';
 import { StreamVadPost } from '../service/vad/postprocessor.mjs';
@@ -65,58 +54,53 @@ fs.writeFileSync(legacyFile, JSON.stringify({
   schema: 'termux-os-framework.termux-speech.conf.v3',
   poll_interval_ms: 2500,
   rms_gate: { open_threshold: 0.06, sample_interval_ms: 200 },
-  kws: {
-    active_profile_id: 'wp_preserved',
-    positive_target: 5,
-    score_threshold: 0.82,
-    initial_weight: 3,
-  },
 }));
 const migrated = loadConfig(configFile, legacyFile);
 test(
-  'v3 config migrates to v4 and preserves the selected Keyword',
+  'v3 config migrates to v4 and preserves the RMS/VAD/ASR defaults',
   migrated.schema === 'termux-os-framework.termux-speech.conf.v4'
     && migrated.rms_gate.open_threshold === 0.06
-    && migrated.kws.active_profile_id === 'wp_preserved'
-    && migrated.kws.idle_timeout_ms === 15_000
     && migrated.vad.pcm_pool_ms === 6000
     && migrated.vad.no_output_timeout_ms === 15_000
-    && migrated.kws.cue_enabled === true
-    && migrated.asr.end_keywords[0] === '结束',
+    && migrated.asr.idle_timeout_ms === 15_000,
 );
 fs.writeFileSync(configFile, JSON.stringify({
   schema: 'termux-os-framework.termux-speech.conf.v3',
   rms_gate: { open_threshold: 0.06, sample_interval_ms: 200 },
-  kws: { active_profile_id: null },
 }));
 const recoveredMigration = loadConfig(configFile, legacyFile);
 test(
   'an old-schema shell at the v4 path is rebuilt from the last valid v3 config',
   recoveredMigration.schema === 'termux-os-framework.termux-speech.conf.v4'
-    && recoveredMigration.kws.active_profile_id === 'wp_preserved',
+    && recoveredMigration.rms_gate.open_threshold === 0.06,
 );
 const savedGate = saveRmsGateConfig(configFile, { open_threshold: 0.07 });
-const savedKws = saveKwsConfig(configFile, {
-  active_profile_id: 'wp_fixture',
-  idle_timeout_ms: 12_000,
-});
 const savedVad = saveVadConfig(configFile, {
   pcm_pool_ms: 5500,
   no_output_timeout_ms: 18_000,
 });
 const savedAsr = saveAsrConfig(configFile, {
-  end_keywords: ['结束', '好了'],
   idle_timeout_ms: 22_000,
 });
 test(
-  'RMS, KWS, VAD, and ASR ending config persist independently',
+  'RMS, VAD, and ASR standby config persist independently',
   savedGate.rms_gate.open_threshold === 0.07
-    && savedKws.kws.active_profile_id === 'wp_fixture'
-    && savedKws.kws.idle_timeout_ms === 12_000
     && savedVad.vad.pcm_pool_ms === 5500
     && savedVad.vad.no_output_timeout_ms === 18_000
-    && savedAsr.asr.end_keywords.join(',') === '结束,好了'
     && savedAsr.asr.idle_timeout_ms === 22_000,
+);
+fs.writeFileSync(configFile, JSON.stringify({
+  ...savedAsr,
+  retired_marker: true,
+  speaker_gate: { ...savedAsr.speaker_gate, retired_marker: true },
+}));
+const cleaned = loadConfig(configFile);
+const persisted = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+test(
+  'config load rewrites only the current schema fields',
+  cleaned.schema === 'termux-os-framework.termux-speech.conf.v4'
+    && !Object.hasOwn(persisted, 'retired_marker')
+    && !Object.hasOwn(persisted.speaker_gate, 'retired_marker'),
 );
 let invalidPoolRejected = false;
 try { saveVadConfig(configFile, { pcm_pool_ms: 6100 }); } catch { invalidPoolRejected = true; }
@@ -193,13 +177,33 @@ pcmClient.configure(pcmDescriptor);
 const pcmSnapshot = pcmClient.snapshot();
 test(
   'PCM descriptor selects the exact App WS while public state redacts credentials',
-  pcmDescriptor.endpoint === 'ws://127.0.0.1:8796/api/android/mic/stream'
+  /**
+   * ⭐ `?rms=1` 是**故意**的：RMS 的权威是 App，逐帧锚让那个数与它的帧成对到达。
+   * ⚠ 路径本身一个字符都没变——旧 App 忽略这个参数就是从前的行为。
+   */
+  pcmDescriptor.endpoint === 'ws://127.0.0.1:8796/api/android/mic/stream?rms=1'
     && pcmSnapshot.endpoint === '/api/android/mic/stream'
     && pcmSnapshot.frame_bytes === 3200
     && !JSON.stringify(pcmSnapshot).includes('provider-secret'),
 );
 
 const gate = new RmsGate({ open_threshold: 0.05, sample_interval_ms: 200 });
+/**
+ * ⚠ 下面这一组钉的是 **RMS 阈值 admission 本身**：越阈开门、跌落不关门、下游关门后重新 arm。
+ *   P2 把正式 admission 整个搬进了 App（`gateExecutor='app'` 之后 `ingest()` 不再开门），
+ *   于是这组全红——**而实现是变得更正确了**。
+ * ⭐ 这套逻辑没有被删除，它就是 `legacy_speech` 回退态。所以这里**显式声明测的是它**，
+ *   ⛔ 而不是把断言改软。**测试要跟着语义走，不是跟着颜色走。**
+ */
+gate.setGateExecutor('legacy_speech');
+/**
+ * ⚠ 下面这一组钉的是 **RMS 阈值 admission 本身**：越阈开门、跌落不关门、
+ *   下游关门后重新 arm。P2 把正式 admission 整个搬进了 App（`gateExecutor='app'`
+ *   之后 `ingest()` 不再开门），于是这组测试全红——**而实现是变得更正确了**。
+ * ⭐ 这套逻辑并没有被删除，它就是 `legacy_speech` 回退态；所以这里显式声明测的是它，
+ *   ⛔ 而不是把断言改软。**测试要跟着语义走，不是跟着颜色走。**
+ */
+gate.setGateExecutor('legacy_speech');
 let gateValue = gate.ingest({
   rms: 0.10,
   recording: true,
@@ -210,73 +214,40 @@ test(
   'RMS opens and latches admission for the VAD Pool',
   gateValue.state === 'open'
     && gateValue.pcm_admission === 'allow'
+    && gateValue.decision_metric === 'avg_100ms'
+    && gateValue.decision_window_ms === 100
+    && gateValue.decision_value === 0.10
     && gateValue.close_control === 'current_pipeline_lease_owner',
 );
 gateValue = gate.ingest({
-  rms: 0.01,
+  rms: 0.03,
   recording: true,
   frameSeq: 2,
   sampleAgeMs: 0,
 }, 1100);
-test('RMS falloff alone cannot close the latched Gate', gateValue.state === 'open');
-gateValue = gate.closeFromDownstream('speech.vad', 'vad_no_wav_timeout', 1200);
+test('RMS falloff does not close the downstream-owned gate',
+  gateValue.state === 'open'
+    && gateValue.decision_value === 0.03
+    && gateValue.pcm_admission === 'allow');
+gateValue = gate.ingest({
+  rms: 0.01,
+  recording: true,
+  frameSeq: 3,
+  sampleAgeMs: 0,
+}, 1200);
+test('RMS can stay open through a quiet frame after admission',
+  gateValue.state === 'open' && gateValue.decision_value === 0.01
+    && gateValue.pcm_admission === 'allow');
+gateValue = gate.closeFromDownstream('speech.vad', 'camplus_no_user_timeout', 1200);
 test(
   'VAD can reset the pipeline to before RMS without an immediate bounce',
   gateValue.state === 'closed'
     && gateValue.open_armed === false
     && gateValue.last_transition.owner === 'speech.vad',
 );
-gate.ingest({ rms: 0.01, recording: true, frameSeq: 3, sampleAgeMs: 0 }, 1300);
-gateValue = gate.ingest({ rms: 0.10, recording: true, frameSeq: 4, sampleAgeMs: 0 }, 2400);
+gate.ingest({ rms: 0.00, recording: true, frameSeq: 4, sampleAgeMs: 0 }, 1300);
+gateValue = gate.ingest({ rms: 0.10, recording: true, frameSeq: 5, sampleAgeMs: 0 }, 1400);
 test('RMS rearms on low audio and opens again on a new qualified sound', gateValue.state === 'open');
-
-const lease = new KwsGateLease({ idleTimeoutMs: 15_000 });
-lease.setCloseAuthority(true);
-lease.observeGate({
-  state: 'open',
-  pcm_admission: 'allow',
-  transition_seq: 1,
-  opened_at_ms: 1000,
-  frame_seq: 1,
-  current: 0.08,
-  open_threshold: 0.05,
-}, 1000);
-lease.onSegmentFinal({
-  segmentId: 7,
-  hit: true,
-  reason: 'kws_hit',
-  score: 0.93,
-  text: 'xiǎoài',
-  durationMs: 900,
-}, 2000);
-test('a KWS final only authorizes handoff and does not close the Gate', lease.pollClose(15_999) === null);
-lease.observeGate({
-  state: 'open',
-  pcm_admission: 'allow',
-  transition_seq: 1,
-  opened_at_ms: 1000,
-  frame_seq: 2,
-  current: 0.09,
-  open_threshold: 0.05,
-}, 10_000);
-test(
-  'new RMS-qualified PCM resets only the KWS countdown',
-  lease.snapshot(10_000).deadline_ms === 25_000
-    && lease.snapshot(24_999).remaining_ms === 1,
-);
-const kwsClose = lease.pollClose(25_000);
-test(
-  'KWS emits one reset request after its independent 15 second silence countdown',
-  kwsClose?.owner === 'speech.kws'
-    && kwsClose.reason === 'kws_no_qualified_pcm_timeout'
-    && lease.pollClose(26_000) === null,
-);
-lease.setCloseAuthority(false);
-test(
-  'KWS countdown immediately loses effect after downstream handoff',
-  lease.snapshot(40_000).remaining_ms === null
-    && lease.pollClose(40_000) === null,
-);
 
 const ownership = new PipelineLease();
 ownership.observeGate({
@@ -285,44 +256,31 @@ ownership.observeGate({
   transition_seq: 9,
   opened_at_ms: 1000,
 }, 1000);
-const staleVadBeforeHit = ownership.requestIdle({
-  requester: PIPELINE_OWNERS.VAD,
-  reason: 'premature_vad_timeout',
+const staleAsrBeforeVad = ownership.requestIdle({
+  requester: PIPELINE_OWNERS.ASR,
+  reason: 'premature_asr_timeout',
   epoch: ownership.epoch,
 }, 1200);
 const toVad = ownership.handoff(
-  PIPELINE_OWNERS.KWS,
-  PIPELINE_OWNERS.VAD,
-  'kws_hit',
-  1300,
-);
-const staleKws = ownership.requestIdle({
-  requester: PIPELINE_OWNERS.KWS,
-  reason: 'expired_kws_timeout',
-  epoch: ownership.epoch,
-}, 1400);
-const toAsr = ownership.handoff(
   PIPELINE_OWNERS.VAD,
   PIPELINE_OWNERS.ASR,
   'vad_wav_published',
-  1500,
+  1300,
 );
 const staleVad = ownership.requestIdle({
   requester: PIPELINE_OWNERS.VAD,
   reason: 'expired_vad_timeout',
   epoch: ownership.epoch,
-}, 1600);
+}, 1400);
 const asrIdle = ownership.requestIdle({
   requester: PIPELINE_OWNERS.ASR,
-  reason: 'asr_end_keyword',
+  reason: 'asr_standby',
   epoch: ownership.epoch,
-}, 1700);
+}, 1500);
 test(
-  'only the last downstream owner can close and speech.idle returns to RMS',
-  staleVadBeforeHit.code === 'stale_owner'
+  'RMS opens, VAD hands WAV to ASR, and only ASR can return to RMS',
+  staleAsrBeforeVad.code === 'stale_owner'
     && toVad.accepted
-    && staleKws.code === 'stale_owner'
-    && toAsr.accepted
     && staleVad.code === 'stale_owner'
     && asrIdle.accepted
     && ownership.snapshot().owner === PIPELINE_OWNERS.RMS,
@@ -400,7 +358,8 @@ const fakeAndroid = {
 const vad = new VadController({
   android: fakeAndroid,
   dataRoot: vadRoot,
-  modelRoot,
+  modelFile: path.join(modelRoot, 'model.onnx'),
+  cmvnFile: path.join(modelRoot, 'cmvn.bin'),
   residentId: 'fixture-vad',
   config: { pcm_pool_ms: 6000, no_output_timeout_ms: 15_000 },
 });
@@ -417,18 +376,19 @@ for (let index = 0; index < 70; index += 1) {
 }
 let vadValue = vad.snapshot(8000);
 test(
-  'the pre-roll Pool rolls before the Gate opens so the wake word is never truncated',
+  'the pre-roll Pool rolls before the Gate opens so speech onset is never truncated',
   (() => {
     const rolling = new VadController({
       android: fakeAndroid,
       dataRoot: path.join(temporaryRoot, 'vad-rolling'),
-      modelRoot,
+      modelFile: path.join(modelRoot, 'model.onnx'),
+      cmvnFile: path.join(modelRoot, 'cmvn.bin'),
       residentId: 'fixture-vad',
       config: { pcm_pool_ms: 6000, no_output_timeout_ms: 15_000 },
     });
     rolling.observeTransport({ connected: true });
-    // 刻意**不**开门：旧实现此刻一个字节都不留，于是 avg_1s 的 300–400 ms 滞后
-    // 直接从 timeline 头部啃掉唤醒词。
+    // 刻意**不**开门：旧实现此刻一个字节都不留，于是 RMS decision window 的滞后
+    // 直接从 timeline 头部啃掉语音起点。
     for (let index = 0; index < 20; index += 1) {
       rolling.ingestPcm(Buffer.alloc(3200), { observed_at_ms: 1000 + index * 100 });
     }
@@ -441,9 +401,8 @@ test(
 );
 
 test(
-  'VAD owns a real bounded pre-roll Pool that KWS never consumes',
+  'VAD owns a real bounded pre-roll Pool reserved for the VAD path',
   vadValue.pcm_pool.owner === 'termux-speech-vad'
-    && vadValue.pcm_pool.used_by_kws === false
     && vadValue.pcm_pool.duration_ms <= 6000
     && vadValue.pcm_pool.retained_bytes <= 192_000
     && vadValue.pcm_pool.retained_bytes > 0,
@@ -455,7 +414,7 @@ vad.speechStartFrame = 1;
 const segment = vad.publishSegment(1, 40);
 const wavBytes = segment ? fs.readFileSync(segment.wav_path) : Buffer.alloc(0);
 test(
-  'KWS handoff lets VAD trim and atomically publish exactly one valid WAV, with no second index',
+  'FireRedVAD trims and atomically publishes exactly one valid WAV, with no second index',
   segment?.schema === 'termux-os.vad-wav.v1'
     && wavBytes.subarray(0, 4).toString() === 'RIFF'
     && wavBytes.subarray(8, 12).toString() === 'WAVE'
@@ -569,46 +528,16 @@ test(
     state: 'open', pcm_admission: 'allow', transition_seq: 1, opened_at_ms: 1000,
   };
   lease.observeGate(openGate, 1000);
-  lease.handoff(PIPELINE_OWNERS.KWS, PIPELINE_OWNERS.VAD, 'kws_hit', 2000);
-  lease.handoff(PIPELINE_OWNERS.VAD, PIPELINE_OWNERS.ASR, 'vad_wav_published', 3000);
+  lease.handoff(PIPELINE_OWNERS.VAD, PIPELINE_OWNERS.ASR, 'vad_wav_published', 2000);
   // 每次交接都刷新 owner_since_ms，会话年龄则一路累加。它只是可观测量：
-  // 会话的结束由结束关键词或无活动超时决定，**没有绝对上界**（长会话是正确行为）。
+  // 会话的结束由 ASR 空闲或显式停链决定，**没有绝对上界**（长会话是正确行为）。
   const late = lease.snapshot(130_000);
   test(
     'the Pipeline lease exposes an absolute session age that owner handoffs cannot reset',
     late.owner === PIPELINE_OWNERS.ASR
-      && late.owner_age_ms === 127_000
+      && late.owner_age_ms === 128_000
       && late.session_age_ms === 129_000
       && lease.snapshot(3000).session_age_ms === 2000,
-  );
-}
-
-// ── 第二把钥匙：KWS HIT 直接开门（消灭四种「门外命中」） ──────────────────
-{
-  const gate = new RmsGate({ open_threshold: 0.05, sample_interval_ms: 200 });
-  // 先走一轮完整会话，让 openArmed 落到 false —— 这正是「上一轮余波」的现场。
-  gate.ingest({ rms: 0.2, recording: true, frameSeq: 1, sampleAgeMs: 0 }, 1000);
-  const opened = gate.snapshot(1000);
-  gate.closeFromDownstream('speech.asr', 'asr_end_keyword', 2000);
-  // 环境仍在阈值以上 → 旧实现在这里永远无法重新 arm，KWS 因此聋掉。
-  const stuck = gate.ingest({ rms: 0.2, recording: true, frameSeq: 2, sampleAgeMs: 0 }, 2100);
-  const keyed = gate.openFromKeyword('kws_hit_opened_gate', 2200);
-  test(
-    'a KWS hit opens the Gate even while RMS is latched shut waiting to rearm',
-    opened.state === 'open'
-      && stuck.state === 'closed'
-      && stuck.open_armed === false
-      && keyed.state === 'open'
-      && keyed.pcm_admission === 'allow'
-      && keyed.last_transition.owner === 'speech.kws'
-      && keyed.open_keys.includes('kws_hit'),
-  );
-  // PCM 不可用是安全兜底，优先于任何策略：第二把钥匙也不得开门。
-  const dark = new RmsGate({ open_threshold: 0.05, sample_interval_ms: 200 });
-  dark.ingest({ rms: null, recording: false, frameSeq: 0, sampleAgeMs: 2000 }, 3000);
-  test(
-    'the second key still refuses to open when PCM is unavailable',
-    dark.openFromKeyword('kws_hit', 3100).state === 'closed',
   );
 }
 
@@ -660,16 +589,17 @@ const asr = new AsrController({
   android: { json: asrResidentApi('fixture-asr', ['_ctc_logits']) },
   dataRoot: path.join(temporaryRoot, 'asr-data'),
   frontendRoot: senseFrontendRoot,
-  graphRoot: senseGraphRoot,
+  frontendFiles: { cmvn: path.join(senseFrontendRoot, 'am.mvn'),
+    tokens: path.join(senseFrontendRoot, 'tokens.json') },
+  // ⭐ docs/093：只给一个「可执行体」，⛔ 不再分 ctx / graph。
+  executablePath: path.join(senseGraphRoot, 'model.onnx'),
+  executableKind: 'local',
   residentId: 'fixture-asr',
   persistConfig: (patch) => { asrPersisted = patch; },
   config: {
     enabled: true,
     language: 'auto',
     text_normalization: true,
-    keyword_end_enabled: true,
-    end_keywords: ['好'],
-    timeout_end_enabled: true,
     idle_timeout_ms: 15_000,
     output_name: null,
   },
@@ -686,11 +616,12 @@ for (let attempt = 0; attempt < 200 && !asr.snapshot().transcripts.last; attempt
 }
 const asrValue = asr.snapshot();
 test(
-  'SenseVoice consumes only the completed WAV and publishes text/end-keyword evidence',
+  // ASR 是 spool 的消费者：它发布文字，不替上游判定会话边界。
+  'SenseVoice consumes only the completed WAV and publishes the text',
   asrValue.transcripts.last?.segment_id === segment.segment_id
     && asrValue.transcripts.last?.text === '你好'
     && asrValue.model.precision === 'qnn-context'
-    && asrEndRequest?.reason === 'asr_end_keyword'
+    && asrEndRequest === null
     // ⛔ ASR 不再自己保存转写历史：`transcripts()` 与 256 条内存水库都已删除。
     // 唯一的存储真相是记录组，feed 由它提供（见 storage-test）。
     && typeof asr.transcripts !== 'function'
@@ -722,24 +653,41 @@ asrDeclares.length = 0;
     android: { json: asrResidentApi('fixture-asr-ctx', ['_ctc_logits']) },
     dataRoot: path.join(temporaryRoot, 'asr-data-ctx'),
     frontendRoot: senseFrontendRoot,
-    ctxRoot: senseCtxRoot,          // 没有 graphRoot
+    frontendFiles: { cmvn: path.join(senseFrontendRoot, 'am.mvn'),
+      tokens: path.join(senseFrontendRoot, 'tokens.json') },
+    executablePath: path.join(senseCtxRoot, 'model.onnx'),
+    executableKind: 'prebuilt',
     residentId: 'fixture-asr-ctx',
     config: { enabled: true, language: 'auto', text_normalization: true },
   });
+  /**
+   * ⭐ **按新意图改写**（docs/093），⛔ 不是绕过。
+   *
+   * 这三条原本锁的是「speech 自己在 ctx 与 graph 之间挑一个，
+   * 并保证有 ctx 时不必持有那 937 MB」。那套判断**本身是对的**，
+   * 但它已经整个搬到模型管理器去了 —— 迁移之后 speech 收到的就是
+   * **当前可用的那一份**，⛔ 它不再知道另一份存不存在。
+   *
+   * 新的约束因此变成：**只用被给定的那个可执行体，⛔ 不许自己再拼第二条路径。**
+   */
   test(
-    'with a context, the 937 MB graph is not among the files that must exist',
-    !ctxOnly.senseFiles().includes(ctxOnly.modelPath)
-      && ctxOnly.modelPath === null
-      && ctxOnly.senseFiles().includes(path.join(senseCtxRoot, 'model.onnx')),
+    'the controller uses exactly the executable it was handed, and nothing else',
+    ctxOnly.executablePath === path.join(senseCtxRoot, 'model.onnx')
+      && ctxOnly.senseFiles().includes(path.join(senseCtxRoot, 'model.onnx'))
+      // ⛔ 源图不在清单里——因为 speech 根本不知道有源图这回事
+      && !ctxOnly.senseFiles().includes(path.join(senseGraphRoot, 'model.onnx'))
+      && ctxOnly.modelPath === null,
   );
   test(
-    'the context path is declared to the App, so it never falls back to its own cache',
+    'the executable path is what is declared to the App (⛔ no fallback to its own cache)',
     ctxOnly.graph.ctxPath === path.join(senseCtxRoot, 'model.onnx'),
   );
-  // ⚠ 反过来：没有 ctx 时源图**必须**在清单里，否则缺它会拖到第一次推理才炸
   test(
-    'without a context, the graph is required again',
-    asr.senseFiles().includes(path.join(senseGraphRoot, 'model.onnx')),
+    'a locally-built executable is used the same way as a prebuilt one',
+    asr.executablePath === path.join(senseGraphRoot, 'model.onnx')
+      && asr.senseFiles().includes(path.join(senseGraphRoot, 'model.onnx'))
+      // ⭐ kind 只进诊断：两种来源产出的是同一个可执行体
+      && asr.executableKind === 'local' && ctxOnly.executableKind === 'prebuilt',
   );
   /**
    * ⭐ 没有模型时**服务照常起来**，转写才拒绝。
@@ -768,14 +716,16 @@ const asrWarm = new AsrController({
   android: { json: asrResidentApi('fixture-asr-warm', ['_ctc_logits']) },
   dataRoot: path.join(temporaryRoot, 'asr-data-warm'),
   frontendRoot: senseFrontendRoot,
-  graphRoot: senseGraphRoot,
+  frontendFiles: { cmvn: path.join(senseFrontendRoot, 'am.mvn'),
+    tokens: path.join(senseFrontendRoot, 'tokens.json') },
+  // ⭐ docs/093：只给一个「可执行体」，⛔ 不再分 ctx / graph。
+  executablePath: path.join(senseGraphRoot, 'model.onnx'),
+  executableKind: 'local',
   residentId: 'fixture-asr-warm',
   config: {
     enabled: true,
     language: 'auto',
     text_normalization: true,
-    keyword_end_enabled: false,
-    end_keywords: [],
     timeout_end_enabled: false,
     idle_timeout_ms: 15_000,
     output_name: '_ctc_logits',
@@ -794,6 +744,27 @@ test(
 );
 asrWarm.close();
 
+/**
+ * ⭐ Audio8 曾经走 Asset → App session；现在整个 backend 已退役。
+ * 这里锁住的是「旧配置不会在第一段语音时才爆炸」：边界层负责迁移，
+ * controller 对旧值明确拒绝，运行时不再偷偷创建旧 session。
+ */
+{
+  const retired = new AsrController({
+    android: { json: async () => { throw new Error('retired backend must not call App'); } },
+    dataRoot: path.join(temporaryRoot, 'asr-data-retired'),
+    frontendRoot: senseFrontendRoot,
+    residentId: 'fixture-asr-retired',
+    config: { enabled: true, model: 'audio8', language: 'auto' },
+  });
+  let rejected = null;
+  await retired.prepareBackend('audio8').catch((error) => { rejected = String(error.message); });
+  test('retired Audio8 is rejected before any App session request',
+    rejected?.includes('not served by this pipeline')
+      && retired.snapshot().model.id === 'sensevoice');
+  retired.close();
+}
+
 asr.observePipeline({
   owner: PIPELINE_OWNERS.ASR,
   epoch: 4,
@@ -802,63 +773,18 @@ asr.observePipeline({
 const beforeAsrTimeout = asr.pollClose(34_999);
 const atAsrTimeout = asr.pollClose(35_000);
 test(
-  'ASR timeout end is owner-scoped and fires at its configured deadline',
+  /**
+   * ⚠ 名字从 `asr_idle_timeout` 改成 `asr_standby`：它说的是「转完了、
+   *   队列空了、一段时间没有新文件 ⇒ 把门交回去」，⛔ 不是「识别结束门」。
+   */
+  'ASR hands the gate back when it has nothing left to do',
   beforeAsrTimeout === null
     && atAsrTimeout?.owner === PIPELINE_OWNERS.ASR
     && atAsrTimeout?.epoch === 4
-    && atAsrTimeout?.reason === 'asr_idle_timeout',
+    && atAsrTimeout?.reason === 'asr_standby',
 );
 asr.close();
 vad.close();
-
-const built = buildTemplates([
-  {
-    index: 0,
-    text: 'xiǎoàitóngxué',
-    tokens: ['x', 'iǎo', 'ài', 't', 'óng', 'x', 'ué'],
-  },
-  {
-    index: 1,
-    text: 'xiǎoàitóngxué',
-    tokens: ['x', 'iǎo', 'ài', 't', 'óng', 'x', 'ué'],
-  },
-]);
-const positive = scorePinyin(built.templates, ['x', 'iǎo', 'ài', 't', 'óng', 'x', 'ué']);
-const negative = scorePinyin(built.templates, ['j', 'īn', 't', 'iān', 't', 'iān', 'q', 'ì']);
-test(
-  'pinyin scorer keeps a positive Keyword above unrelated speech',
-  built.templates.length === 1 && positive.score === 1 && negative.score < 0.8,
-);
-
-const capture = new PinyinWs();
-capture.armCapture();
-capture.handleFrame({ seg: 1, event: 'start' });
-for (const token of ['x', 'iǎo', 'ài']) capture.handleFrame({ seg: 1, event: 'token', tok: token });
-capture.handleFrame({ seg: 1, event: 'final', dur_ms: 800 });
-test(
-  'pinyin WebSocket capture still returns one finalized text segment',
-  capture.pollCapture().finalized
-    && capture.pollCapture().text === 'xiǎoài'
-    && capture.pollCapture().duration_ms === 800,
-);
-
-const profileRoot = path.join(temporaryRoot, 'profiles-data');
-const profile = createProfile(profileRoot, '小爱同学');
-saveSamplePinyin(profileRoot, profile.profile_id, 0, {
-  text: 'xiǎoàitóngxué',
-  tokens: ['x', 'iǎo', 'ài', 't', 'óng', 'x', 'ué'],
-});
-setProfileModel(profileRoot, profile.profile_id, {
-  schema: 'termux-os.wake-words.model.v3',
-  threshold: 0.8,
-  templates: built.templates,
-});
-test(
-  'profile store keeps pinyin templates but no PCM/WAV payloads',
-  listProfiles(profileRoot)[0].built === true
-    && !JSON.stringify(getProfile(profileRoot, profile.profile_id)).includes('raw.wav')
-    && !JSON.stringify(getProfile(profileRoot, profile.profile_id)).includes('pcm_s16le'),
-);
 
 const devices = {
   inputs: [{ selector: 'id:21', type_name: 'built_in_mic', address: 'bottom' }],
@@ -880,6 +806,12 @@ vadValue = {
 const value = projectSpeechInput({
   devices,
   mic,
+  rmsStream: {
+    connected: true,
+    frame_seq: 20,
+    last_frame_age_ms: 20,
+    binary_frames: 0,
+  },
   pcmStream: {
     connected: true,
     encoding: 'pcm_s16le',
@@ -891,11 +823,6 @@ const value = projectSpeechInput({
     last_frame_age_ms: 20,
   },
   rmsGate: gateValue,
-  kws: {
-    schema: 'termux-os.speech-kws.v1',
-    provider: { connected: true },
-    profile: { profile_id: profile.profile_id, display_name: profile.display_name, built: true },
-  },
   vad: vadValue,
   asr: asrValue,
   pipeline: {
@@ -911,17 +838,29 @@ test(
     && value.selection.selector === 'id:21'
     && value.pcm.encoding === 'pcm_s16le'
     && value.pcm.payload_exposed_by_capability === false
-    && value.pcm_pool.used_by_kws === false
     && value.downstream.stages.find((stage) => stage.id === 'asr')?.connected === true
     && value.downstream.close_owner === PIPELINE_OWNERS.ASR
     && value.downstream.idle_capability === 'speech.idle'
     && value.storage.framework_pcm_egress === 'none',
 );
+const senseVoiceInput = projectSpeechInput({
+  devices,
+  mic,
+  rmsStream: { connected: true, last_frame_age_ms: 20, frame_seq: 1 },
+  pcmStream: { connected: true, last_frame_age_ms: 20, frame_seq: 1 },
+  rmsGate: gateValue,
+  vad: vadValue,
+  asr: { ready: true, model: { id: 'sensevoice', files_present: true } },
+  pipeline: { owner: PIPELINE_OWNERS.RMS },
+});
+test(
+  'speech.input treats the ready SenseVoice backend as connected',
+  senseVoiceInput.downstream.stages.find((stage) => stage.id === 'asr')?.connected === true,
+);
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const manifest = JSON.parse(fs.readFileSync(path.join(root, 'termux-os.package.json'), 'utf8'));
 const indexHtml = fs.readFileSync(path.join(root, 'web/index.html'), 'utf8');
-const setupHtml = fs.readFileSync(path.join(root, 'web/setup.html'), 'utf8');
 // ⚠ 页面的行为现在分在 app.js（I/O）与 views.js（渲染）两个文件里。
 // 断言要问的是「这个页面做不做某件事」，不是「这一个文件里有没有那一行」——
 // 按文件断言会在下一次拆分时假红，而拆分本身并没有改变任何行为。
@@ -929,11 +868,44 @@ const appJs = ['web/app.js', 'web/views.js']
   .map((file) => fs.readFileSync(path.join(root, file), 'utf8'))
   .join('\n');
 const styleCss = fs.readFileSync(path.join(root, 'web/style.css'), 'utf8');
+
+/**
+ * ⭐ 记录必须来自实际执行的 backend。当前产品只有 SenseVoice，
+ *   因此它的运行时 metadata 必须仍然明确写出 SenseVoice，而不是沿用旧值。
+ */
+{
+  const controller = fs.readFileSync(path.join(root, 'service/asr/controller.mjs'), 'utf8');
+  const body = controller.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  test(
+    'the recorded model id names the backend that actually ran',
+    /**
+     * ⚠ 0.21.8：判据从「发布时的配置」收紧成「**开跑时**记下的 `ran_backend`」，
+     *   并且它必须写在 `inFlight` 快照之前，否则那个字段永远是空的。
+     */
+    /model:\s*\{\s*id:\s*'sensevoice'/.test(body)
+      && /backend: job\.ran_backend \?\? this\.config\.model \?\? 'sensevoice'/.test(body)
+      && /job\.ran_backend = this\.config\.model[\s\S]{0,200}this\.inFlight = /.test(body),
+  );
+}
+
+
 test(
   'Manifest declares every speech Capability and locates SenseVoice through assets, not paths',
-  manifest.version === '0.20.0'
+  /**
+   * ⭐ 版本号是**钉死**的，不是读出来的。它逼着每次 bump 都走一遍这条断言，
+   * 于是「改了内容却没改版本号」不可能悄悄通过——上一轮正是这样让 `0.20.0`
+   * 同时指向两套差 11.5k 行的代码。
+   */
+    manifest.version === '0.22.5'
     && manifest.id === 'github.termux-os.service.termux-speech'
     && manifest.capabilities.requires.some((item) => item.id === 'termux-os.app.api' && item.required)
+    /**
+     * ⭐ 模型管理器是 **optional capability**：它是资产管理服务，不在语音数据通路上。
+     * ⛔ 写成 required 等于给语音链凭空加一个单点故障——Manager 挂了，
+     *   已经装好的模型照样该能用（那由 Framework runtime resolver 回答）。
+     */
+    && manifest.capabilities.requires.some((item) => item.id === 'termux-os.assets.manager'
+      && item.required === false)
     && manifest.capabilities.provides.some((item) => item.id === 'speech.input')
     && manifest.capabilities.provides.some((item) => item.id === 'speech.activity')
     && manifest.capabilities.provides.some((item) => item.id === 'speech.transcript')
@@ -957,22 +929,17 @@ test(
     && manifest.release.repository.includes('termux_os-service-termux_speech'),
 );
 test(
-  'the Qwen tiers are optional, so nothing is downloaded until a tier is chosen',
+  'retired ASR backends leave no speech-package metadata',
   /**
-   * ⭐ Q4 与 Q8 是**替代品不是集合**：一台设备装其中一个。声明成必需会让每台机器
-   * 都下 1.5 GB，其中一半永远用不到。
-   *
-   * ⚠ 编码器与 mel 两档共用，所以它们跟着档位一起可选——但只要选了任一档就都需要。
+   * ⭐ 下线的定义是**四个层面都消失**：selector / runtime / UI / **依赖与资产声明**。
+   *   只删 selector 不够；否则管理页仍会提供一个永远不会被本包加载的重量级资产。
    */
-  manifest.packages.requires.some((r) => r.id === 'github.termux-os.asset.qwen3asr' && r.required === false)
-    && manifest.assets.requires.some((a) => a.id === 'model.qwen3asr.decoder.q4' && a.required === false)
-    && manifest.assets.requires.some((a) => a.id === 'model.qwen3asr.decoder.q8' && a.required === false)
-    && manifest.assets.requires.some((a) => a.id === 'model.qwen3asr.encoder' && a.required === false)
-    // SenseVoice 是默认档：前处理资料必需，而图形是**二选一**——
-    // 本机架构有 ctx 就用 ctx（478 MB），没有才需要源图（937 MB）。
-    // ⚠ 依赖阶梯表达不了「其中一个」，故两个都声明为可选，由启动时**同时报出两个原因**兜底；
-    //    把其中任一个写成必需，都会让一半的设备装上一份它永远不会加载的东西。
-    && manifest.assets.requires.some((a) => a.id === 'model.sensevoice.frontend' && a.required === true)
+  /**
+   *   Speech 当前只声明 SenseVoice、FireRedVAD 与 CAM++；Audio8/Qwen 资产由
+   *   旧安装或 Manager 历史保留，但不再属于这个发布包。
+   */
+  !/audio8|qwen3/i.test(JSON.stringify(manifest))
+    && manifest.assets.requires.some((a) => a.id === 'model.sensevoice.frontend' && a.required === false)
     && manifest.assets.requires.some((a) => a.id === 'model.sensevoice.ctx' && a.required === false)
     && manifest.assets.requires.some((a) => a.id === 'model.sensevoice.graph' && a.required === false),
 );
@@ -992,35 +959,54 @@ test(
     assetsSource.includes('export async function ensureAssetRoot')
       // ⛔ 启动路径上**不许**出现下载。几百 MB 的取用发生在页面显式点下载时。
       && !/ensureAssetRoot\('model\.sensevoice/.test(mainSource)
-      && /senseCtx = await resolveAssetRoot\('model\.sensevoice\.ctx'/.test(mainSource)
-      // Qwen：选中那一档的那一刻（注入给 AsrController 的解析器）
-      && /resolveAsset: \(id\) => ensureAssetRoot\(id/.test(mainSource)
+      // ⭐ docs/093：SenseVoice 现在走 logical resolve，⛔ 不再自己解析 `.ctx`。
+      //    但那条规矩没变——**启动只问「能不能跑」，⛔ 不下载**。
+      && /senseModel = await resolveLogicalModel\('model\.sensevoice'\)/.test(mainSource)
+      /**
+       * ⚠ 必须用**去掉注释**的源码：上面那句解释里就写着
+       * `ensureAssetRoot('model.campplus.ctx')`（说明「迁移前是这样」），
+       * 而按原文断言会让**一句解释**把测试判红——修法则会变成删掉那句解释。
+       * ⭐ 测试要盯的是代码，不是文字（本文件后面 `codeOnly` 的同一条规矩）。
+       */
+      && !/ensureAssetRoot\('model\.campplus\.ctx'/.test(
+        mainSource.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, ''))
+      // SenseVoice 的可执行体只从 logical model descriptor 注入；Speech 不再
+      // 按旧 backend id 解析资产，也不在启动时下载。
+      && !/resolveAsset:\s*\(id\)/.test(mainSource)
+      && !/ensureAssetRoot\('model\.(audio8|qwen3)/.test(mainSource)
       // 只有 optional 的资产走得通这条路；必需的仍然必须装的时候到位
       && assetsSource.includes('not_optional'),
   );
   const modelsSource = fs.readFileSync(path.join(root, 'service/models.mjs'), 'utf8');
   const indexHtmlModels = fs.readFileSync(path.join(root, 'web/index.html'), 'utf8');
   const appJsModels = fs.readFileSync(path.join(root, 'web/app.js'), 'utf8');
+  const modelsCode = modelsSource
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  const mainModelsCode = mainSource
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
   test(
-    'a model can be obtained and removed from this page, with no other route to it',
-    /**
-     * ⭐ 资产包刻意不出现在 Framework 的 Package 页面里，所以这里必须是完整的入口：
-     * 看得到状态、下得了、删得掉。少任何一半，setup 就走不完——而「装了却不能用」
-     * 正是这套东西要消灭的状态。
-     */
+    'Settings exposes logical model requirements and delegates lifecycle to Manager',
     /export async function listModels/.test(modelsSource)
-      && /export async function fetchModel/.test(modelsSource)
-      && /export async function removeModel/.test(modelsSource)
-      && /route === '\/models'/.test(mainSource)
-      && /route === '\/models\/fetch'/.test(mainSource)
-      && /route === '\/models\/delete'/.test(mainSource)
-      // ⭐ 资产包也从这里装：少这一条，Qwen 档位就永远停在「资产包未安装」而无路可走。
-      && /export async function installProvider/.test(modelsSource)
-      && /route === '\/models\/install-provider'/.test(mainSource)
-      && appJsModels.includes("'install-provider'")
-      // ⭐ 模型是**自己一个 tab**，不是设置页里的一节：在模型到位之前这个包做不了任何事。
-      && indexHtmlModels.includes('data-page="models"')
-      && indexHtmlModels.includes('id="page-models"')
+      && /export async function downloadModel/.test(modelsSource)
+      && /export async function useModel/.test(modelsSource)
+      && /export async function modelOperation/.test(modelsSource)
+      && modelsCode.includes('model.sensevoice')
+      && modelsCode.includes('model.fireredvad')
+      && modelsCode.includes('model.campplus')
+      && !modelsCode.includes('model.qwen3asr')
+      && /route === '\/models'/.test(mainModelsCode)
+      && /route === '\/models\/download'/.test(mainModelsCode)
+      && /route === '\/models\/use'/.test(mainModelsCode)
+      && !/route === '\/models\/(fetch|delete|install-provider)'/.test(mainModelsCode)
+      && !/export async function (fetchModel|removeModel|installProvider)/.test(modelsCode)
+      && !appJsModels.includes('install-provider')
+      && !appJsModels.includes('models/delete')
+      && !appJsModels.includes('models/install-provider')
+      && !indexHtmlModels.includes('data-page="models"')
+      && indexHtmlModels.includes('id="models-manager-link"')
+      && indexHtmlModels.includes('id="models-freshness"')
       && indexHtmlModels.includes('id="models-list"')
       && appJsModels.includes('renderModels'),
   );
@@ -1031,8 +1017,11 @@ test(
      * 是**模型页也打不开了**，那正是唯一能补模型的地方。缺什么都要能被看见并就地修好。
      */
     // 前处理数据解析失败要被接住并记下原因，而不是逃出去把进程带走。
-    /senseFrontendWhy = String\(error/.test(mainSource)
+    // ⭐ docs/093：现在缺模型体现为 `resolveLogicalModel` 返回 available:false，
+    //    ⛔ 而不是一个会把进程带走的异常。
+    /senseFrontendWhy = senseModel\?\.hint/.test(mainSource)
       && /frontendRoot: senseFrontend\?\.root \?\? null/.test(mainSource)
+      && /resolveLogicalModel\('model\.sensevoice'\)/.test(mainSource)
       && /lastTransportError/.test(fs.readFileSync(path.join(root, 'service/assets.mjs'), 'utf8')),
   );
   test(
@@ -1041,8 +1030,10 @@ test(
      * ⚠ 能下的就下、本机没有对应硬件版本的下了也没用、资产包没装的要先装包——
      * 三件事的下一步动作完全不同，压成一句「缺失」等于什么都没说。
      */
-    /no_variant/.test(modelsSource) && /no_provider/.test(modelsSource)
-      && appJsModels.includes('no_variant') && appJsModels.includes('no_provider'),
+    /managerFailure/.test(modelsSource)
+      && modelsSource.includes('runtime_unknown')
+    && modelsSource.includes('manager_unavailable')
+      && appJsModels.includes('ready_reason'),
   );
   test(
     'a missing model reports both why it was missing and why the fetch failed',
@@ -1056,7 +1047,7 @@ test(
   );
 }
 test(
-  'FireRedVAD is a declared dependency, not a bare path this package hopes exists',
+  'model packages are capability dependencies, while App remains a hard integration',
   /**
    * ⭐ 三个声明各回答一个不同的问题，缺一不可：
    *   packages.requires → 装什么（Framework 去 Catalog 取）
@@ -1065,8 +1056,12 @@ test(
    * ⛔ 同时**删掉**了 `runtime.external` 里那两条裸路径探针：同一件事两个声明处，
    * 其中一个指的路径新版本根本不再读，迟早变成「明明装好了却报缺失」的假红。
    */
-  manifest.packages.requires.some((item) => item.id === 'github.termux-os.asset.fireredvad' && item.required)
-    && manifest.assets.requires.some((item) => item.id === 'model.fireredvad' && item.required)
+  manifest.packages.requires.some((item) => item.id === 'github.termux-os.asset.fireredvad' && item.required === false)
+    && manifest.packages.requires.filter((item) => item.id.startsWith('github.termux-os.asset.'))
+      .every((item) => item.required === false)
+    && manifest.assets.requires.filter((item) => item.id.startsWith('model.'))
+      .every((item) => item.required === false)
+    && manifest.integrations.requires.some((item) => item.capability === 'termux-os.app.api' && item.required === true)
     && !manifest.runtime.external.some((item) => item.id.startsWith('fireredvad-'))
     && !JSON.stringify(manifest).includes('models/fireredvad'),
 );
@@ -1075,13 +1070,15 @@ test(
   const mainSourceForAssets = fs.readFileSync(path.join(root, 'service/main.mjs'), 'utf8');
   const assetsSource = fs.readFileSync(path.join(root, 'service/assets.mjs'), 'utf8');
   test(
-    'the VAD model path comes from the asset map, with no fallback to a bare path',
+    'FireRedVAD consumes executable + cmvn from the logical descriptor, with no raw fallback',
     // ⛔ 没有默认值、没有回落。一个「资产缺失时悄悄用旧路径」的分支会让依赖门禁
     // 形同虚设：声明的东西没装上，服务照样跑，而问题要到别人的机器上才暴露。
     !vadSource.includes('/sdcard/termux-os/models')
-      && vadSource.includes('requires a resolved modelRoot from the asset map')
-      && mainSourceForAssets.includes("await resolveAssetRoot('model.fireredvad')")
-      && mainSourceForAssets.includes('modelRoot: vadAsset.root,')
+      && vadSource.includes('cmvnFile = null')
+      && mainSourceForAssets.includes("resolveLogicalModel('model.fireredvad')")
+      && mainSourceForAssets.includes("companionFile(vadModel, 'cmvn')")
+      && !mainSourceForAssets.includes("resolveAssetRoot('model.fireredvad')")
+      && !mainSourceForAssets.includes('modelRoot: vadAsset.root,')
       /**
        * ⭐ 真机上抓到过的分裂状态：speech 读的 cmvn 来自 asset store，而 **HTP 上真正
        * 跑的那张图来自旧裸路径**——因为只给了 `model`（一个名字），App 就按它自己的
@@ -1096,27 +1093,78 @@ test(
       && assetsSource.includes("asset.ready !== true"),
   );
 }
-// 0.13.0：可切换转写模型 + 顶部实时可用内存。
-// 锁三件事：① 三个档位都在配置的取值域里；② Qwen 分支走 pcm_b64 而**不是** wav_path
-// （WAV 在本包私域，App 是另一个 uid 读不到，写成路径会在真机上静默失败）；
-// ③ 内存只是显示值，不参与任何自动决策——docs/053 已证 MemAvailable 不预测能否载入。
+// 0.13.0：转写配置 + 顶部实时可用内存。
+// 当前 Speech 只提供 SenseVoice；内存只是显示值，不参与任何自动决策。
 const asrControllerSource = fs.readFileSync(new URL('../service/asr/controller.mjs', import.meta.url), 'utf8');
 const configSource = fs.readFileSync(new URL('../service/config.mjs', import.meta.url), 'utf8');
 const appJsSource = appJs;
 const indexHtmlSource = indexHtml;
+// docs/074：产品面只剩两条 pipeline，各自持有已验证成熟的 VAD。
 test(
-  'ASR model is switchable across SenseVoice and both Qwen3 variants',
-  configSource.includes("ASR_MODELS = ['sensevoice', 'qwen3-q4', 'qwen3-q8']")
+  'the ASR selector offers exactly SenseVoice',
+  configSource.includes("ASR_MODELS = ['sensevoice']")
     && configSource.includes("model: 'sensevoice'")
     && indexHtmlSource.includes('id="asr-model"')
     && appJsSource.includes("$('asr-model').value"),
 );
+// ⭐ 下线不是「藏起来」：旧值必须在四个层面都消失，只留一条会警告的迁移路径。
 test(
-  'Qwen3 transcription sends PCM bytes, never a path the App cannot open',
-  asrControllerSource.includes('pcm_b64')
-    && asrControllerSource.includes('readWavPcmBytes')
-    && !/\bwav_path:\s/.test(asrControllerSource.split('transcribeQwen')[1]?.slice(0, 1200) ?? ''),
+  'retired ASR engines are gone from selector, UI and runtime',
+  !configSource.includes("ASR_MODELS = ['sensevoice', 'audio8']")
+    && !configSource.includes("ASR_MODELS = ['sensevoice', 'qwen3")
+    && !/value="qwen3-/.test(indexHtmlSource)
+    && !/value="audio8"/.test(indexHtmlSource)
+    && !/transcribeQwen/.test(asrControllerSource)
+    && !/transcribeAudio8/.test(asrControllerSource)
+    && configSource.includes('ASR_DEPRECATED_MODELS'),
 );
+test(
+  'a retired engine value migrates to the product default with one warning, never silently',
+  configSource.includes('resolveAsrModel')
+    && configSource.includes('deprecationWarned')
+    && configSource.includes('console.warn'),
+);
+{
+  const mainForBackend = fs.readFileSync(path.join(root, 'service/main.mjs'), 'utf8');
+  test(
+    'only one backend may commit at a time, and lateness is judged by generation not by clock',
+    mainForBackend.includes('backendGeneration')
+      && mainForBackend.includes('stale_backend_result_dropped')
+      /**
+       * ⚠ 0.21.5：判据从「写死 sensevoice」改成「结果自己说出自哪条 backend」。
+       *   两条 backend 现在共用同一条队列，写死一个名字等于把另一条的结果全丢掉。
+       */
+      && mainForBackend.includes("backendOwns(outcome?.backend ?? 'sensevoice', resultGeneration)")
+      && !mainForBackend.replace(/\/\*[\s\S]*?\*\//g, '').includes("activeBackend !== 'sensevoice'"),
+  );
+  test(
+    'switching closes the old door, bumps the generation, then reopens with the new one',
+    /**
+     * ⭐ 顺序契约（docs/075 §7）：**先关旧门 → generation++ → 再用新实现开同一扇门**。
+     *   `backendOwns` 保证换代之后旧路径的结果一律作废，所以「两条同时 commit」
+     *   不靠时间窗躲开，而是结构上不可能。
+     * ⚠ 判断门与麦克风一概不动——旧版在这里 stopChain，制造出 demand=0 的一瞬，
+     *   而后台重启 microphone FGS 会被 Android 拒绝（docs/074 实测 969 次重试）。
+     */
+    (() => {
+      const start = mainForBackend.indexOf('const applyBackend');
+      const end = mainForBackend.indexOf('const backendSnapshot', start);
+      const section = mainForBackend.slice(start, end);
+      const closeDoor = section.indexOf('close_old_door');
+      const prepare = section.indexOf('prepare_target');
+      const generation = section.indexOf('backendGeneration += 1');
+      const reengage = section.indexOf('engageProcessing', generation);
+      return closeDoor >= 0 && closeDoor < prepare
+        && prepare < generation && reengage > generation;
+    })()
+      // ⚠ 锚在**声明**上：`applyBackend` 现在也被 `selectBackend`/`ensureBackendReady`
+      //   调用（docs/090 §6），而那两个一行的转发不是切换实现。盯任何一次提及会让
+      //   「有人在别处调了它」看起来像「切换路径 stopChain 了」——判据必须指向被测的那段代码。
+      && !/const applyBackend = async[\s\S]{0,3500}stopChain/.test(mainForBackend)
+      && !mainForBackend.includes("'/api/android/mic/enable'")
+      && !mainForBackend.includes("'/api/android/mic/disable'"),
+  );
+}
 test(
   'available memory is a readout only and never gates behaviour',
   indexHtmlSource.includes('id="mem-avail"')
@@ -1131,12 +1179,10 @@ const mainSource = fs.readFileSync(new URL('../service/main.mjs', import.meta.ur
 const packageSource = fs.readFileSync(new URL('../package.mjs', import.meta.url), 'utf8');
 const statesSource = fs.readFileSync(new URL('../service/states.mjs', import.meta.url), 'utf8');
 const appJsRaw = fs.readFileSync(path.join(root, 'web/app.js'), 'utf8');
-const setupJsRaw = fs.readFileSync(path.join(root, 'web/setup.js'), 'utf8');
 const vadSource = fs.readFileSync(new URL('../service/vad/controller.mjs', import.meta.url), 'utf8');
 const lifecycleSource = fs.readFileSync(new URL('../service/lifecycle/controller.mjs', import.meta.url), 'utf8');
 const captureSource = fs.readFileSync(new URL('../service/capture/app-events.mjs', import.meta.url), 'utf8');
 const pcmSource = fs.readFileSync(new URL('../service/pcm-ws.mjs', import.meta.url), 'utf8');
-const kwsSource = fs.readFileSync(new URL('../service/kws/controller.mjs', import.meta.url), 'utf8');
 /**
  * ⚠ 断言「代码里没有 X」时必须先去掉注释——否则一句解释「我们**不用** X」会让断言失败，
  * 而修法会变成删掉那句解释。测试要盯的是代码，不是文字。
@@ -1166,8 +1212,9 @@ test(
   // 「不保存 WAV、不 enqueue ASR、不产生 transcript」是三件事；写了再删只做到了一件。
   vadSource.indexOf('const dropped = this.evaluateDrop(') < vadSource.indexOf('fs.mkdirSync(this.wavRoot')
     && vadSource.includes("return { reason: 'capture_interrupted', at_mono_ms: broke }")
-    // 没有单调时刻时不丢：宁可多转写一句，也不要因为「不知道」就吃掉使用者说过的话。
-    && vadSource.includes('if (startMonoMs === null || endMonoMs === null) return null;'),
+    // 时间型策略需要单调锚；CAM++ gate 则可以在无锚时先拒绝，不能先落 WAV。
+    && vadSource.includes('this.dropPolicy({')
+    && vadSource.includes('if (startMonoMs !== null && endMonoMs !== null) {'),
 );
 // ⭐ 机械保证：service 读的每一个持久化路径，package.mjs 都必须注入。
 // ⚠ 这条同样是真机事故催生的：`RECORD_DATA_ROOT` 只在 service 里有默认值、没人注入，
@@ -1227,14 +1274,18 @@ test(
     && groupsSource.includes('item_seq: items.length + 1'),
 );
 test(
-  'the page shows the current group and the two on disk, never a lifetime total',
-  indexHtml.includes('id="rec-group"')
-    && indexHtml.includes('id="rec-progress"')
-    && indexHtml.includes('id="rec-groups"')
-    && appJs.includes('renderRecords')
-    && appJs.includes('音频${')
-    // 归档不可用时页面必须说出来——否则「轮转停了」是完全不可见的。
-    && appJs.includes('轮转已暂停，音频不会被删除'),
+  /**
+   * OLD TEST → 记录组卡必须出现在概览（`rec-group`/`rec-progress`/`rec-groups`）。
+   * WHY OBSOLETE → 0.21.5 把「转写结果」整张开发者卡移出概览产品路径：
+   *   组号、组进度、`segment=` 这类内部编号不是使用者要在首页看的东西。
+   * NEW ASSERTION → 旧记录组 renderer 不再是产品入口；ASR live renderer 仍然由
+   *   Overview 唯一调用并保留最近识别事实。
+   */
+  'the records renderer survives the overview rebuild and still tells the truth about rotation',
+  appJs.includes('renderAsrLive')
+    && appJs.includes('overview-asr-live')
+    && indexHtml.includes('id="ov-latest"')
+    && !indexHtml.includes('id="rec-groups"'),
 );
 
 test(
@@ -1245,9 +1296,8 @@ test(
   configSource.includes("graph_residency: 'service'")
     && lifecycleSource.includes("if (this.residency !== 'service') {")
     && lifecycleSource.includes("if (this.residency !== 'warm') {")
-    // ⚠ App 在最后一个订阅者离开时拆掉拼音 worker，所以「保持挂载」必须连订阅一起留。
-    && mainSource.includes("kws.suspend({ keepSubscription: cfg.graph_residency === 'service' })")
-    && kwsSource.includes('if (!keepSubscription) this.pinyin.close();'),
+    // 只验证 VAD/ASR 常驻图，不把已经删除的触发组件带回架构契约。
+    && !mainSource.includes('keepSubscription'),
 );
 test(
   'undeclare has exactly two callers, and neither of them is a restart',
@@ -1300,7 +1350,7 @@ test(
     && !/trim\(\)\s*===\s*''/.test(groupsSource)
     && !/isBlank/.test(groupsSource)
     // 标点-only 不是空白：使用者可能真的只说了一个语气。
-    && textSource.includes('标点-only'),
+    && textSource.includes('标点/符号-only'),
 );
 test(
   'records are admitted after ASR, so discarding a blank needs no rollback',
@@ -1326,7 +1376,7 @@ test(
    * 用 `admit` 走这条路则会在当前组再建一条重复记录。
    */
   mainSource.includes('retranscribe: true')
-    && mainSource.includes("if (outcome?.retranscribe) records?.retranscribe(segment.segment_id, outcome);")
+    && mainSource.includes("if (outcome?.retranscribe) { records?.retranscribe(segment.segment_id, outcome); return; }")
     && groupsSource.includes('retranscribe(segmentId, outcome = {}) {')
     // 就地更新：不新建 item、不动 feed 游标。
     && !/retranscribe\(segmentId[\s\S]{0,1400}nextFeedSeq\(\)/.test(groupsSource)
@@ -1345,7 +1395,7 @@ test(
     // 恢复即停：一次抖动不该留下一条永远慢下去的探测节奏。
     && captureSource.includes('this.reset();')
     // 事件是主路径；watchdog 只在「本该有 PCM 却长时间没有」时才动。
-    && mainSource.includes('expected: lifecycle.wantsPcm(),')
+    && mainSource.includes('expected: pcmNeeded,')
     && !mainSource.includes('setInterval(() => void readMic'),
 );
 test(
@@ -1373,16 +1423,25 @@ test(
 // 少注册一条不会报错，只会在使用者按下去的那一刻失败。
 {
   const called = new Set();
-  for (const source of [appJsRaw, setupJsRaw]) {
+  for (const source of [appJsRaw]) {
     for (const m of source.matchAll(/request\(\s*(?:`([^`]*)`|'([^']*)'|[^,)]*\?\s*'([^']*)'\s*:\s*'([^']*)')/g)) {
       for (const hit of [m[1], m[2], m[3], m[4]]) {
         if (hit) called.add(hit.split('?')[0].replace(/\$\{[^}]*\}/g, ''));
       }
     }
   }
+  /**
+   * ⚠ 注册有**两种写法**：单条 `proxy('POST', '/x')`，以及
+   * `for (const r of ['/x', '/y']) proxy('POST', r)` 那种成批的。
+   * 只认第一种，就会把成批注册过的路由judged为「没注册」——而那是个假警报，
+   * 修它的人多半会去加一条重复注册，而不是发现这条判据自己不完整。
+   */
   const registered = new Set(
     [...packageSource.matchAll(/proxy\('(?:GET|POST)',\s*'([^']+)'/g)].map((m) => m[1]),
   );
+  for (const loop of packageSource.matchAll(/for \(const r of \[([^\]]+)\]\)\s*\{?\s*\n?\s*proxy\('(?:GET|POST)'/g)) {
+    for (const m of loop[1].matchAll(/'([^']+)'/g)) registered.add(m[1]);
+  }
   const missing = [...called].filter((route) => !registered.has(route)).sort();
   test(
     `every service path the pages call is registered in package.mjs (missing: ${missing.join(', ') || 'none'})`,
@@ -1391,17 +1450,13 @@ test(
 }
 
 test(
-  'the page separates capture, wake and dictation instead of collapsing them into on/off',
-  // 采集被抢占时是 silenced 而唤醒组仍 ready；听写 warm 时模型在内存里但没人在用。
-  indexHtml.includes('id="ov-capture"')
-    && indexHtml.includes('id="ov-wake"')
-    && indexHtml.includes('id="ov-dictation"')
-    && indexHtml.includes('id="chain-toggle"')
+  'the manual entry uses one control and the chain has one opening path',
+  indexHtml.includes('id="ac-chain"')
+    && !indexHtml.includes('id="chain-toggle"')
+    && (indexHtml.match(/id="man-toggle"/g) ?? []).length === 1
     && appJs.includes("request(started ? '/chain/stop' : '/chain/start'")
-    // 外部 requester 持着听写时，停链要先问一次——误触不该静默收走别人的输入。
     && appJs.includes('停止语音链会强行收走它们的听写')
     && appJs.includes('force = true;')
-    // 保温剩余时间必须看得见，否则「模型还在不在」对使用者是不可观测的。
     && appJs.includes("lifecycle.dictation === 'warm'"),
 );
 test(
@@ -1414,68 +1469,63 @@ test(
     && !vadSource.includes('drops_total_all_time'),
 );
 test(
-  'listen mode suppresses every automatic close and shares one opening path with KWS',
-  // listen 不再有自己的一份布尔——真相住在 lifecycle 的 requester lease 表里（docs/061 §五）。
+  'listen mode suppresses automatic close and uses the RMS-to-ASR opening path',
   mainSource.includes('if (listenEngaged()) return null;')
     && /onEnd: \(request\) => \(listenEngaged\(\)/.test(mainSource)
-    // ⚠ KWS 的 lease 不算「听写模式」：模式的语义是抑制全部自动关门，而唤醒触发的会话
-    // 本来就该被那四条超时收走。它拿 lease 只是为了让载入与状态经过同一个 controller。
-    && mainSource.includes("const listenEngaged = () => [...lifecycle.leases.keys()].some((id) => id !== KWS_REQUESTER);")
-    && mainSource.includes("await lifecycle.engage(KWS_REQUESTER, { reason: 'kws_hit' })")
-    // 开门只有一段代码：KWS 命中与 listen 模式都走 engagePipeline，不许有第二套
-    && (mainSource.match(/gate\.openFromKeyword\(/g) ?? []).length === 1
-    && mainSource.includes('await engagePipeline(hit,')
-    && mainSource.includes("engagePipeline(\n    { source: requester")
+    && (mainSource.includes('const listenEngaged = () => lifecycle.leases.size > 0;')
+      || mainSource.includes('const listenEngaged = () => lifecycle?.leases?.size > 0;'))
+    && mainSource.includes("engageProcessing(\n    { source: requester")
+    && mainSource.includes('const engageProcessing = (trigger, reason) => engagePipeline(trigger, reason);')
+    && (mainSource.match(/engagePipeline\(/g) ?? []).length === 1
     && packageSource.includes("id: 'speech.listen.set'"),
 );
 test(
   'Speech page removes PCM Core Test and embeds the Input Device selector in actual routing',
   !indexHtml.includes('PCM核心测试')
     && !indexHtml.includes('pcm/test')
-    && indexHtml.includes('class="route-fact"')
     && indexHtml.includes('id="input-device"')
-    && indexHtml.includes('PCM Pool（VAD 回溯）')
-    && ['form-daily', 'form-detect', 'form-recognition']
-      .every((form) => indexHtml.includes(`id="${form}"`))
-    && indexHtml.includes('id="kws-cue-enabled"')
-    // ⛔ 「保留 WAV 上限」已随 Reservoir 一起删除：保留量由记录组回答（每组 50、盘上两组）。
+    && indexHtml.includes('id="form-daily"')
+    && !indexHtml.includes('id="form-detect"')
+    && !indexHtml.includes('id="form-recognition"')
     && !indexHtml.includes('id="vad-max-wavs"')
-    && indexHtml.includes('开发者 speech.idle'),
+    && indexHtml.includes('id="man-toggle"')
+    && indexHtml.includes('id="asr-model"'),
 );
-// 060：主导航从「六个 Pipeline 阶段」改为「概览 / 设置 / 诊断」三页。
-// 六个阶段的详细数值一个都不许丢——它们全部搬进诊断页，这一条同时锁住这两件事。
+// 产品导航收敛为 Overview / Settings / My Voice；内部阶段事实按产品职责归位。
 test(
-  'the page is three task-shaped pages and no stage detail was dropped on the way',
-  ['overview', 'settings', 'diagnostics']
+  'the page is exactly three product pages and pipeline facts stay on the right page',
+  ['overview', 'settings', 'voice']
     .every((page) => indexHtml.includes(`data-page="${page}"`)
       && indexHtml.includes(`id="page-${page}"`))
-    // 六个阶段的诊断区块全部在场
-    && ['input', 'rms', 'kws', 'vad', 'asr', 'output']
-      .every((stage) => indexHtml.includes(`id="diag-${stage}"`))
-    // 每个阶段的关键读数都还能找到
-    && ['rms-current', 'rms-avg', 'rms-peak', 'kws-keyword', 'kws-score', 'kws-countdown',
-      'vad-probability', 'vad-countdown', 'vad-wav-total', 'asr-owner', 'asr-countdown',
-      'asr-total', 'states-grid', 'speech-input']
+    && ['rms-current', 'rms-avg', 'rms-peak', 'rms-cam-countdown', 'cam-live', 'cam-owner',
+      'vad-probability', 'vad-owner', 'asr-owner', 'asr-state', 'ov-current', 'ov-latest']
       .every((id) => indexHtml.includes(`id="${id}"`))
-    // 旧的六格导航必须整个消失，不能两套并存
-    && ['pipe-cell', 'node-pool', 'node-wav', 'kws-control-lane', 'pipeline-boundary', 'pipe-edge']
-      .every((id) => !indexHtml.includes(id))
+    && !indexHtml.includes('data-page="speech"')
+    && !indexHtml.includes('data-page="diagnostics"')
+    && !indexHtml.includes('<iframe')
     && !styleCss.includes('grid-template-columns:repeat(6,1fr)')
-    // 触控高度是一个基准变量，不是逐处手写的数字
     && styleCss.includes('--touch:48px')
-    && /\.tab\s*\{[^}]*min-height:var\(--touch\)/.test(styleCss),
+    && /\.tab\s*\{[^}]*height:100%/.test(styleCss),
 );
 // 概览页要能「一眼看完」，所以这六件事必须在同一页上，不需要点开任何分页。
 test(
-  'Overview answers the six daily questions without opening another page',
-  ['health-badge', 'ov-mic', 'ov-route', 'ov-model', 'listen-state', 'tx-latest-text', 'alerts']
-    .every((id) => indexHtml.includes(`id="${id}"`))
-    // 流水线摘要是阶段节点，⛔ 不是进度条
-    && indexHtml.includes('class="stages"')
-    && !/<progress|role="progressbar"/.test(indexHtml)
-    // Active 与 Close Owner 是两个独立维度，页面上必须分开标
-    && indexHtml.includes('own-tag')
-    && /\.stage-row\.owner\s+\.own-tag/.test(styleCss),
+  /**
+   * OLD TEST → 概览必须有 `health-badge`/`ov-mic`/`ov-route`/`ov-model`/`listen-state`/
+   *   `tx-latest-text`/`alerts` 七个 id（麦克风、路由、模型、听写、告警……）。
+   * WHY OBSOLETE → 那七项里有五项是**技术读数**（路由、模型、听写开关、开发者告警卡），
+   *   0.21.5 把概览收敛成「服务怎么样 / 现在有没有听见 / 识别到了什么」三块。
+   * NEW ASSERTION → 概览必须能回答的是**产品**三问：服务状态、声音活动、识别结果；
+   *   ⭐ 并且**一开口就要动的那一条**（音量条）必须真的在第一屏的 DOM 里。
+   */
+  'Overview answers the three product questions and reacts the moment there is sound',
+  ['pd-service-badge', 'act-meter', 'act-fill', 'act-badge', 'act-who',
+    'ov-current', 'ov-latest'].every((id) => indexHtml.includes(`id="${id}"`))
+    // ⛔ 旧的开发者卡整块退出产品路径
+    && !indexHtml.includes('id="alerts"')
+    && !indexHtml.includes('id="ov-route"')
+    && !indexHtml.includes('id="listen-state"')
+    // 音量条是 width 过渡，⛔ 不是会引起重排的动画（它每秒更新多次）
+    && /\.meter-fill\s*\{[^}]*transition:\s*width/.test(styleCss),
 );
 test(
   'an unrecognised transcript shape is an explicit error, never an empty history',
@@ -1493,11 +1543,25 @@ test(
     && !appJs.includes('known - TRANSCRIPT_KEEP'),
 );
 test(
+  /**
+   * OLD TEST → 钉住 `listen-toggle` 那个按钮里的确切措辞（「听写正由…」）。
+   * WHY OBSOLETE → 0.21.5 把四个相似入口收敛成一个 `man-toggle`，
+   *   那个按钮连同它的文案一起没了。
+   * NEW ASSERTION → 钉**保护本身**而不是钉哪个按钮承载它：
+   *   页面上唯一那个会停止语音输入的控件，在持有者不是自己时必须先问一次。
+   * ⚠ 这条保护无法搬到后端：`POST /listen{enabled:false}` 是无条件退出的，
+   *   「要不要打断别人」是产品决定。
+   */
   'stopping a listen that someone else holds needs an explicit confirmation',
-  // 后端不区分调用方（POST /listen {enabled:false} 无条件退出），保护只能落在这里
-  appJs.includes("requester !== 'webui'")
-    && /window\.confirm\(\s*\n?\s*`听写正由/.test(appJs)
-    && appJs.includes("'直通／已绕过唤醒'"),
+  (() => {
+    return appJs.includes('const holders = (lifecycle?.requesters ?? []).filter((id) => id !== \'webui\');')
+      && appJs.includes('if (started && holders.length)')
+      && appJs.includes('window.confirm(')
+      && appJs.includes('if (!confirmed) return;')
+      && appJs.includes('force = true;');
+  })()
+    && appJs.includes("['settings-audio-control', ['lifecycle', 'pcm_consumers', 'input', 'listen']")
+    && appJs.includes('语音输入归谁'),
 );
 // 概览要回答的两件事——「有没有出事」和「听写现在归谁」——此前分别只在 `/status`
 // 和 `/listen` 里，于是巡检回路看不见它们。两者都是既有状态的**投影**，不是新状态机；
@@ -1517,52 +1581,70 @@ test(
 );
 test(
   'switching the ASR model confirms, re-reads the backend, and never claims a fallback',
-  appJs.includes('MODEL_RISK')
-    && /await request\('\/asr\/config'\)/.test(appJs)
-    && appJs.includes('切换失败，仍在使用原模型')
-    // 后端没有任何自动回退机制，页面就不许出现这种字样
+  /**
+   * ⭐ **按新意图改写**（docs/091 §使用者反馈③），⛔ 不是绕过。
+   *
+   * 旧断言绑在一个**独立的「切换」按钮**上（`MODEL_RISK` 确认框 + 失败提示）。
+   * 使用者要求去掉那个按钮：保存 ASR 设定**就是**切换——两个按钮意味着
+   * 「选了但没切」是一个合法状态，而没有人想要那个状态。
+   * 不变的仍然是这条：**成功也必须回读后端**，⛔ 页面不许自称换成功了；
+   * 而后端没有任何自动回退机制，页面也就不许出现那种字样。
+   */
+  /await request\('\/asr\/config'\)/.test(appJs)
+    && appJs.includes("confirmed.value.model !== wantedModel")
+    && appJs.includes('后端保留了')
+    // ⛔ 已经没有第二个入口了
+    && !appJs.includes('asr-model-apply')
     && !/自动降级|自动回退|自动 fallback/.test(appJs),
 );
-// 一个叫「用了哪个模型」的字段不能是常量。改前每条转写都自称 SenseVoice，
-// 哪怕它其实是 Qwen 转的——于是「换过模型」这件事在历史里完全不可见。
+// 一个叫「用了哪个模型」的字段必须对应真实执行体。当前产品只有 SenseVoice，
+// 所以记录明确写出它，并且旧 backend 不再有自己的执行路径。
 test(
   'a transcript records the model that actually produced it',
-  asrControllerSource.includes("model: (this.config.model ?? 'sensevoice') === 'sensevoice'")
-    && asrControllerSource.includes('id: this.config.model,')
-    && asrControllerSource.includes("runtime: 'android-app-asr-endpoint',"),
+  // docs/074：这条 pipeline 只服务 SenseVoice；controller 在跑前冻结 backend，
+  // 结果的 model 与 backend 都来自这条唯一执行事实。
+  asrControllerSource.includes("id: 'sensevoice',")
+    && asrControllerSource.includes("model: {\n        id: 'sensevoice',")
+    && asrControllerSource.includes("job.ran_backend = this.config.model ?? 'sensevoice';")
+    && asrControllerSource.includes("runtime: 'android-app-ort-qnn-htp',")
+    && asrControllerSource.includes('is not served by this pipeline'),
 );
-// `files_present` 回答的永远是 SenseVoice。选了 Qwen 时它照样返回布尔值，
-// 但答的不是被问的那个问题（docs/056：读得出值，含义却是错的）。
+// `files_present` 当前只回答 SenseVoice；不存在「选了别的引擎却伪造文件状态」的分支。
 test(
-  'a tier resolves only its own assets, and "not resolved yet" is not "missing"',
-  // ⛔ 全部先解析一遍，会让没装 Qwen 的设备在用 SenseVoice 时因为缺一个它根本用不到的
-  // 资产而起不来。⚠ 而 `files_present: null` 与 `false` 必须分开：前者要去解析，后者要去下载。
-  asrControllerSource.includes('async qwenPaths(variant)')
-    && asrControllerSource.includes('await this.resolveAsset(QWEN_ASSETS[variant])')
-    && asrControllerSource.includes("reason: 'asset_not_resolved_yet'")
-    && asrControllerSource.includes('files_present: null'),
+  'only SenseVoice is probed and old backend-specific fields are gone',
+  asrControllerSource.includes("const variant = 'sensevoice';")
+    && asrControllerSource.includes('session_loaded')
+    && !asrControllerSource.includes('audio8_session_not_loaded')
+    && !asrControllerSource.includes('transcribeAudio8'),
 );
 test(
-  'the selected ASR tier is probed on its own, and the SenseVoice field keeps its old meaning',
+  'the SenseVoice tier is probed on its own and keeps an explicit readiness meaning',
   asrControllerSource.includes('const presence = (files, nowMs = Date.now())')
-    && asrControllerSource.includes("const variant = this.config.model ?? 'sensevoice';")
-    // Qwen 的路径来自 Asset map，代码里不再有裸路径常量。
+    && asrControllerSource.includes("const variant = 'sensevoice';")
+    // 旧 backend 的路径来自旧 Asset map；当前源码不再保留裸路径常量。
     && !asrControllerSource.includes('QWEN_MEL_ONNX')
     && !/const QWEN_ROOT = /.test(asrControllerSource)
-    // verify-device 断言的 files_present 是 SenseVoice 的事实，不许改语义
-    && asrControllerSource.includes('const filesPresent = senseVoice.files_present;')
-    && asrControllerSource.includes('selected,')
+    /**
+     * verify-device 断言的 `files_present` 是 SenseVoice 的事实，不许改语义。
+     * ⭐ **但它必须先排除空集合**（docs/093）：模型管理器还没起来时可执行体是 null
+     * ⇒ 文件清单为空 ⇒ `missing.length === 0` ⇒ 报 ready，**而它一个模型都没有**。
+     * ⚠ 一个空集合让「全部满足」与「什么都没问」变成同一个答案。
+     */
+    && asrControllerSource.includes(
+      'const filesPresent = senseVoice.files.length > 0 && senseVoice.files_present;')
+    && asrControllerSource.includes('const selected =')
+    && asrControllerSource.includes('const selectedReady = selected.ready === true;')
     // 缺失要说得出缺的是哪个文件
     && appJs.includes('selected.missing ?? []')
-    && appJs.includes('selected?.files_present === false'),
+    && appJs.includes('selected.ready !== true'),
 );
 // 真机渲染抓到的缺陷：重建 <select> 的选项会连带扔掉当前选择，而「脏表单不覆盖」
 // 的守卫只守住了赋值那一步——于是守卫反而保证了用户的选择被抹掉。
 test(
-  'rebuilding the keyword options never silently drops the current selection',
-  appJs.includes('const keep = select.value;')
-    && appJs.includes("const wanted = dirty.has('daily') ? keep : (payload?.config?.active_profile_id ?? '');")
-    && appJs.includes("if (select.value !== wanted) select.value = '';"),
+  'a refresh never overwrites the dirty ASR form',
+  appJs.includes('function populateDaily(')
+    && /if \(dirty\.has\('daily'\)\) return;/.test(appJs)
+    && !appJs.includes('active_profile_id'),
 );
 test(
   'copy still works where navigator.clipboard does not exist',
@@ -1572,27 +1654,35 @@ test(
 );
 test(
   'the developer speech.idle stays locked until it is explicitly unlocked',
-  indexHtml.includes('id="dev-unlock"')
-    && /id="force-idle"[^>]*disabled/.test(indexHtml)
-    && appJs.includes("$('force-idle').disabled = !$('dev-unlock').checked"),
+  !indexHtml.includes('id="dev-unlock"')
+    && !indexHtml.includes('id="force-idle"')
+    && !indexHtml.includes('speech.idle'),
 );
 test(
+  /**
+   * OLD TEST → 六格阶段行里 `active`（正在工作）与 `owner`（有资格关门）
+   *   必须是两个各自独立决定的 class。
+   * WHY OBSOLETE → 那一行（`renderStages` + `.stages`）随概览重建整个下线了，
+   *   `renderStages` 已经是没有节点也没有调用者的死代码。
+   * NEW ASSERTION → **区分本身**必须还在，只是换了地方：
+   *   概览的反应层用 `speaking`（有人在说话）与门/阶段各自回答，
+   *   诊断页仍逐阶段显示 owner。⛔ 不许再退回「只看 owner 就点亮」。
+   * ⚠ 这条区分当初是真机上换来的：ASR 一开始转写 VAD 就无故变暗，
+   *   因为 lease 回答的是「谁能关门」，不是「谁在工作」。
+   */
   'lighting separates "who is working" from "who may close", so VAD stays lit while ASR transcribes',
-  // active 与 owner 是两个独立的类，不是同一个判断的两种写法
-  // ⚠ 写入前会先比一次（`setClass`），所以断言看的是这两个类**各自被独立决定**，
-  // 而不是它们用了哪个 DOM API。
-  appJs.includes("setClass(cell, 'active', active[stage] === true)")
-    && appJs.includes("setClass(cell, 'owner', stage === ownerStage)")
-    // VAD 的 active 取自 handoff（交权给 ASR 后仍为真），不是 owner === 'vad'
-    && /vad:\s*vadArmed,/.test(appJs)
-    && appJs.includes("vadArmed = vad?.handoff?.active === true")
-    // 不得再出现「只看 owner」的旧写法，也不得靠历史字段点亮
+  // 概览：说话与否单独判定，⛔ 不从 owner 推出来
+  appJs.includes('const speaking = act.active === true;')
+    && appJs.includes("const heard = level >= 0.02 || rms?.state === 'open';")
+    // 诊断：owner 仍然逐阶段可见
+    && indexHtml.includes('id="asr-owner"')
+    // ⛔ 旧的「只看 owner」与靠历史字段点亮的写法都不许回来
     && !appJs.includes('owner === node.stage')
     && !appJs.includes('vadSpeech || wav'),
 );
 test(
   'the operator page carries live state, not the architecture doctrine that belongs in docs',
-  ['不读取 Pool', 'KWS 不消费', '解耦文件契约', '只有当前 owner 能发', '关门权=',
+  ['不读取 Pool', '解耦文件契约', '只有当前 owner 能发', '关门权=',
     '未把它冒充为', '不含 PCM 字节', 'WAV RESERVOIR', 'VAD PRE-ROLL POOL']
     .every((phrase) => !indexHtml.includes(phrase))
     // 精度是可核验的事实而不是教义，所以压成角标保留，不许一起删掉。
@@ -1601,9 +1691,9 @@ test(
 test(
   'both WebUI pages use Browser Session and never ask for credentials',
   indexHtml.includes('/admin/session.js')
-    && setupHtml.includes('/admin/session.js')
+    && indexHtml.includes('/admin/session.js')
     && !indexHtml.includes('type="password"')
-    && !setupHtml.includes('type="password"'),
+    && !indexHtml.includes('type="password"'),
 );
 
 fs.rmSync(temporaryRoot, { recursive: true, force: true });

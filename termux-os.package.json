@@ -2,8 +2,8 @@
   "schema": "termux-os.package.v1",
   "id": "github.termux-os.service.termux-speech",
   "name": "Termux Speech",
-  "version": "0.20.0",
-  "description": "Runs a last-owner RMS/KWS/VAD/ASR pipeline with App-HTP FireRedVAD, SenseVoice WAV transcription, a dictation listen mode, speech.idle, live transcript feeds, a switchable ASR model (SenseVoice / Qwen3-ASR Q4 / Q8), and a live available-memory readout.",
+  "version": "0.22.5",
+  "description": "Runs a last-owner RMS/VAD/ASR pipeline with App-HTP FireRedVAD, SenseVoice WAV transcription, a dictation listen mode, speech.idle, live transcript feeds, and a live available-memory readout.",
   "types": [
     "service"
   ],
@@ -37,6 +37,12 @@
   },
   "capabilities": {
     "provides": [
+      {
+        "id": "speech.state",
+        "provider": "termux-speech",
+        "kind": "action",
+        "action": "speech.state.read"
+      },
       {
         "id": "speech.input",
         "provider": "termux-speech",
@@ -74,6 +80,10 @@
       {
         "id": "termux-os.app.api",
         "required": true
+      },
+      {
+        "id": "termux-os.assets.manager",
+        "required": false
       }
     ]
   },
@@ -90,7 +100,6 @@
         "type": "enum",
         "values": [
           "rms",
-          "kws",
           "vad",
           "asr"
         ],
@@ -149,16 +158,16 @@
       {
         "id": "github.termux-os.asset.fireredvad",
         "version": ">=1.0.0",
-        "required": true
+        "required": false
       },
       {
         "id": "github.termux-os.asset.sensevoice",
         "version": ">=3.0.0",
-        "required": true
+        "required": false
       },
       {
-        "id": "github.termux-os.asset.qwen3asr",
-        "version": ">=1.1.0",
+        "id": "github.termux-os.asset.campplus",
+        "version": ">=1.0.0",
         "required": false
       }
     ]
@@ -175,11 +184,11 @@
     "requires": [
       {
         "id": "model.fireredvad",
-        "required": true
+        "required": false
       },
       {
         "id": "model.sensevoice.frontend",
-        "required": true
+        "required": false
       },
       {
         "id": "model.sensevoice.ctx",
@@ -190,15 +199,11 @@
         "required": false
       },
       {
-        "id": "model.qwen3asr.encoder",
+        "id": "model.campplus.graph",
         "required": false
       },
       {
-        "id": "model.qwen3asr.decoder.q4",
-        "required": false
-      },
-      {
-        "id": "model.qwen3asr.decoder.q8",
+        "id": "model.campplus.ctx",
         "required": false
       }
     ]

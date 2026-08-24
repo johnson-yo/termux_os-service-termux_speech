@@ -1,7 +1,8 @@
 /**
  * SPDX-License-Identifier: Apache-2.0
- * [INPUT]: RMS/PCM, KWS handoff, Pipeline close authority, App HTP runtime, and VAD config.
- * [OUTPUT]: Bounded pre-roll, FireRedVAD cuts, atomic WAV records, ASR callbacks, and owner-scoped idle requests.
+ * [INPUT]: RMS/PCM admission, Pipeline close authority, App HTP runtime, and VAD config.
+ * [OUTPUT]: Bounded pre-roll, FireRedVAD cuts, explicit pool/activity/staircase/inference diagnostics,
+ *           atomic WAV records, ASR callbacks, and owner-scoped idle requests.
  * [POS]: VAD/WAV stage; first WAV hands close authority to ASR while VAD keeps cutting later WAVs.
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -63,15 +64,10 @@ export class VadController {
     android,
     dataRoot,
     config,
-    /**
-     * ⛔ **没有默认值**。模型位置由 Framework 的 Asset map 解析
-     * （`context.assets.resolve('model.fireredvad')`），不是一条写死的裸路径。
-     *
-     * 一个「资产缺失时悄悄回落到旧路径」的默认值，会让依赖门禁形同虚设：
-     * 声明的东西没装上，服务照样跑起来，而问题要到别人的机器上才暴露。
-     * 拿不到就 throw——起不来比带着未知状态跑更容易查。
-     */
-    modelRoot,
+    /** logical descriptor 给出的可执行模型绝对路径；⛔ 不在类内拼文件名。 */
+    modelFile = null,
+    /** logical descriptor 给出的 runtime CMVN 绝对路径；⛔ 不从 modelFile 推导。 */
+    cmvnFile = null,
     residentId = DEFAULT_RESIDENT_ID,
     onSegment = () => {},
     onChange = () => {},
@@ -80,6 +76,13 @@ export class VadController {
      * 「不保存 WAV、不 enqueue ASR、不产生 transcript」是三件事，写了再删只做到了一件。
      */
     dropPolicy = () => null,
+    /**
+     * ⭐ 每一帧 VAD 概率的**唯一观测点**（docs/083 shadow 链）。
+     * ⛔ 之所以是回调而不是「再起一张 VAD 图」：FireRedVAD 是**有状态的流**，
+     *   两个消费者共用会互相污染 recurrent state（docs/078 已经付过这个代价）。
+     * ⚠ 它必须是纯观测——抛异常不许影响正式判决，故调用点包了 try。
+     */
+    onProbability = null,
   }) {
     this.android = android;
     this.dataRoot = dataRoot;
@@ -95,11 +98,11 @@ export class VadController {
     this.onChange = onChange;
     this.onSegment = onSegment;
     this.dropPolicy = dropPolicy;
+    this.onProbability = typeof onProbability === 'function' ? onProbability : null;
+    this.probabilityFrames = 0;
     this.config = { ...config };
-    if (!modelRoot) throw new Error('VadController requires a resolved modelRoot from the asset map');
-    this.modelRoot = modelRoot;
-    this.modelPath = path.join(modelRoot, 'model.onnx');
-    this.cmvnPath = path.join(modelRoot, 'cmvn.bin');
+    this.modelPath = modelFile;
+    this.cmvnPath = cmvnFile;
     this.graph = new ResidentGraph({
       android,
       id: residentId,
@@ -131,7 +134,9 @@ export class VadController {
     this.captureGeneration = null;
     /** 本次运行中采集中断过的时刻。跨过任何一个的段都必须作废。 */
     this.captureBreaks = [];
-    this.drops = { total: 0, tts_overlap: 0, capture_interrupted: 0, last: null };
+    this.drops = {
+      total: 0, tts_overlap: 0, capture_interrupted: 0, camplus_gate: 0, last: null,
+    };
     this.timelineBaseFrame = 1;
     this.sampleQueue = [];
     this.pendingFeatures = [];
@@ -145,6 +150,7 @@ export class VadController {
     this.vadActive = false;
     this.lastProbability = null;
     this.lastGradientCut = null;
+    this.lastCutReason = null;
     this.gradientCuts = 0;
     this.lastInferenceMs = null;
     this.lastError = null;
@@ -195,12 +201,19 @@ export class VadController {
   /**
    * 启动即声明，不等第一次调用。
    *
-   * 产品形态是「KWS 前待机不卸载，KWS 通过后立刻工作」（docs/053）。若声明发生在第一次
-   * `stream()` 里，那么第一次唤醒要现场付载入——恰好把代价放在唯一在意延迟的那条路径上。
+   * 产品形态是「待机常驻，RMS 通过后立刻工作」（docs/053）。若声明发生在第一次
+   * `stream()` 里，那么第一次进入处理要现场付载入——恰好把代价放在唯一在意延迟的那条路径上。
    */
   async ensureResident() {
     this.ensureModelFiles();
     await this.graph.declare();
+    return this.graph.snapshot();
+  }
+
+  /** 只同步 App 已存在的声明；不在重启/对账路径上发起任何图操作。 */
+  reconcileResident(declared) {
+    this.graph.reconcileDeclared(declared);
+    if (declared !== true) this.sessionReady = false;
     return this.graph.snapshot();
   }
 
@@ -224,11 +237,10 @@ export class VadController {
   /**
    * Gate 转换只影响 VAD 的**运行**，不再影响 Pool 的**滚动**。
    *
-   * 旧行为是「RMS OPEN 后才开始写 Pool」，而 `avg_1s` 的固有滞后让 OPEN 比说话起点晚
-   * 300–400 ms——于是 VAD 拿到的 timeline 开头本来就缺了唤醒词的前 300–400 ms。
+   * 旧行为是「RMS OPEN 后才开始写 Pool」，而 RMS decision window 的固有滞后会让 OPEN
+   * 比说话起点晚——于是 VAD 拿到的 timeline 开头本来就缺了语音起点。
    * 现在 Pool 是一条恒定滚动的 6 秒环形缓冲（约 192 KB），代价可忽略，而
-   * pre-roll 永远完整；这同时也是「KWS HIT 作为第二把钥匙」能成立的前提——
-   * 那条路径开门时 Pool 里必须已经有音频。
+   * pre-roll 永远完整；显式进入处理时 Pool 里必须已经有音频。
    */
   observeGate(gate, nowMs = Date.now()) {
     const open = gate?.state === 'open' && gate?.pcm_admission === 'allow';
@@ -288,7 +300,7 @@ export class VadController {
     // Pool 恒滚，所以这里只可能因为「刚开机还没收到帧」而为空。
     const preRoll = this.eligiblePool();
     if (preRoll.length === 0) {
-      this.lastError = 'KWS hit arrived before any PCM frame was buffered';
+      this.lastError = 'listen request arrived before any PCM frame was buffered';
       this.onChange();
       return this.snapshot(nowMs);
     }
@@ -318,11 +330,12 @@ export class VadController {
     this.vadActive = false;
     this.lastProbability = null;
     this.lastGradientCut = null;
+    this.lastCutReason = null;
     this.gradientCuts = 0;
     this.lastError = null;
     this.appendFeatureSamples(this.timeline);
     this.extractReadyFeatures();
-    this.emitActivity(false, nowMs, 'kws_handoff');
+    this.emitActivity(false, nowMs, 'vad_armed');
     this.scheduleInference();
     this.onChange();
     return this.snapshot(nowMs);
@@ -343,7 +356,7 @@ export class VadController {
   resetRun(reason = 'reset') {
     const wasActive = this.active || this.vadActive;
     // Pool 不清（它是恒滚的），改为抬高地板：上一轮的尾音不再进入下一轮 timeline。
-    // 清空 Pool 会把「刚刚说出的唤醒词」一起丢掉，正是我们要修的那个病。
+    // 清空 Pool 会把「刚刚说出的语音起点」一起丢掉，正是我们要修的那个病。
     if (wasActive) this.poolFloorMs = Date.now();
     this.active = false;
     this.runId = null;
@@ -362,6 +375,7 @@ export class VadController {
     this.resetNext = true;
     this.post.reset();
     this.speechStartFrame = null;
+    this.lastCutReason = null;
     this.vadActive = false;
     clearTimeout(this.retryTimer);
     this.retryTimer = null;
@@ -379,6 +393,8 @@ export class VadController {
   }
 
   ensureModelFiles() {
+    if (!this.modelPath) throw new Error('FireRedVAD logical executable is unavailable');
+    if (!this.cmvnPath) throw new Error('FireRedVAD logical companion cmvn is unavailable');
     if (!fs.existsSync(this.modelPath)) {
       throw new Error(`FireRedVAD model missing: ${this.modelPath}`);
     }
@@ -462,10 +478,17 @@ export class VadController {
 
   handleProbability(probability) {
     this.lastProbability = probability;
+    // 帧序号即音频时间（10 ms/帧）；shadow 靠它把 VAD 对齐到 PCM 的单调时钟。
+    this.probabilityFrames = (this.probabilityFrames ?? 0) + 1;
+    if (this.onProbability) {
+      try { this.onProbability(probability, this.probabilityFrames - 1); }
+      catch { /* ⛔ 观测不许影响判决 */ }
+    }
     const transition = this.post.process(probability);
     if (transition.start_frame != null && this.speechStartFrame === null) {
       this.speechStartFrame = transition.start_frame;
       this.vadActive = true;
+      this.lastCutReason = 'speech_start';
       this.emitActivity(true, Date.now(), 'speech_start');
     }
     // 梯度切点：说话还在继续，只是窗内出现了值得下刀的停顿谷。发布 [start, cut]，
@@ -478,8 +501,11 @@ export class VadController {
         this.speechStartFrame = transition.cut_frame + 1;
         if (!segment.dropped) {
           this.lastGradientCut = { ...transition.cut, segment_id: segment.segment_id };
+          this.lastCutReason = 'gradient_valley';
           this.gradientCuts += 1;
           this.emitActivity(true, Date.now(), 'gradient_cut', segment.segment_id);
+        } else {
+          this.lastCutReason = `dropped:${segment.reason}`;
         }
       }
     }
@@ -488,6 +514,7 @@ export class VadController {
       this.speechStartFrame = null;
       this.vadActive = false;
       const segment = this.publishSegment(startFrame, transition.end_frame);
+      this.lastCutReason = segment ? 'speech_end' : 'speech_end_short';
       this.emitActivity(false, Date.now(), 'speech_end', segment?.segment_id ?? null);
       void segment;
     }
@@ -600,9 +627,10 @@ export class VadController {
    * 「不知道」就静默吃掉使用者真的说过的话。
    */
   evaluateDrop(startMonoMs, endMonoMs) {
-    if (startMonoMs === null || endMonoMs === null) return null;
-    const broke = this.captureBreaks.find((at) => at >= startMonoMs && at <= endMonoMs);
-    if (broke !== undefined) return { reason: 'capture_interrupted', at_mono_ms: broke };
+    if (startMonoMs !== null && endMonoMs !== null) {
+      const broke = this.captureBreaks.find((at) => at >= startMonoMs && at <= endMonoMs);
+      if (broke !== undefined) return { reason: 'capture_interrupted', at_mono_ms: broke };
+    }
     let verdict = null;
     try {
       verdict = this.dropPolicy({
@@ -691,7 +719,6 @@ export class VadController {
       pcm_pool: {
         owner: 'termux-speech-vad',
         purpose: 'vad_preroll',
-        used_by_kws: false,
         scope: 'package-memory',
         transport: 'authenticated_app_loopback_ws',
         connected: this.transport?.connected === true,
@@ -704,6 +731,8 @@ export class VadController {
           this.eligiblePool().reduce((sum, item) => sum + item.pcm.length, 0) / BYTES_PER_MS,
         ),
         configured_ms: this.config.pcm_pool_ms,
+        pcm_pool_ms: this.config.pcm_pool_ms,
+        pcm_pool_max_ms: 6000,
         max_ms: 6000,
         duration_ms: Math.min(this.config.pcm_pool_ms, poolDurationMs),
         retained_bytes: this.poolBytes,
@@ -723,17 +752,32 @@ export class VadController {
         active: this.vadActive,
         probability: this.lastProbability,
         processed_frames: this.post.frameCount,
+        segment_ms: this.active && this.timeline ? Math.round(this.timeline.length / BYTES_PER_MS) : 0,
+        active_speech_ms: this.speechStartFrame === null
+          ? 0 : Math.max(0, (this.post.frameCount - this.speechStartFrame) * 10),
       },
       // 梯度式切句：段越长对停顿谷的质量要求越低，回选窗内最优谷下刀。
       gradient: {
         enabled: this.post.options.gradient !== false,
         cuts: this.gradientCuts,
+        cut_count: this.gradientCuts,
         last: cloneJson(this.lastGradientCut),
+        last_cut_reason: this.lastCutReason,
+        stage: this.post.state,
         need_curve_ms: [
           this.post.options.startFrames * 10,
           this.post.options.pressureFrames * 10,
           this.post.options.limitFrames * 10,
         ],
+      },
+      inference: {
+        state: this.inferenceInFlight ? 'running'
+          : this.lastError ? 'error'
+            : this.active ? 'idle' : 'stopped',
+        active: this.inferenceInFlight,
+        session_ready: this.sessionReady,
+        pending_feature_frames: this.pendingFeatures.length,
+        last_inference_ms: this.lastInferenceMs,
       },
       countdown: {
         owner: 'speech.vad',
@@ -759,6 +803,7 @@ export class VadController {
         total: this.drops.total,
         tts_overlap: this.drops.tts_overlap,
         capture_interrupted: this.drops.capture_interrupted,
+        camplus_gate: this.drops.camplus_gate,
         last: cloneJson(this.drops.last),
         capture_breaks: this.captureBreaks.length,
       },

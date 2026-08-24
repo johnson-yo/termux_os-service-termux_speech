@@ -11,7 +11,6 @@ import {
   DICTATION,
   LifecycleController,
   MIC_REQUESTER,
-  WAKE,
 } from '../service/lifecycle/controller.mjs';
 import { AppEventsClient, CaptureWatchdog } from '../service/capture/app-events.mjs';
 import { TtsIntervals } from '../service/capture/tts-intervals.mjs';
@@ -76,10 +75,6 @@ const makeHarness = ({
         return { ok: true };
       },
     },
-    wake: {
-      load: async () => record('wake:load'),
-      unload: async () => record('wake:unload'),
-    },
     dictation: {
       loadVad: async () => record('vad:load'),
       loadAsr: async () => {
@@ -101,20 +96,19 @@ const makeHarness = ({
   const first = calls.length;
   const again = await controller.startChain('test');
   test(
-    'B1 Chain Start 幂等：第二次不重复请求 Mic、不重复载唤醒组',
+    'B1 Chain Start 幂等：第二次不重复请求 Mic、不重复载入资源',
     again.ok && again.reason === 'already_started' && calls.length === first,
   );
   test(
-    'B1b Chain Start 预载听写组：唤醒组存在的意义就是「需要时立刻叫醒它」',
-    calls.includes('wake:load')
-      && calls.includes('vad:load')
+    'B1b Chain Start 预载听写组：VAD 与 ASR 一起进入就绪',
+    calls.includes('vad:load')
       && calls.includes('asr:load')
       && controller.dictationState === DICTATION.READY,
   );
 }
 
 {
-  const { controller, calls } = makeHarness({ residency: 'chain' });
+  const { controller, calls } = makeHarness({ residency: 'warm' });
   await controller.startChain();
   await controller.stopChain({ reason: 'test' });
   const afterFirst = [...calls];
@@ -130,9 +124,9 @@ const makeHarness = ({
       && controller.micHeld === false,
   );
   test(
-    'B4 Chain Stop 释放唤醒组订阅并卸载 VAD/ASR 常驻',
-    calls.includes('wake:unload')
-      && controller.wakeState === WAKE.UNLOADED
+    'B4 Chain Stop 在 warm 策略下卸载 VAD/ASR 常驻',
+    calls.includes('vad:unload')
+      && calls.includes('asr:unload')
       && controller.dictationState === DICTATION.UNLOADED,
   );
 }
@@ -184,8 +178,8 @@ const makeHarness = ({
       && controller.warmRemainingMs() === 300_000,
   );
   test(
-    'B10b 保温期间不得自动恢复 RMS+KWS',
-    controller.chain === CHAIN.STOPPED && !calls.includes('wake:load'),
+    'B10b 保温期间不得自动恢复资源',
+    controller.chain === CHAIN.STOPPED && calls.filter((item) => item === 'vad:load').length === 1,
   );
 }
 
@@ -225,7 +219,7 @@ const makeHarness = ({
   const before = micReleases();
   await controller.release('webui');
   test(
-    'B13 Chain Started 基线下 release 保留 Mic，回到 RMS+KWS',
+    'B13 Chain Started 基线下 release 保留 Mic，回到待机',
     micReleases() === before
       && controller.micHeld === true
       && controller.chain === CHAIN.STARTED
@@ -240,7 +234,7 @@ const makeHarness = ({
   await controller.release('webui');
   await clock.advance(5001);
   test(
-    'B12b Chain Started 下保温到期**不卸载**——唤醒组还在守着，随时会叫醒它；'
+    'B12b Chain Started 下保温到期**不卸载**——服务仍保留资源；'
     + '而且反复 load/unload 会把 ORT 分配器高水位推上去，为省内存而周期性卸载净效果是费内存',
     !calls.includes('vad:unload')
       && controller.dictationState === DICTATION.READY
@@ -383,11 +377,10 @@ const makeHarness = ({
   await controller.startChain();
   const stopped = await controller.stopChain({ reason: 'user' });
   test(
-    'B21 默认 residency=service：停链释放麦克风与唤醒检测，但**三张图继续挂着**——'
+    'B21 默认 residency=service：停链释放麦克风，但**两张图继续挂着**——'
     + '闲置常驻几乎不要钱（换进 ZRAM），而反复 load/unload 会把分配器高水位推上去',
     stopped.ok
       && calls.includes(`mic:${MIC_REQUESTER}:false`)
-      && calls.includes('wake:unload')
       && !calls.includes('vad:unload')
       && !calls.includes('asr:unload')
       && controller.dictationLoaded()

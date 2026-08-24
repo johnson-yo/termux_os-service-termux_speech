@@ -352,7 +352,6 @@ const makeStore = async (name, options = {}) => {
     inference_ms: 200,
     utterance_id: 'utt_a',
     language: 'auto',
-    keyword_matched: null,
     observed_ms: 1_785_000_000_000,
   });
 
@@ -460,6 +459,34 @@ const makeStore = async (name, options = {}) => {
       && groups.find(first.segment_id)?.text === '第一组里的一句',
   );
   test('G4 找不存在的 id 明确返回 null', groups.find('no-such-segment') === null && groups.find('') === null);
+  archive.close();
+}
+
+/* ── 「最新一句」必须带得动原音频时长 ──────────────────────────────────── */
+{
+  const storeRoot = path.join(root, 'lastsentence');
+  const wavDir = path.join(root, 'lastsentence-wav');
+  const archive = new RecordArchive({ file: path.join(storeRoot, 'archive.sqlite3') });
+  const groups = new RecordGroups({ root: storeRoot, archive });
+  const segment = makeSegment(wavDir);
+  groups.admit(segment, { status: 'succeeded', text: '一句话', inference_ms: 42,
+    backend: 'sensevoice' });
+  const last = groups.lastSentence;
+  /**
+   * ⭐ 概览那行「原音频 => 推理 | 倍速」的分子就是它。
+   * ⚠ 这个投影此前**只带 `inference_ms`**，于是那一行永远算不出来，退化成一个
+   *   孤零零的毫秒数——而**少一个字段不会报错**：`undefined` 与「这条记录没有音频」
+   *   在下游长得一模一样（docs/056 的同一形状）。
+   */
+  test('H1 ⭐ lastSentence 带得动原音频时长', last?.duration_ms === segment.duration_ms);
+  test('H2 也带得动 segment_id（下游要用它对齐 WAV）', last?.segment_id === segment.segment_id);
+  test('H3 推理耗时照旧', last?.inference_ms === 42);
+  // 重启后从盘上补回来的那一份，形状必须一样——⛔ 不许只有活着的时候才完整。
+  const groups2 = new RecordGroups({ root: storeRoot, archive });
+  groups2.hydrateLastSentence();
+  test('H4 重启补回来的「最新一句」形状相同',
+    groups2.lastSentence?.duration_ms === segment.duration_ms
+      && groups2.lastSentence?.segment_id === segment.segment_id);
   archive.close();
 }
 

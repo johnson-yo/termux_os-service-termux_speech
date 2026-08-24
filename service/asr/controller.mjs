@@ -2,9 +2,9 @@
  * SPDX-License-Identifier: Apache-2.0
  * [INPUT]: Staged VAD WAVs, ASR config, Pipeline lease snapshots, the App graph HTP API,
  *          and `../storage/text.mjs` for the one blank judgement.
- * [OUTPUT]: SenseVoice transcripts, record-group admission (`onResult`), an incremental feed,
- *           bounded blank-discard diagnostics, and ASR-owned keyword/timeout idle requests.
- * [POS]: WAV-only SenseVoice stage; it never reads PCM/Pool or controls VAD segmentation.
+ * [OUTPUT]: Multi-backend transcripts, record-group admission (`onResult`), an incremental feed,
+ *           bounded blank-discard diagnostics, and the standby hand-back when idle.
+ * [POS]: WAV-only backend stage; it never reads PCM/Pool or controls VAD segmentation.
  *        ⭐ It is also the **admission point**: a segment becomes a record only once this stage has a
  *        verdict, so a blank result is discarded with its staging WAV instead of being rolled back
  *        out of a group it should never have entered.
@@ -32,24 +32,10 @@ import { BlankStats, normalizeTranscript } from '../storage/text.mjs';
  * `residents` 收 `model_path` 與 `ctx_path`，那個阻塞就沒有了——現在兩邊都是
  * speech **顯式發給 App**，App 不猜位置。
  *
- * ⚠ **按檔位解析**：選了哪一檔才問哪一檔。全部先解析一遍會讓沒裝 Qwen 的裝置
  * 在使用 SenseVoice 時因為缺一個它根本用不到的資產而起不來。
  */
-const QWEN_ASSETS = Object.freeze({
-  encoder: 'model.qwen3asr.encoder',
-  'qwen3-q4': 'model.qwen3asr.decoder.q4',
-  'qwen3-q8': 'model.qwen3asr.decoder.q8',
-});
-const QWEN_FILES = Object.freeze({
-  mel: 'qwen3asr_mel.onnx',
-  encoder: 'qwen3asr_enc_tanh_fp16.onnx',
-  'qwen3-q4': 'qwen3asr-q4out.gguf',
-  'qwen3-q8': 'Qwen3-ASR-0.6B-Q8_0.gguf',
-});
 // 首次调用要在设备上编译 mel/编码器两张图的 EPContext（分钟级，只发生一次，之后落 caches/）；
 // 稳态 14 秒音频约 2.9 秒。给足余量，让「首次很慢」不至于表现为「坏掉」。
-const QWEN_SESSION_TIMEOUT_MS = 180_000;
-const QWEN_TRANSCRIBE_TIMEOUT_MS = 300_000;
 
 /** 只取 WAV 的 data chunk（s16le 裸流），供 /api/asr 的 pcm_b64 入口 */
 const readWavPcmBytes = (file) => {
@@ -122,11 +108,6 @@ const presence = (files, nowMs = Date.now()) => {
   return value;
 };
 
-const normalizedKeyword = (value) => String(value ?? '')
-  .normalize('NFKC')
-  .toLocaleLowerCase()
-  .replace(/\s+/g, '');
-
 export class AsrController {
   constructor({
     android,
@@ -140,8 +121,11 @@ export class AsrController {
      * `require(ctxUsable || 源圖存在)`，有 ctx 時源圖一次都不會被打開。
      */
     frontendRoot,
-    graphRoot = null,
-    ctxRoot = null,
+    /** ⭐ 模型管理器给出的当前可执行体（绝对路径）。⛔ 不再收 graphRoot / ctxRoot。 */
+    executablePath = null,
+    executableKind = null,
+    /** 伴随文件的 role → 绝对路径映射（`cmvn` / `tokens`）。 */
+    frontendFiles = null,
     /** 本機的 htp/qnn。⚠ 曾經寫死成 v73/2.47，在 S25 上會如實地報一個錯的值。 */
     target = null,
     residentId = DEFAULT_RESIDENT_ID,
@@ -156,15 +140,19 @@ export class AsrController {
      * 参见 [discardBlank]。
      */
     onResult = () => {},
+    /** 读取当前 backend 代次；每个 job 开始时冻结，防止切换后迟到结果串线。 */
+    getBackendGeneration = () => null,
     /**
      * Asset map 的解析器。注入而非 import：本檔不該知道 Framework 在哪、憑證是什麼，
      * 那是 `service/assets.mjs` 的事。單測也因此不需要一個 Framework 就能驅動它。
      */
     resolveAsset = async (id) => { throw new Error(`no asset resolver injected for ${id}`); },
+    /** logical model 的解析器（注入而非 import：本档不该知道 Manager 在哪）。 */
+    resolveLogical = null,
   }) {
     this.android = android;
     this.resolveAsset = resolveAsset;
-    this.qwenPathCache = null;
+    this.resolveLogical = resolveLogical;
     this.dataRoot = dataRoot;
     /**
      * ⛔ 旧的 `transcripts/transcripts.v1.jsonl` 与它的 256 条内存水库都已删除
@@ -183,16 +171,29 @@ export class AsrController {
      * 先前这里直接抛：干净设备上服务因此起不来，而使用者失去的恰好是那个能让他
      * 去取模型的界面。缺模型时照常构造，`ready` 为 false，转写请求明确拒绝并说明原因。
      */
-    this.modelReady = Boolean(frontendRoot && (ctxRoot || graphRoot));
+    /**
+     * ⭐ **docs/093：只认一个「可执行体」，⛔ 不再分 ctx 与 graph。**
+     *
+     * `executablePath` 由模型管理器给出——它已经是**当前这台机器上能跑的那一份**，
+     * 是预制还是本机编的都一样。⛔ 本类不再拼 `model.onnx`、不再判断优先级、
+     * 也不再知道 v73 / QNN 是什么。
+     * ⚠ 伴随文件按 **role** 取（`cmvn` / `tokens`），⛔ 不拼 `am.mvn` / `tokens.json`：
+     *   文件名是 asset 的性质，写死它在换一份 asset 时不会报错，只会打开错的文件。
+     */
+    this.executablePath = executablePath ?? null;
+    this.executableKind = executableKind ?? null;
     this.frontendRoot = frontendRoot;
-    this.graphRoot = graphRoot;
-    // EPContext wrapper 的檔名由 Asset Package 的 `files.graph` 決定；
-    // ⚠ wrapper 內部以 `./model.bin` 引用 context binary，兩者必須同目錄同名。
-    this.ctxPath = ctxRoot ? path.join(ctxRoot, 'model.onnx') : null;
+    this.cmvnPath = frontendFiles?.cmvn ?? null;
+    this.tokensPath = frontendFiles?.tokens ?? null;
     this.target = target;
-    this.modelPath = graphRoot ? path.join(graphRoot, 'model.onnx') : null;
-    this.cmvnPath = frontendRoot ? path.join(frontendRoot, 'am.mvn') : null;
-    this.tokensPath = frontendRoot ? path.join(frontendRoot, 'tokens.json') : null;
+    this.modelReady = Boolean(this.executablePath && this.cmvnPath && this.tokensPath);
+    /**
+     * ⚠ 兼容：`ctxPath` / `modelPath` 这两个名字仍被下面的 `ResidentGraph` 使用。
+     * ⭐ 现在它们指向**同一个** executable —— 因为对 App 来说「用哪一份」这件事
+     *   已经在上游决定完了。`ctx_path` 走的是 App 那条「外来 artifact 不许删」的路径。
+     */
+    this.ctxPath = this.executablePath;
+    this.modelPath = null;
     this.graph = new ResidentGraph({
       android,
       id: residentId,
@@ -209,12 +210,15 @@ export class AsrController {
     this.onEnd = onEnd;
     this.onChange = onChange;
     this.onResult = onResult;
+    this.getBackendGeneration = getBackendGeneration;
     this.authority = false;
     this.epoch = 0;
     this.activatedAtMs = null;
     this.lastActivityAtMs = null;
     this.lastEnd = null;
     this.lastError = null;
+    /** 错误必须归属到当前唯一的 SenseVoice backend。 */
+    this.lastErrorBackend = null;
     this.lastInferenceMs = null;
     this.lastTranscript = null;
     this.outputName = null;
@@ -222,6 +226,21 @@ export class AsrController {
     this.cmvn = null;
     this.pending = [];
     this.inFlight = null;
+    /**
+     * segment_id → 已知的最高 revision。⭐ 判「陈旧」的唯一依据。
+     * ⚠ 有界：与 completedSegments 一起裁剪，否则一次长会话会让它无限增长。
+     */
+    this.latestRevision = new Map();
+    this.supersededCount = 0;
+    this.staleDropped = 0;
+    /**
+     * 发布链路的有界诊断。`lastTranscript` 只证明 App 回了文字；任务要求还要能
+     * 证明它有没有穿过 `onResult` 进入 public/records。旧版把 callback 异常静默吞掉，
+     * 真机上因此只能看到「转写成功」与「记录没增加」两个互相矛盾的事实。
+     */
+    this.resultCallbackCalls = 0;
+    this.resultCallbackErrors = 0;
+    this.lastResultCallback = null;
     this.retryTimer = null;
     /** 去重用的段 id。⚠ 必须有界：它曾经随历史一起无限增长。 */
     this.completedSegments = [];
@@ -247,9 +266,6 @@ export class AsrController {
       model: this.config.model,
       language: this.config.language,
       text_normalization: this.config.text_normalization !== false,
-      keyword_end_enabled: this.config.keyword_end_enabled !== false,
-      end_keywords: [...(this.config.end_keywords ?? [])],
-      timeout_end_enabled: this.config.timeout_end_enabled !== false,
       idle_timeout_ms: this.config.idle_timeout_ms,
     };
   }
@@ -260,7 +276,7 @@ export class AsrController {
       if (saved?.schema === 'termux-os.speech-asr-pending.v1' && Array.isArray(saved.jobs)) {
         this.pending = saved.jobs.filter((job) => (
           job?.segment?.segment_id
-          && !this.completedSegments.has(job.segment.segment_id)
+          && !this.completedSegments.includes(job.segment.segment_id)
         ));
       }
     } catch { /* No pending work is normal on first start. */ }
@@ -307,11 +323,41 @@ export class AsrController {
     const segmentId = String(segment?.segment_id ?? '');
     if (!segmentId) throw new Error('ASR requires a VAD segment_id');
     if (!fs.existsSync(segment.wav_path)) throw new Error(`ASR WAV missing: ${segment.wav_path}`);
-    if (this.completedSegments.includes(segmentId)
-      || this.pending.some((job) => job.segment.segment_id === segmentId)
-      || this.inFlight?.segment?.segment_id === segmentId) {
-      return { accepted: false, reason: 'duplicate_segment', segment_id: segmentId };
+    /**
+     * ⭐ 一段话的身份是 `segment_id`，一次投递的身份是 `(segment_id, revision)`。
+     *
+     * 把两者混成一个，同一句话的 `complete` 就会被它自己的 `incomplete` 判成重复而丢掉。
+     * ⚠ 缺省 revision = 1：旧调用方（FireRedVAD 手动链、重转写）一个字都不用改，
+     *   它们本来就只投一次。
+     */
+    const revision = Math.max(1, Number(segment?.revision) || 1);
+    const status = segment?.status === 'incomplete' ? 'incomplete' : 'complete';
+    const key = `${segmentId}#${revision}`;
+    if ((!retranscribe && this.completedSegments.includes(key))
+      || this.pending.some((job) => job.key === key)
+      || this.inFlight?.key === key) {
+      return { accepted: false, reason: 'duplicate_segment', segment_id: segmentId, revision };
     }
+    /**
+     * ⭐ 更新的修订**取消**还没开工的旧修订。
+     * 让一段已经被更好的版本取代的音频排在前面推理，是把最稀缺的资源花在必然被丢弃的结果上。
+     */
+    /**
+     * `pump()` 保持 in-flight job 在 pending[0]，直到 finally 才 shift。
+     * 因此它虽然「正在跑」，仍会出现在 `this.pending` 里；把它从这里过滤掉会
+     * 让 r1 结束时的 `pending.shift()` 误删掉真正要跑的 r2——这正是真机上
+     * 「有文字、但 final 没进 public/records」的竞态。飞行中的旧 revision
+     * 不可撤销，只能让它按 stale 规则完成；这里只取消尚未开工的旧 revision。
+     */
+    const inFlightKey = this.inFlight?.key ?? null;
+    const superseded = this.pending.filter(
+      (job) => job.key !== inFlightKey
+        && job.segment.segment_id === segmentId && job.revision < revision);
+    if (superseded.length) {
+      this.pending = this.pending.filter((job) => !superseded.includes(job));
+      this.supersededCount = (this.supersededCount ?? 0) + superseded.length;
+    }
+    this.latestRevision.set(segmentId, Math.max(this.latestRevision.get(segmentId) ?? 0, revision));
     const nowMs = Date.now();
     const job = {
       schema: 'termux-os.speech-asr-job.v1',
@@ -319,6 +365,9 @@ export class AsrController {
       epoch: Math.max(0, Number(epoch) || 0),
       segment: cloneJson(segment),
       retranscribe: retranscribe === true,
+      revision,
+      status,
+      key,
       attempts: 0,
       enqueued_at_ms: nowMs,
     };
@@ -327,7 +376,7 @@ export class AsrController {
     if (this.authority && job.epoch === this.epoch) this.lastActivityAtMs = nowMs;
     this.onChange();
     setImmediate(() => void this.pump());
-    return { accepted: true, job_id: job.job_id, segment_id: segmentId };
+    return { accepted: true, job_id: job.job_id, segment_id: segmentId, revision, status };
   }
 
   /** VAD 回收 WAV 前问这里：这个段我还要用吗（排队中或正在推理）。 */
@@ -337,10 +386,20 @@ export class AsrController {
       || this.pending.some((job) => job.segment?.segment_id === segmentId);
   }
 
+  /**
+   * 这个结果还算数吗。⭐ 判据是「同一句话有没有更新的修订」，
+   * ⛔ 不是时间、不是顺序——单槽串行下 r1 的结果完全可能在 r2 入队之后才回来。
+   */
+  isStale(job) {
+    const latest = this.latestRevision.get(job?.segment?.segment_id);
+    return latest !== undefined && (job?.revision ?? 1) < latest;
+  }
+
   /** 本機實際會用到的檔案。⚠ 有 ctx 時源圖不在清單裡——要求一個永遠不會被打開的檔案存在，
    *  等於把那 937 MB 變成事實上的必需品，ctx 就白裝了。 */
   senseFiles() {
-    return [this.cmvnPath, this.tokensPath, ...(this.ctxPath ? [this.ctxPath] : [this.modelPath])];
+    return [this.cmvnPath, this.tokensPath, ...(this.ctxPath ? [this.ctxPath] : [this.modelPath])]
+      .filter(Boolean);
   }
 
   ensureFiles() {
@@ -396,6 +455,12 @@ export class AsrController {
     await this.graph.declare({ force: true });
   }
 
+  /** 只同步 App 已存在的声明；不在重启/对账路径上发起任何图操作。 */
+  reconcileResident(declared) {
+    this.graph.reconcileDeclared(declared);
+    return this.graph.snapshot();
+  }
+
   /**
    * 卸载常驻。⛔ **只有两个调用方**：使用者明确停链，和听写保温到期（docs/061 §一）。
    * 服务重启、dev reload、错误恢复、Mic 被抢占一律不许走到这里——那是 churn，不是卸载。
@@ -405,56 +470,20 @@ export class AsrController {
     this.onChange();
     return this.graph.snapshot();
   }
-
-  /**
-   * Qwen3-ASR 分支：走 App 的 /api/asr 端到端（mel/編碼器在 HTP，解碼在 ggml-hexagon）。
-   * ⚠ 音頻走 `pcm_b64` 而非 `wav_path`——WAV 落在本包的私域，App 是另一個 uid **讀不到**。
-   * 15 秒 @16k s16le 約 480KB，base64 後 640KB，走 loopback HTTP 沒問題（不是 Binder）。
-   */
-  async transcribeQwen(segment, variant) {
-    const paths = await this.qwenPaths(variant);
-    const gguf = paths.decoder;
-    if (this.qwenLoaded !== gguf) {
-      await this.android.json('/api/asr/session', {
-        method: 'POST',
-        body: { model_path: gguf },
-        // ⚠ app-api 默认 8 秒，而这两步都会超。GGUF 热载入实测约 1.5 秒，
-        // 但 worker 刚重生时要连权重一起读；编码器/mel 的 EPContext 首次编译更是分钟级。
-        // 默认超时会把「慢」误报成「坏」，而重试只会让它从头再慢一次。
-        timeoutMs: QWEN_SESSION_TIMEOUT_MS,
-      });
-      this.qwenLoaded = gguf;
+  /** 处理门切换前的正式准备动作。当前唯一 backend 是 SenseVoice。 */
+  async prepareBackend(variant = this.config.model ?? 'sensevoice') {
+    if (variant === 'sensevoice') {
+      if (!this.modelReady) return { backend: variant, ready: false };
+      await this.ensureResident();
+      return { backend: variant, ready: true };
     }
-    const pcm = readWavPcmBytes(segment.wav_path);
-    const started = Date.now();
-    let data;
-    try {
-      data = await this.android.json('/api/asr/transcribe', {
-        method: 'POST',
-        body: {
-          pcm_b64: pcm.toString('base64'),
-          mel_path: paths.mel,
-          encoder_path: paths.encoder,
-        },
-        timeoutMs: QWEN_TRANSCRIBE_TIMEOUT_MS,
-      });
-    } catch (error) {
-      // 會話可能被 LMK 帶走；下次重新載入而不是把這個檔位永久記成已載入
-      this.qwenLoaded = null;
-      throw error;
-    }
-    return {
-      text: String(data?.text ?? '').trim(),
-      tokens: [],
-      valid_frames: Number(data?.n_audio_tokens) || 0,
-      inference_ms: Math.max(0, Date.now() - started),
-      profile: cloneJson(data?.timings_ms),
-    };
+    throw new Error(`ASR engine "${variant}" is not served by this pipeline`);
   }
 
-  async transcribe(segment) {
-    const variant = this.config.model ?? 'sensevoice';
-    if (variant !== 'sensevoice') return this.transcribeQwen(segment, variant);
+  async transcribe(segment, variant = this.config.model ?? 'sensevoice') {
+    if (variant !== 'sensevoice') {
+      throw new Error(`ASR engine "${variant}" is not served by this pipeline`);
+    }
     // ⛔ 缺模型时明确拒绝并说清楚该做什么。不重试——重试解决不了「东西不在盘上」。
     if (!this.modelReady) {
       throw new Error('SenseVoice has no model on this device yet. '
@@ -499,36 +528,6 @@ export class AsrController {
     };
   }
 
-  /**
-   * 解析選中檔位需要的三個路徑。⚠ **只問這一檔**：全部先解析一遍會讓沒裝 Qwen 的
-   * 裝置在使用 SenseVoice 時，因為缺一個它根本用不到的資產而起不來。
-   *
-   * ⛔ 沒有回落。缺了就是缺了，錯誤原樣上拋——一個「找不到就用舊路徑」的分支會讓
-   * 「這台機器到底裝了什麼」變成一個沒人答得出的問題。
-   */
-  async qwenPaths(variant) {
-    if (this.qwenPathCache?.variant === variant) return this.qwenPathCache;
-    const encoder = await this.resolveAsset(QWEN_ASSETS.encoder);
-    const decoder = await this.resolveAsset(QWEN_ASSETS[variant]);
-    const resolved = {
-      variant,
-      mel: path.join(encoder.root, QWEN_FILES.mel),
-      encoder: path.join(encoder.root, QWEN_FILES.encoder),
-      decoder: path.join(decoder.root, QWEN_FILES[variant]),
-    };
-    this.qwenPathCache = resolved;
-    return resolved;
-  }
-
-  matchingEndKeyword(text) {
-    if (this.config.keyword_end_enabled === false) return null;
-    const normalized = normalizedKeyword(text);
-    if (!normalized) return null;
-    return (this.config.end_keywords ?? []).find((keyword) => {
-      const candidate = normalizedKeyword(keyword);
-      return candidate && normalized.includes(candidate);
-    }) ?? null;
-  }
 
   /**
    * ⛔ 空白结果的**唯一**归宿：删掉 staging WAV，记一笔有界诊断，然后什么都不做。
@@ -546,11 +545,14 @@ export class AsrController {
       // ⚠ 删不掉不是错误：VAD 的水库本来就会回收它。这里只是让它立刻消失而不是稍后。
       try { fs.rmSync(wav, { force: true }); } catch { /* 水库兜底。 */ }
     }
-    this.completedSegments.push(job.segment.segment_id);
+    this.completedSegments.push(job.key ?? job.segment.segment_id);
     while (this.completedSegments.length > COMPLETED_CAP) this.completedSegments.shift();
     // 空白也真的推了一次理——耗时如实留着，否则「空转」在耗时上看不出成本。
     this.lastInferenceMs = result?.inference_ms ?? null;
-    this.lastError = null;
+    if (this.lastErrorBackend === (job.ran_backend ?? this.config?.model ?? 'sensevoice')) {
+      this.lastError = null;
+      this.lastErrorBackend = null;
+    }
     // ⚠ 仍要推进活跃时刻：空白也是「ASR 刚刚做完一件事」，不推进会让 idle 倒计时
     // 在一串空白里提前触发，把还在说话的人当成已经说完。
     if (this.authority && job.epoch === this.epoch) this.lastActivityAtMs = Date.now();
@@ -563,7 +565,6 @@ export class AsrController {
     const normalized = normalizeTranscript(result.text);
     if (normalized.isBlank) return this.discardBlank(job, result, normalized.reason);
     result = { ...result, text: normalized.text };
-    const keyword = this.matchingEndKeyword(result.text);
     const record = {
       schema: 'termux-os.speech-transcript.v1',
       seq: ++this.transcriptSeq,
@@ -574,33 +575,21 @@ export class AsrController {
       text: result.text,
       final: true,
       language: this.config.language,
-      // ⚠ 这里曾经无条件写 `id: 'sensevoice'`——即使这句话实际是 Qwen 转的。
-      // 于是历史记录里每一条都自称 SenseVoice，而「换了模型」这件事在事后完全不可见：
-      // 一个字段既然叫「用了哪个模型」，就不能是个常量。
-      model: (this.config.model ?? 'sensevoice') === 'sensevoice'
-        ? {
-          id: 'sensevoice',
-          runtime: 'android-app-ort-qnn-htp',
-          precision: 'qnn-context',
-          htp: 'v73',
-          qnn: '2.47',
-          session: this.graph.id,
-        }
-        : {
-          id: this.config.model,
-          runtime: 'android-app-asr-endpoint',
-          precision: this.config.model === 'qwen3-q4' ? 'q4_0' : 'q8_0',
-        },
+      /** 当前唯一执行体，运行时事实与配置/selector保持同一来源。 */
+      model: {
+        id: 'sensevoice',
+        runtime: 'android-app-ort-qnn-htp',
+        precision: 'qnn-context',
+        htp: this.target?.htp ?? null,
+        qnn: this.target?.qnn ?? null,
+        session: this.graph.id,
+      },
       audio: {
         wav_path: job.segment.wav_path,
         duration_ms: job.segment.duration_ms,
         sample_rate_hz: job.segment.sample_rate_hz,
         channels: job.segment.channels,
         encoding: job.segment.encoding,
-      },
-      end_gate: {
-        keyword_matched: keyword,
-        requested_idle: Boolean(keyword),
       },
       timing: {
         queued_at_ms: job.enqueued_at_ms,
@@ -613,30 +602,82 @@ export class AsrController {
     // ⛔ 这里曾经 `durableAppend` 一条 `transcripts.v1.jsonl` 并推进一个 256 条的内存环。
     // 两者都删了：转写的持久化归记录组（`onResult` → `settle`），一句话只落一处。
     this.lastObservedMs = record.observed_ms;
-    this.completedSegments.push(record.segment_id);
+    this.completedSegments.push(job.key ?? record.segment_id);
     while (this.completedSegments.length > COMPLETED_CAP) this.completedSegments.shift();
     this.lastTranscript = record;
     this.lastInferenceMs = result.inference_ms;
-    this.lastError = null;
+    if (this.lastErrorBackend === (job.ran_backend ?? this.config?.model ?? 'sensevoice')) {
+      this.lastError = null;
+      this.lastErrorBackend = null;
+    }
     if (this.authority && job.epoch === this.epoch) this.lastActivityAtMs = nowMs;
     // ⭐ 记录组的 item 在这里**诞生并直接进入终态**（准入后移，docs/061 §七.2 已改写）。
     // 回调失败不得影响转写本身。
+    /**
+     * ⭐ 陈旧结果：**不发布**。
+     *
+     * r1 还在推理时 r2 就入队了，是这条链的常态（半快门先处理、全快门随后）。
+     * 让 r1 的文字后到并覆盖 r2，会把一句已经定稿的话换回它的中间版本——
+     * 而两者都「成功」，从状态上分辨不出来。
+     * ⚠ 仍然要留痕：静默丢弃会让「这句怎么没出来」永远查不到。
+     */
+    if (this.isStale(job)) {
+      this.staleDropped += 1;
+      this.lastStale = {
+        segment_id: record.segment_id,
+        revision: job.revision ?? 1,
+        superseded_by: this.latestRevision.get(record.segment_id) ?? null,
+        backend: job.ran_backend ?? this.config.model ?? 'sensevoice',
+        backend_generation: job.ran_backend_generation ?? null,
+        at_ms: nowMs,
+      };
+      return { record, stale: true };
+    }
+    this.resultCallbackCalls += 1;
+    this.lastResultCallback = {
+      segment_id: record.segment_id,
+      revision: job.revision ?? 1,
+      status: job.status ?? 'complete',
+      backend: job.ran_backend ?? this.config.model ?? 'sensevoice',
+      backend_generation: job.ran_backend_generation ?? null,
+      at_ms: nowMs,
+      error: null,
+    };
     try {
       this.onResult(job.segment, {
         retranscribe: job.retranscribe === true,
+        /**
+         * ⛔ ASR **不决定** status，它只把上游的判决原样带过去。
+         * `succeeded` 说的是「这次识别成功了」，`segment_status` 说的是
+         * 「这段音频是不是最终版」——两件事，压成一个就再也分不开。
+         */
         status: 'succeeded',
+        segment_status: job.status ?? 'complete',
+        revision: job.revision ?? 1,
         text: record.text,
         model: record.model,
+        /**
+         * 这一句出自当前唯一支持的 backend，跟配置/selector保持同一事实源。
+         */
+        backend: job.ran_backend ?? this.config.model ?? 'sensevoice',
+        backend_generation: job.ran_backend_generation ?? null,
         inference_ms: record.timing?.inference_ms ?? null,
+        audio_duration_ms: record.audio?.duration_ms ?? job.segment?.duration_ms ?? null,
         // ⭐ feed 要靠记录组重建，所以这些字段必须**跟着结果一起**落到 item 里。
         // 少一个就是一个消费者读不到的字段，而它们读不到的时候不会报错，只会安静地少做事。
         utterance_id: record.utterance_id,
         language: record.language,
-        keyword_matched: record.end_gate?.keyword_matched ?? null,
         observed_ms: record.observed_ms,
       });
-    } catch { /* 记录组的问题不能传染回转写。 */ }
-    return { record, keyword };
+    } catch (error) {
+      this.resultCallbackErrors += 1;
+      this.lastResultCallback = {
+        ...this.lastResultCallback,
+        error: String(error?.message ?? error),
+      };
+      console.log(`[termux-speech] result publish callback failed: ${this.lastResultCallback.error}`);
+    }
+    return { record };
   }
 
   failPermanently(job, error) {
@@ -657,7 +698,9 @@ export class AsrController {
         retranscribe: job.retranscribe === true,
         status: 'failed',
         error: record.error,
-        model: { id: this.config.model },
+        model: { id: job.ran_backend ?? this.config.model },
+        backend: job.ran_backend ?? this.config.model ?? 'sensevoice',
+        backend_generation: job.ran_backend_generation ?? null,
       });
     } catch { /* 同上。 */ }
   }
@@ -666,36 +709,32 @@ export class AsrController {
     if (this.inFlight || this.pending.length === 0 || this.config.enabled === false) return;
     const job = this.pending[0];
     job.attempts = Math.max(0, Number(job.attempts) || 0) + 1;
+    /**
+     * ⭐ **这一趟是哪条 backend 跑的，必须在开跑前记下来。**
+     *
+     * ⚠ 以前 `publish()` 用的是 `this.config.model` —— 那是**发布那一刻**的配置。
+     *   转写要几百毫秒到几秒，而使用者可以在中途切 backend：切完之后 config 已经是新的，
+     *   因此结果的 backend 必须在任务开始时冻结，不能由完成时的配置猜。
+     *   ⛔ 「谁产出的」是既成事实，不能由之后的配置回答。
+     * ⚠ 必须写在 `this.inFlight` 快照**之前**，否则快照里那个字段永远是空的。
+     */
+    job.ran_backend = this.config.model ?? 'sensevoice';
+    job.ran_backend_generation = this.getBackendGeneration?.() ?? null;
     this.persistPending();
     this.inFlight = { ...cloneJson(job), started_at_ms: Date.now() };
     this.onChange();
     let retry = false;
     let retryDelayMs = 1000;
     try {
-      const result = await this.transcribe(job.segment);
+      // `ran_backend` is the immutable backend choice for this in-flight attempt;
+      // a UI switch may change config while the WAV is being processed.
+      const result = await this.transcribe(job.segment, job.ran_backend);
       const published = this.publish(job, result);
       this.pending.shift();
       this.persistPending();
-      if (published.keyword && this.authority && job.epoch === this.epoch) {
-        this.lastEnd = {
-          reason: 'asr_end_keyword',
-          keyword: published.keyword,
-          requested_at_ms: Date.now(),
-          epoch: job.epoch,
-        };
-        this.onEnd({
-          owner: 'speech.asr',
-          epoch: job.epoch,
-          reason: this.lastEnd.reason,
-          metadata: {
-            keyword: published.keyword,
-            transcript_seq: published.record.seq,
-            segment_id: published.record.segment_id,
-          },
-        });
-      }
     } catch (error) {
       this.lastError = String(error?.message ?? error);
+      this.lastErrorBackend = job.ran_backend ?? this.config.model ?? 'sensevoice';
       // 「还没好」与「坏了」必须分开计数。App 侧 503 有两个来源——常驻在 worker 重生后
       // 尚未对账完成、以及有界准入拒绝过载（docs/051 §4.3/§5.4）——两者都不是这句话的错。
       // 旧实现把它们计入 3 次即永久失败的 attempts，于是一次 worker 重生就能烧掉一句转写。
@@ -730,14 +769,23 @@ export class AsrController {
     }
   }
 
+  /**
+   * ⭐ **这不是「识别结束门」，是「转写完了就回待命」。**
+   *
+   * ASR 是 spool 的消费者：上游（FireRedVAD / CAM++VAD）切完段、它转完、
+   * 队列空了、一段时间没有新文件——那就没有事情要做了，把门交回去。
+   * ⛔ 它**不判断使用者说完了没有**，那是切段的事；也**不能被关掉**——
+   *   一个可以关掉的「交回」等于让 ASR 永久占着门，而它本来就没有资格占。
+   * ⚠ ASR 不持有会话结束门；它只在转写队列空闲后把关闭权交回上游。
+   */
   pollClose(nowMs = Date.now()) {
-    if (!this.authority || this.config.timeout_end_enabled === false) return null;
+    if (!this.authority) return null;
     const currentBusy = (this.inFlight && this.inFlight.epoch === this.epoch)
       || this.pending.some((job) => job.epoch === this.epoch);
     if (currentBusy || this.lastActivityAtMs === null
       || nowMs - this.lastActivityAtMs < this.config.idle_timeout_ms) return null;
     this.lastEnd = {
-      reason: 'asr_idle_timeout',
+      reason: 'asr_standby',
       requested_at_ms: nowMs,
       epoch: this.epoch,
     };
@@ -753,24 +801,31 @@ export class AsrController {
     const currentBusy = (this.inFlight && this.inFlight.epoch === this.epoch)
       || this.pending.some((job) => job.epoch === this.epoch);
     const deadline = this.authority
-      && this.config.timeout_end_enabled !== false
       && !currentBusy
       && this.lastActivityAtMs !== null
       ? this.lastActivityAtMs + this.config.idle_timeout_ms
       : null;
     const senseVoice = presence(this.senseFiles());
-    const filesPresent = senseVoice.files_present;
-    // ⚠ 上面那个 `files_present` 回答的**永远是 SenseVoice**。选了 Qwen 档位时它照样
-    // 返回 true/false，但答的不是「我选的这个模型在不在」——读得出值，含义却是错的
-    // （docs/056 的同一形状）。所以被选中的那一档单独探，名字里写清楚它是谁。
-    const variant = this.config.model ?? 'sensevoice';
-    // ⚠ Qwen 檔位的檔案位置由 Asset map 給，只有解析過才知道；還沒解析時如實報
-    // 「尚未解析」而不是一個看起來像「缺失」的 false——那兩件事要做的處置完全不同。
-    const selected = variant === 'sensevoice'
-      ? { id: variant, ...senseVoice }
-      : (this.qwenPathCache?.variant === variant
-        ? { id: variant, ...presence([this.qwenPathCache.decoder, this.qwenPathCache.mel, this.qwenPathCache.encoder]) }
-        : { id: variant, files: [], missing: [], files_present: null, reason: 'asset_not_resolved_yet' });
+    /**
+     * ⚠ **「没有文件要检查」⛔ 不等于「文件都在」。**
+     *
+     * 真机上撞到过：模型管理器还没起来时 `executablePath` 是 null ⇒ `senseFiles()` 返回空数组
+     * ⇒ `missing.length === 0` ⇒ `files_present: true` ⇒ 整条链报 **ready，而它一个模型都没有**。
+     * ⭐ 一个空集合让「全部满足」与「什么都没问」变成同一个答案 —— 这两件事必须分开。
+     */
+    const filesPresent = senseVoice.files.length > 0 && senseVoice.files_present;
+    const senseReady = this.modelReady && filesPresent
+      && (this.graph.declared || this.lastErrorBackend !== 'sensevoice');
+    const variant = 'sensevoice';
+    const selected = {
+      id: variant,
+      ...senseVoice,
+      ready: senseReady,
+      reason: senseReady ? null
+        : (!this.modelReady ? 'model_not_enabled'
+          : filesPresent ? 'sensevoice_not_ready' : 'model_missing'),
+    };
+    const selectedReady = selected.ready === true;
     return {
       schema: 'termux-os.speech-asr.v1',
       capability: 'speech.transcript',
@@ -778,7 +833,8 @@ export class AsrController {
         : this.pending.length ? 'queued'
           : this.authority ? 'listening'
             : 'standby',
-      ready: filesPresent && (this.graph.declared || !this.lastError),
+      ready: selectedReady,
+      reason: selectedReady ? null : selected.reason,
       authority: {
         active: this.authority,
         owner: 'speech.asr',
@@ -786,13 +842,15 @@ export class AsrController {
         activated_at_ms: this.activatedAtMs,
       },
       model: {
-        id: 'sensevoice',
-        model: this.config.model ?? 'sensevoice',
+        id: variant,
+        model: variant,
         model_path: this.modelPath,
         ctx_path: this.ctxPath,
         cmvn_path: this.cmvnPath,
         tokens_path: this.tokensPath,
-        files_present: filesPresent,
+        files_present: selected.files_present,
+        ready: selectedReady,
+        reason: selected.reason,
         runtime: 'android-app-ort-qnn-htp',
         precision: 'qnn-context',
         /**
@@ -803,6 +861,7 @@ export class AsrController {
         htp: this.target?.htp ?? null,
         qnn: this.target?.qnn ?? null,
         session: this.graph.id,
+        session_loaded: this.graph.declared,
         residency: this.graph.snapshot(),
         output_name_cached: Boolean(this.config.output_name),
         output_name: this.outputName,
@@ -810,13 +869,13 @@ export class AsrController {
       },
       queue: {
         depth: this.pending.length,
+        /** ⚠ `ran_backend` 让「切换那一瞬正在跑的是谁」可观测，⛔ 不用事后猜。 */
         in_flight: cloneJson(this.inFlight),
+        in_flight_backend: this.inFlight?.ran_backend ?? null,
         pending_file: this.pendingFile,
       },
-      ending: {
-        keyword_enabled: this.config.keyword_end_enabled !== false,
-        end_keywords: [...(this.config.end_keywords ?? [])],
-        timeout_enabled: this.config.timeout_end_enabled !== false,
+      /** ⚠ 名字从 `ending` 改成 `standby`：它说的是「多久没事做就交回门」。 */
+      standby: {
         timeout_ms: this.config.idle_timeout_ms,
         deadline_ms: deadline,
         remaining_ms: deadline === null ? null : Math.max(0, deadline - nowMs),
@@ -839,6 +898,14 @@ export class AsrController {
         http_feed: '/asr/transcripts',
         websocket: '/asr/transcripts/ws',
         store: 'records',
+      },
+      publish: {
+        result_callback_calls: this.resultCallbackCalls,
+        result_callback_errors: this.resultCallbackErrors,
+        stale_dropped: this.staleDropped,
+        superseded: this.supersededCount,
+        last_stale: cloneJson(this.lastStale),
+        last_result_callback: cloneJson(this.lastResultCallback),
       },
       last_inference_ms: this.lastInferenceMs,
       last_error: this.lastError,

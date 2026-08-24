@@ -1,0 +1,38 @@
+/* docs/080 声纹登记页。沿用 lab 的排版语汇，只求好用。 */
+.lab-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin:10px 0 6px; }
+.lab-head h1 { font-size:1.05rem; margin:0; }
+.row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0; }
+label.inline { display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--muted); }
+label.inline input { width:auto; min-width:84px; }
+.clip-list { list-style:none; margin:8px 0 0; padding:0; display:grid; gap:8px; }
+.clip-list li { border:1px solid var(--line); border-radius:10px; padding:9px; background:var(--panel);
+                display:grid; gap:5px; }
+.clip-list h3 { margin:0; font-size:.78rem; font-weight:600; }
+.clip-list audio { height:30px; width:100%; }
+.clip-list button { justify-self:start; }
+.keep { color:#5fd08a; } .drop { color:#e0403f; }
+.enrolled { color:#5aa9e6; } .muted { color:var(--muted); }
+.note.bad { color:#ff9a8a; }
+#tl { width:100%; display:block; border:1px solid var(--line); border-radius:10px; background:#0b0f14; }
+.tl-legend { margin-top:6px; }
+.badge.ok { color:#5fd08a; border-color:#2f6b47; }
+label.inline select { width:auto; min-width:96px; }
+
+/* docs/084 CAM++ Activity Test */
+.cam-live { align-items: baseline; gap: 12px; }
+.cam-state { font-weight: 700; font-size: 1.05rem; letter-spacing: .02em; }
+.cam-sim { font-variant-numeric: tabular-nums; font-size: 1.6rem; font-weight: 700; }
+.cam-history { display: flex; gap: 1px; align-items: flex-end; height: 56px;
+  overflow-x: auto; padding: 2px 0; }
+.cam-history i { display: block; width: 4px; flex: 0 0 4px; border-radius: 1px; }
+
+/* 0.21.4 产品流程：三步一屏，⛔ 校准台默认折叠。 */
+.step { margin: 14px 0 4px; font-size: 15px; color: var(--text); }
+#dev-lab { margin-top: 18px; }
+#dev-lab > summary {
+  cursor: pointer; padding: 10px 12px; border-radius: 10px;
+  background: var(--card); border: 1px solid var(--line); font-weight: 600;
+  min-height: 44px; display: flex; align-items: center;
+}
+#dev-lab[open] > summary { margin-bottom: 10px; }
+#enrollments li .row { gap: 8px; margin-top: 6px; }

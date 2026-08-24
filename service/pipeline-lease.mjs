@@ -1,6 +1,6 @@
 /**
  * SPDX-License-Identifier: Apache-2.0
- * [INPUT]: RMS Gate transitions plus KWS, VAD, ASR, or developer handoff/idle requests.
+ * [INPUT]: RMS Gate transitions plus VAD, ASR, or developer handoff/idle requests.
  * [OUTPUT]: One epoch-scoped downstream owner and an auditable transition history.
  * [POS]: The single source of truth for the “last downstream stage closes” invariant.
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -9,13 +9,11 @@ import crypto from 'node:crypto';
 
 export const PIPELINE_OWNERS = Object.freeze({
   RMS: 'speech.rms',
-  KWS: 'speech.kws',
   VAD: 'speech.vad',
   ASR: 'speech.asr',
 });
 
 const NEXT_OWNER = Object.freeze({
-  [PIPELINE_OWNERS.KWS]: PIPELINE_OWNERS.VAD,
   [PIPELINE_OWNERS.VAD]: PIPELINE_OWNERS.ASR,
 });
 
@@ -64,7 +62,7 @@ export class PipelineLease {
       this.openedAtMs = Number(gate?.opened_at_ms) || nowMs;
       const transition = this.record(
         PIPELINE_OWNERS.RMS,
-        PIPELINE_OWNERS.KWS,
+        PIPELINE_OWNERS.VAD,
         'rms_open',
         PIPELINE_OWNERS.RMS,
         nowMs,

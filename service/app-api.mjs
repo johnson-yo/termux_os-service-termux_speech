@@ -85,6 +85,28 @@ export async function appJson(descriptor, path, {
   return payload.data;
 }
 
+/**
+ * App 二进制/状态码透传的原始响应。
+ *
+ * ⛔ `appJson` 不能拿来读 WAV：它会尝试 `response.json()`，而且会把 206/416/404
+ * 当成异常吃掉。调用方需要自己保留 App 的 Content-Type、Range 状态与字节。
+ */
+export async function appResponse(descriptor, path, {
+  method = 'GET',
+  headers = {},
+  fetchImpl = fetch,
+  timeoutMs = 15_000,
+} = {}) {
+  return fetchImpl(`${descriptor.baseUrl}${path}`, {
+    method,
+    headers: {
+      Authorization: descriptor.authorization,
+      ...headers,
+    },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+}
+
 export function createAndroidAppClient({
   frameworkUrl,
   systemKey,
@@ -120,9 +142,20 @@ export function createAndroidAppClient({
     }
   };
 
+  const raw = async (path, options = {}) => {
+    let response = await appResponse(await descriptor(), path, { ...options, fetchImpl });
+    if (response.status === 401 || response.status === 403) {
+      cached = null;
+      validUntil = 0;
+      response = await appResponse(await descriptor(true), path, { ...options, fetchImpl });
+    }
+    return response;
+  };
+
   return {
     describe: descriptor,
     json,
+    raw,
     invalidate() {
       cached = null;
       validUntil = 0;

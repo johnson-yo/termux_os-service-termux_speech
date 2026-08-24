@@ -4,6 +4,8 @@
  * [OUTPUT]: 带 boot_id/version 的完整 snapshot、按域的增量、以及一个「等到有变化再回答」的观测者
  * [POS]: docs/061 §五。**观测的成本正比于事实的变化次数，不正比于时间**——
  *        没有观测者时这里一行都不算；有观测者时状态没变也不重新构造、不重新序列化。
+ *        每个长挂 observer 还声明自己的最小节奏：变化立即交付，稳定时不让
+ *        watcher 把音频侧重新拉回固定 5Hz。
  * [PROTOCOL]: ⛔ 三条不可退让：
  *             ① 新连接必须先拿到**完整** snapshot，否则它会带着一张空表等增量；
  *             ② 版本只增不减，重连后旧 sequence 绝不能覆盖新 snapshot；
@@ -19,6 +21,16 @@ export const WATCH_TIMEOUT_MS = 25_000;
 
 /** 两次推送之间的最小间隔。UI 用不到比这更快的更新，而这条上限与载荷是否稳定无关。 */
 export const MIN_PUSH_INTERVAL_MS = 200;
+
+/** State route 的默认观察节奏；显式 observer 可以要求更慢，但不能突破硬上限。 */
+export const DEFAULT_WATCH_INTERVAL_MS = MIN_PUSH_INTERVAL_MS;
+export const MAX_WATCH_INTERVAL_MS = 5_000;
+
+export const normalizeWatchInterval = (value, fallback = DEFAULT_WATCH_INTERVAL_MS) => {
+  const parsed = Number(value);
+  const base = Number.isFinite(parsed) ? parsed : Number(fallback);
+  return Math.max(0, Math.min(MAX_WATCH_INTERVAL_MS, base || 0));
+};
 
 /**
  * ⭐ **只随时钟走、不代表任何事实变化的字段**（真机实测得来，不是猜的）。
@@ -114,7 +126,9 @@ export class StateHub {
    * 这里只登记「该重算了」，真正的构造交给下一个 `setImmediate` 合并执行。
    */
   schedule() {
-    if (this.scheduled || !this.watching) return;
+    // A timer already owns the next eligible pump. Audio callbacks only need
+    // to leave the dirty bit set; another setImmediate would be pure churn.
+    if (this.scheduled || this.pushTimer || !this.watching) return;
     this.scheduled = true;
     setImmediate(() => {
       this.scheduled = false;
@@ -125,6 +139,24 @@ export class StateHub {
   markCold() { this.dirty.cold = true; }
 
   markAll() { this.dirty.hot = true; this.dirty.cold = true; }
+
+  nextEligibleMs() {
+    let next = Infinity;
+    for (const waiter of this.waiters) {
+      if (waiter.notBeforeMs < next) next = waiter.notBeforeMs;
+    }
+    return next;
+  }
+
+  armPump(atMs) {
+    if (this.pushTimer || !this.watching) return;
+    const delay = Math.max(0, atMs - this.now());
+    this.pushTimer = setTimeout(() => {
+      this.pushTimer = null;
+      this.pump();
+    }, delay);
+    if (typeof this.pushTimer.unref === 'function') this.pushTimer.unref();
+  }
 
   /**
    * 按需重建。**状态没变就不加版本**——这正是「状态不变时不得持续发送完整树」的落点。
@@ -163,22 +195,26 @@ export class StateHub {
   }
 
   /**
-   * 只在**有人在看**且确实脏了的时候重建，然后叫醒等待者。
+   * 只在**有人在看**且确实脏了的时候重建，然后通知等待者。
    *
    * ⛔ 硬上限：两次推送之间至少隔 `minIntervalMs`。这条与载荷是否稳定**无关**——
    * 它保证「某个字段其实一直在变」最多让我们多睡一会儿，而不会变成一条满速回路。
    */
   pump() {
     if (!this.watching) return false;
-    const waited = this.now() - this.lastPushMs;
-    if (this.minIntervalMs > 0 && waited < this.minIntervalMs) {
-      if (!this.pushTimer) {
-        this.pushTimer = setTimeout(() => {
-          this.pushTimer = null;
-          this.pump();
-        }, this.minIntervalMs - waited);
-        if (typeof this.pushTimer.unref === 'function') this.pushTimer.unref();
-      }
+    const now = this.now();
+    this.notifyWaiters(now);
+    if (!this.watching) return false;
+
+    const eligibleAt = this.nextEligibleMs();
+    if (eligibleAt > now) {
+      this.armPump(eligibleAt);
+      return false;
+    }
+
+    const minPushAt = this.lastPushMs + this.minIntervalMs;
+    if (minPushAt > now) {
+      this.armPump(minPushAt);
       return false;
     }
     const kinds = [
@@ -187,21 +223,57 @@ export class StateHub {
     ];
     if (!kinds.length) return false;
     const changed = this.build(kinds);
+    const builtAt = this.now();
     if (changed) {
-      this.lastPushMs = this.now();
-      this.wake();
+      this.lastPushMs = builtAt;
+      this.pushes += 1;
+      this.notifyWaiters(builtAt);
+    } else {
+      // The first build for a long-poll request is immediate. If it found
+      // nothing new, hold the same waiter until its declared next cadence.
+      for (const waiter of this.waiters) {
+        if (waiter.notBeforeMs <= builtAt) waiter.notBeforeMs = builtAt + waiter.intervalMs;
+      }
     }
+    const next = this.nextEligibleMs();
+    if (next < Infinity) this.armPump(Math.max(next, this.lastPushMs + this.minIntervalMs));
     return changed;
   }
 
-  wake() {
+  notifyWaiters(now = this.now()) {
     for (const waiter of [...this.waiters]) {
-      if (this.version > waiter.after) {
+      if (this.version > waiter.after && waiter.notBeforeMs <= now) {
         this.waiters.delete(waiter);
         clearTimeout(waiter.timer);
         waiter.resolve(this.since(waiter.after));
       }
     }
+  }
+
+  waitFor(after, bootId, timeoutMs, intervalMs, notBeforeMs = this.now()) {
+    return new Promise((resolve) => {
+      const waiter = {
+        after,
+        resolve,
+        timer: null,
+        intervalMs,
+        notBeforeMs,
+      };
+      waiter.timer = setTimeout(() => {
+        this.waiters.delete(waiter);
+        resolve(this.since(after, bootId));
+      }, Math.max(1000, Number(timeoutMs) || WATCH_TIMEOUT_MS));
+      // Node 的定时器不该把进程钉住。
+      if (typeof waiter.timer.unref === 'function') waiter.timer.unref();
+      this.waiters.add(waiter);
+      // 挂上之后立刻拉一次：这个观测者可能是**第一个**，在他到来之前没有人构造过状态。
+      this.markAll();
+      this.pump();
+      if (this.waiters.has(waiter) && waiter.notBeforeMs <= this.now()) {
+        waiter.notBeforeMs = this.now() + waiter.intervalMs;
+        this.armPump(waiter.notBeforeMs);
+      }
+    });
   }
 
   /**
@@ -245,27 +317,26 @@ export class StateHub {
    * ⛔ 不排队：每个观测者只持有一个游标，醒来时拿到的永远是**当下**的事实，
    *    而不是一串补发的中间值。这就是慢客户端不会让服务端堆积的原因。
    */
-  watch(after, bootId, timeoutMs = WATCH_TIMEOUT_MS) {
+  watch(after, bootId, timeoutMs = WATCH_TIMEOUT_MS, intervalMs = 0) {
     const cursor = Number(after);
     const known = bootId === this.bootId && Number.isFinite(cursor) && cursor >= 0;
+    const cadenceMs = Math.max(this.minIntervalMs, normalizeWatchInterval(intervalMs, 0));
     if (!known || cursor > this.version) {
       if (!this.cache.size) this.build();
       return Promise.resolve(this.since(after, bootId));
     }
-    if (this.version > cursor) return Promise.resolve(this.since(cursor));
-    return new Promise((resolve) => {
-      const waiter = { after: cursor, resolve, timer: null };
-      waiter.timer = setTimeout(() => {
-        this.waiters.delete(waiter);
-        resolve(this.since(cursor));
-      }, Math.max(1000, Number(timeoutMs) || WATCH_TIMEOUT_MS));
-      // Node 的定时器不该把进程钉住。
-      if (typeof waiter.timer.unref === 'function') waiter.timer.unref();
-      this.waiters.add(waiter);
-      // 挂上之后立刻拉一次：这个观测者可能是**第一个**，在他到来之前没有人构造过状态。
-      this.markAll();
-      this.pump();
-    });
+    if (this.version > cursor) {
+      // The bridge immediately issues the next watch after receiving a frame.
+      // When a new version already exists, do not let that fast path bypass the
+      // observer's declared cadence; only the initial cursor=0 snapshot is
+      // intentionally immediate.
+      const eligibleAt = cursor === 0 || !this.lastPushMs
+        ? this.now()
+        : this.lastPushMs + cadenceMs;
+      if (eligibleAt <= this.now()) return Promise.resolve(this.since(cursor));
+      return this.waitFor(cursor, bootId, timeoutMs, cadenceMs, eligibleAt);
+    }
+    return this.waitFor(cursor, bootId, timeoutMs, cadenceMs);
   }
 
   stats() {
@@ -275,8 +346,10 @@ export class StateHub {
       version: this.version,
       watchers: this.waiters.size,
       builds: this.builds,
+      pushes: this.pushes,
       domains: this.cache.size,
       last_build_ms: this.lastBuildMs,
+      last_push_ms: this.lastPushMs || null,
     };
   }
 

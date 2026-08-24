@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: Apache-2.0
  * [INPUT]: FireRedVAD posterior probabilities in 10 ms frame order.
  * [OUTPUT]: Speech start/end transitions plus gradient cut points inside a still-active segment.
- * [POS]: Pure VAD cut policy; it has no PCM transport, storage, HTP, KWS, or ASR responsibility.
+ * [POS]: Pure FireRedVAD cut policy; it has no PCM transport, storage, HTP, or ASR responsibility.
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
