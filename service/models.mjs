@@ -24,10 +24,10 @@ export const REQUIREMENTS = Object.freeze({
     name: 'SenseVoice', feature: 'asr', description: '语音转文字。',
   },
   'model.fireredvad': {
-    name: 'FireRedVAD', feature: 'vad', description: '手动转录时判断语音起止。',
+    name: 'FireRedVAD', feature: 'vad', description: '语音活动检测。',
   },
   'model.campplus': {
-    name: 'CAM++', feature: 'speaker_activity', description: '自动转录时判断当前说话人。',
+    name: 'CAM++', feature: 'vad', description: '语音活动检测与说话人判断。',
   },
 });
 
@@ -45,34 +45,57 @@ const managerFailure = (status) => ({
   message: status.message ?? unavailableText(status.reason),
 });
 
+/** ⭐ 只剩一个 ASR。⛔ 不留一个只有一个分支的三元表达式假装还有选择。 */
 const selectedAsr = () => 'model.sensevoice';
+
+/**
+ * ⭐ docs/099：**断句器永远是 FireRedVAD**，CAM++ 是可选的本人过滤。
+ * ⛔ 不再有「选了 CAM++ 就不需要 FR」这回事 —— 那是退役的二选一语义。
+ */
+const selectedVad = () => 'model.fireredvad';
+
+/** CAM++ 只在 `segment = fireredvad_camplus` 时被需要。 */
+const camFilterOn = (config) => {
+  const seg = config?.pipeline?.segment;
+  return seg === 'fireredvad_camplus' || seg === 'camplus';
+};
 
 const requirementRows = (config) => {
   const asr = selectedAsr(config);
+  const vad = selectedVad();
   const vadRequired = config?.asr?.enabled !== false;
-  const speakerRequired = config?.speaker_activity?.enabled === true;
+  // ⭐ 判据换成「本人过滤开没开」，⛔ 不再是那个退役的 speaker_activity 开关。
+  const speakerRequired = camFilterOn(config);
   return MODEL_IDS.map((modelId) => {
     const meta = REQUIREMENTS[modelId];
+    const isSelectedVad = meta.feature === 'vad' && modelId === vad;
+    const isSpeakerDependency = modelId === 'model.campplus' && speakerRequired;
     const requirement = meta.feature === 'asr'
       ? (modelId === asr ? 'required' : 'alternative')
-      : meta.feature === 'vad'
+      : isSelectedVad
         ? (vadRequired ? 'required' : 'optional')
-        : (speakerRequired ? 'required' : 'optional');
+        : isSpeakerDependency
+          ? 'required'
+          : (vadRequired ? 'alternative' : 'optional');
+    const selected = modelId === asr || isSelectedVad;
     return {
       model_id: modelId,
       name: meta.name,
       feature: meta.feature,
       description: meta.description,
       requirement,
-      selected: modelId === asr,
+      selected,
+      /**
+       * ⚠ 文案按三层 Pipeline 重写（docs/097 §十八）：⛔ 不再出现「自动转录」「VAD」
+       *   这两个已经退役的概念——同一个句子里说两套模型，读的人分不清哪套是现在的。
+       */
       reason: requirement === 'required'
-        ? (meta.feature === 'asr' ? `当前选择的 ASR 模型（cfg.asr.model=${config?.asr?.model ?? 'sensevoice'}）。`
-          : meta.feature === 'vad' ? '当前 ASR 链需要手动转录的语音检测。'
-            : '当前 policy 已开启自动转录的说话人活动判定。')
+        ? (meta.feature === 'asr' ? '当前 Pipeline 的转录层用它。'
+          : isSpeakerDependency && !isSelectedVad ? '当前 Pipeline 的断句层依赖它。'
+            : '当前 Pipeline 的断句层用它。')
         : requirement === 'alternative'
-          ? '未选择；切换 ASR 模型后才需要。'
-          : meta.feature === 'vad' ? '当前配置没有启用 ASR，暂不要求。'
-            : '当前 policy 未开启自动转录，暂不要求。',
+          ? '当前 Pipeline 不用它；切换到它那一层时才需要。'
+          : '当前 Pipeline 未使用这项功能。',
     };
   });
 };
@@ -203,13 +226,14 @@ export async function listModels(_packageRoot = null, {
     config: {
       asr_model: config?.asr?.model ?? 'sensevoice',
       asr_enabled: config?.asr?.enabled !== false,
+      vad_provider: config?.vad?.provider ?? 'campplus',
       speaker_activity_enabled: config?.speaker_activity?.enabled === true,
     },
     requirements,
     features: {
       asr: requirements.filter((r) => r.feature === 'asr').find((r) => r.selected)?.ready === true,
-      vad: requirements.find((r) => r.feature === 'vad')?.ready === true,
-      speaker_activity: requirements.find((r) => r.feature === 'speaker_activity')?.ready === true,
+      vad: requirements.find((r) => r.feature === 'vad' && r.selected)?.ready === true,
+      speaker_activity: requirements.find((r) => r.model_id === 'model.campplus')?.ready === true,
     },
     summary: {
       ready: complete,

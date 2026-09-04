@@ -63,9 +63,15 @@ test('R7 同档位再次 apply 仍然 prepare（⛔ 不是 no-op）',
 test('R8 SenseVoice 的 prepare 就是 ensureResident（声明幂等，⛔ 不重复建图）',
   /if \(variant === 'sensevoice'\)[\s\S]{0,200}?await this\.ensureResident\(\)/.test(code(ctl)));
 
-test('R9 Audio8 的 prepare/runtime 分支已退休',
-  !code(ctl).includes('ensureAudio8Session')
-    && !code(ctl).includes('/api/asr/audio8/'));
+/**
+ * ⚠ R9 原本钉「Audio8 的 prepare/runtime 分支走官方 App session contract」。
+ *   Audio8 随 App 0.25.x 退役、那两个端点已从 App 删除，故按新意图倒过来钉。
+ * ⭐ 但**它保护的东西没变**：`prepareBackend` 仍然必须对认不出的 backend
+ *   **明确报错**，⛔ 绝不「悄悄按 SenseVoice 跑」——那才是这条测试的本意。
+ */
+test('R9 ⛔ 不再有 Audio8 分支，而认不出的 backend 仍然明确报错',
+  !/audio8/i.test(code(ctl))
+  && code(ctl).includes('is not served by this pipeline'));
 
 // ── §5/§7 automatic ready 只认 App 的事实 ──────────────────────────────
 
@@ -152,6 +158,28 @@ test('R26b automatic 链里没有任何一处在启动时打开 PCM consumer',
 test('R27 ⛔ 服务重启/停链不许 undeclare（那是 churn，不是卸载）',
   /chain_desired=stopped; leaving residents untouched/.test(read('service/main.mjs'))
   && /这里绝不 undeclare/.test(read('service/main.mjs')));
+
+
+/**
+ * ⭐ **可执行体是会迟到的事实，⛔ 不是只在开机为真的常量**（docs/103 §8.2⑥）。
+ *
+ * ⚠ 同一个形状出现过三次（docs/101 麦克风需求、docs/090 boot、本轮 ASR+VAD 两处），
+ *   所以对账器必须**一次覆盖全部**，⛔ 不是给某一个模型单独打补丁。
+ * ⚠ VAD 那份**三个消费者共用**（VadController / AcousticLab / SpeakerLab）——
+ *   ⛔ 让它们各自去问会变成三份会各自漂移的答案。
+ */
+test('R12 启动时解析不到的可执行体，由一条有界对账器补上',
+  mainCode.includes('reconcileExecutables')
+  && mainCode.includes('reconcileAsrExecutable')
+  && mainCode.includes('reconcileVadExecutable')
+  && /for \(const consumer of \[vad, lab, speakerLab\]\)/.test(mainCode));
+test('R13 ⛔ 退避有界且没有终局放弃',
+  mainCode.includes('EXECUTABLE_RECONCILE_MAX_MS')
+  && /Math\.min\(executableBackoffMs \* 2, EXECUTABLE_RECONCILE_MAX_MS\)/.test(mainCode)
+  && !/executableGaveUp|reconcileDisabled/.test(mainCode));
+test('R14 ⭐ 闭合要说出来，⛔ 不许静默自愈',
+  /logical executables reconciled after boot/.test(mainCode)
+  && mainCode.includes('recoveries='));
 
 console.log(`\n${count - failures}/${count} passed`);
 process.exit(failures ? 1 : 0);

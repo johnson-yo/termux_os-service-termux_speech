@@ -346,7 +346,7 @@ test(
 
 test(
   'B5 WS 重连不会叠加 listener：重连前后都只有一个 socket 对象持有回调',
-  /socket\.onclose = \(\) => \{\s*if \(stateSocket !== socket \|\| stateConnectionGeneration !== generation\) return;/.test(appJs)
+  /socket\.onclose = \(\) => \{[\s\S]*?if \(stateSocket !== socket \|\| stateConnectionGeneration !== generation\) return;/.test(appJs)
     && !appJs.includes("socket.addEventListener('message'"),
 );
 
@@ -359,7 +359,15 @@ test(
   'B6 单个域变化只触发对应区域，区域的依赖是显式声明的',
   appJs.includes('const REGIONS = [')
     && appJs.includes('if (!needs.some((domain) => touched.has(domain))) continue;')
-    && appJs.includes("['overview-activity', ['rms_gate', 'public', 'speaker_activity', 'pipeline', 'vad', 'asr'],"),
+    /**
+     * ⭐ **按新意图改写**（docs/097），⛔ 不是换个字符串绕过。
+     * OLD → 钉死 `['rms_gate', 'public', 'speaker_activity', 'pipeline', 'vad', 'asr']`。
+     * WHY OBSOLETE → 那五个域描述的是**已经不在跑**的旧执行体；runtime 事实
+     *   现在只有一个来处 `app_pipeline`，把它列进依赖正是这条断言要保证的事。
+     * NEW → 依赖仍然**显式声明**，且这一区必须依赖 `app_pipeline`。
+     */
+    && appJs.includes("['overview-activity', ['app_pipeline', 'public', 'speaker_activity', 'vad'],")
+    && appJs.includes("['pipeline-selectors', ['app_pipeline']"),
 );
 
 test(
@@ -397,7 +405,14 @@ test(
   appJs.includes("request(started ? '/chain/stop' : '/chain/start'")
     && /holder[\s\S]{0,200}!== 'webui'/.test(appJs)
     && viewsJs.includes('CAPTURE_LABELS')
-    && appJs.includes("$('man-toggle')")
+    /**
+     * ⭐ **按新意图改写**：OLD → `appJs.includes("$('man-toggle')")`。
+     * WHY OBSOLETE → 「手动转录」这个模式已经不存在；那个 id 在 `index.html` 里
+     *   出现 0 次，断言钉的是一段绑不到任何节点的死代码。
+     * NEW → 开/停现在是 trigger 那一层的事，而它只有**一个写入点**。
+     */
+    && appJs.includes('const PIPE_IDS = {')
+    && !appJs.includes("$('btn-mode-auto')?.addEventListener")
     && !viewsJs.includes("$('rec-progress')"),
 );
 

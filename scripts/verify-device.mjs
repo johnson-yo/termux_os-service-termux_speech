@@ -362,11 +362,42 @@ await check('sensevoice_contract_and_htp_runtime', async () => {
   if (asr?.schema !== 'termux-os.speech-asr.v1' || asr.model?.files_present !== true) {
     throw new Error(asr?.last_error ?? 'SenseVoice model/adjuncts unavailable');
   }
+  /**
+   * ⚠ 这里曾把 `v73` 与 `2.47` **写死**。那两个值描述的是**这台机器**，
+   *   ⛔ 不是产品契约：S25 是 v79/2.49，于是这条验收在它上面**永远不可能通过**；
+   *   而 QAIRT 升到 2.49 之后，连原本作为基准的参考机也不通过了。
+   * ⭐ **一个永远失败的验收脚本比没有脚本更糟：它训练人去忽略红灯。**
+   *
+   * 判据改成两条**真正的契约**：
+   *   ① runtime/precision 必须是 ORT-QNN 的 HTP 上下文（⛔ 不许悄悄退到 CPU）；
+   *   ② htp/qnn 必须**报得出来，且与 App 自报的 target 逐字相同**——
+   *      ⭐ 判的是「它说的和它跑的是不是同一台机器」，⛔ 不是「它是不是某台机器」。
+   *      这条抓的是真实事故形状：speech 侧曾把这两个值写死成 `'v73'`/`'2.47'`，
+   *      在 S25 上如实地报了一个**错的**值而没有任何东西发现（docs/060 同一形状）。
+   */
   if (asr.model.runtime !== 'android-app-ort-qnn-htp'
-    || asr.model.precision !== 'qnn-context'
-    || asr.model.htp !== 'v73'
-    || asr.model.qnn !== '2.47') {
-    throw new Error('SenseVoice runtime metadata is not the installed V73/QNN 2.47 context');
+    || asr.model.precision !== 'qnn-context') {
+    throw new Error('SenseVoice runtime is not an ORT-QNN HTP context'
+      + ` (runtime=${asr.model.runtime} precision=${asr.model.precision})`);
+  }
+  if (!asr.model.htp || !asr.model.qnn) {
+    throw new Error('SenseVoice runtime does not report its HTP/QNN target'
+      + ' — a field named "what it runs on" must never be blank');
+  }
+  {
+    const app = await discoverApp();
+    const prepare = await fetch(`${app.baseUrl}/api/inference/model/prepare`, {
+      headers: { Authorization: app.authorization },
+      signal: AbortSignal.timeout(8000),
+    }).then((r) => r.json()).catch(() => null);
+    const target = prepare?.data?.target;
+    if (!target?.htp || !target?.qnn) {
+      throw new Error('App did not report its own HTP/QNN target');
+    }
+    if (asr.model.htp !== target.htp || asr.model.qnn !== target.qnn) {
+      throw new Error('SenseVoice reports a different machine than the App runs on:'
+        + ` speech=${asr.model.htp}/${asr.model.qnn} app=${target.htp}/${target.qnn}`);
+    }
   }
   if (asr.transcripts?.http_feed !== '/asr/transcripts'
     || asr.transcripts?.websocket !== '/asr/transcripts/ws') {

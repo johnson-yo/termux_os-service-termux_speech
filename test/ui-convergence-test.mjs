@@ -1,7 +1,7 @@
 /**
  * SPDX-License-Identifier: Apache-2.0
  * [INPUT]: `web/` 的 Overview / Settings / My Voice DOM 与渲染接线
- * [OUTPUT]: 三个产品 tab、runtime 事实位置、设置边界、原生声纹登记与手动 FireRedVAD 计时来源的结构回归
+ * [OUTPUT]: 三个产品 tab、runtime 事实位置、设置边界、原生声纹登记与选定 VAD 计时来源的结构回归
  * [POS]: UI 产品收敛的结构钉；不以文案假绿，优先检查 DOM/调用关系。
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
@@ -66,7 +66,8 @@ test('U4 Overview 是事实与控制页：RMS/CAM/VAD/ASR 读数与开关行都�
   const overview = body.slice(body.indexOf('id="page-overview"'), body.indexOf('id="page-settings"'));
   return ['rms-current', 'rms-avg', 'rms-threshold', 'rms-admission', 'cam-plot', 'rms-cam-countdown',
     'cam-live', 'cam-owner', 'vad-mode', 'vad-owner', 'vad-live', 'asr-owner', 'ov-current',
-    'ov-latest', 'asr-model-facts', 'res-enabled', 'man-toggle', 'ac-mic'].every((id) => overview.includes(`id="${id}"`));
+    /** ⚠ `man-toggle` / `ac-mic` 是已删除的旧模式按钮；手动入口现在是 `pd-manual`。 */
+    'asr-model-facts', 'res-enabled', 'pd-manual'].every((id) => overview.includes(`id="${id}"`));
 })());
 test('U5 Settings 收拢可修改配置，并按功能折叠', (() => {
   const settings = body.slice(body.indexOf('id="page-settings"'), body.indexOf('id="page-voice"'));
@@ -74,13 +75,11 @@ test('U5 Settings 收拢可修改配置，并按功能折叠', (() => {
     && ['asr-model', 'asr-language',
       'open-threshold', 'input-device', 'enable', 'disable', 'card-models-wrap']
       .every((id) => settings.includes(`id="${id}"`))
-    /**
-     * ⭐ **原来这里断言的是「固定 CAM++ 8 秒不成为产品设置」——使用者明确推翻了它。**
-     * 现在它是 policy 的 `speaker.user_timeout_ms`，入口只有一个（policy 卡里那个）。
-     * ⛔ 不靠「换个 id 绕过旧断言」：判据要跟着意图改，否则测试就变成了考古。
-     */
     && settings.includes('id="pol-spk-usertimeout"')
-    && (settings.match(/user_timeout_ms/g) ?? []).length === 1;
+    // ⚠ `pol-vad-provider` → `set-pipe-segment`：断句方式归 Pipeline，⛔ 不再是 policy 字段。
+    && settings.includes('id="set-pipe-segment"')
+    && /<details class="card settings-group" id="card-policy">/.test(settings)
+    && !/<details class="card settings-group" id="card-policy" open>/.test(settings);
 })());
 test('U6 My Voice 只有 native enrollment，且没有旧页/图表入口', (() => {
   const voice = body.slice(body.indexOf('id="page-voice"'));
@@ -123,10 +122,24 @@ test('U12 区域失败隔离且可见',
 test('U13 状态流成功也更新 LIVE，而不是永远 CONNECTING',
   /socket\.onmessage[\s\S]{0,600}setBadge\(\$\('pipeline-live'\), 'LIVE'/.test(app)
   && app.includes("'状态流断开，正在重连…'"));
-test('U14 Overview 门开时按 RMS gate 说听到了',
-  /const heard = level >= 0\.02 \|\| rms\?\.state === 'open';/.test(app));
-test('U14b 手动听写的 FireRedVAD 计时不把 RMS 常开门当成持续说话',
-  app.includes('const isSpeaking = domains.vad?.activity?.active === true;')
+/**
+ * ⚠ 判据不变（电平够 **或** 门开了），来处变了：门开与否现在按 trigger 的产品语义
+ *   由 App 回答（直通=常开、停止=常关、音量/拍掌=App 的 `admitted`），
+ *   ⛔ 不再一律拿本包 RMS 比阈值——真机上本包那条 RMS 已经三个半小时没有新帧。
+ */
+test('U14 Overview 门开时按处理门说听到了',
+  /const heard = level >= 0\.02 \|\| gateOpen;/.test(app)
+    && app.includes("const gateOpen = stopped ? false"));
+/**
+ * ⭐ **按新意图改写**，⛔ 不是绕过。
+ * OLD → 「手动听写」模式下 FireRedVAD 的计时不许拿常开的 RMS 门当说话。
+ * WHY OBSOLETE → 手动/自动这套模式已经不存在；三层 Pipeline 里没有"手动听写"。
+ * NEW → 保住的是**同一条原则**：语音层必须跟一条**真的活动事实**，
+ *   ⛔ 不许因为门开着（直通就是永远开着）就画成一直在说话。
+ */
+test('U14b 语音层跟真实活动事实，⛔ 不把常开的门当成持续说话',
+  app.includes('&& Number.isFinite(vadProb) && vadProb >= vadThreshold && vadFresh')
+    && app.includes('lastVadAdvanceAtMs')
     && !app.includes('const isSpeaking = speaking || heard || domains.vad?.activity?.active === true;'));
 test('U15 Audio8/SenseVoice 都从同一份 public ASR live 状态读文字',
   views.includes('value?.latest') && views.includes('current?.backend')

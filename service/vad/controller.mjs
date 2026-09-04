@@ -64,8 +64,13 @@ export class VadController {
     android,
     dataRoot,
     config,
-    /** logical descriptor 给出的可执行模型绝对路径；⛔ 不在类内拼文件名。 */
-    modelFile = null,
+    /**
+     * ⭐ **已经路由好的图参数**，来自 `executableGraphArgs(descriptor)`。
+     * ⛔ 不是一个裸路径：`executable.path` 多数时候是一份 EPContext，当成 `model_path`
+     *   送过去会被 App 以 `EP_CONTEXT_AS_MODEL_PATH` 拒绝。判据只住在 `logical-models.mjs`，
+     *   本类**不许知道** `kind` 这个字段存在。
+     */
+    graph = null,
     /** logical descriptor 给出的 runtime CMVN 绝对路径；⛔ 不从 modelFile 推导。 */
     cmvnFile = null,
     residentId = DEFAULT_RESIDENT_ID,
@@ -101,7 +106,9 @@ export class VadController {
     this.onProbability = typeof onProbability === 'function' ? onProbability : null;
     this.probabilityFrames = 0;
     this.config = { ...config };
-    this.modelPath = modelFile;
+    this.executable = graph ?? null;
+    /** 「文件在不在」与状态投影用的那一份；⛔ 不拿它去当 model_path。 */
+    this.modelPath = graph?.path ?? null;
     this.cmvnPath = cmvnFile;
     this.graph = new ResidentGraph({
       android,
@@ -109,7 +116,9 @@ export class VadController {
       model: 'fireredvad',
       // ⭐ 给绝对路径，不只给名字。只给名字时 App 会按它自己的 htp_models_dir 去拼，
       // 于是 cmvn 来自 asset store 而**图来自旧裸路径**——两份都在时看起来完全正常。
-      modelPath: this.modelPath,
+      modelPath: graph?.modelPath ?? null,
+      ctxPath: graph?.ctxPath ?? null,
+      ctxKey: graph?.ctxKey ?? null,
       estMemMb: VAD_EST_MEM_MB,
     });
     this.transport = null;
@@ -173,6 +182,7 @@ export class VadController {
 
   publicConfig() {
     return {
+      provider: this.config.provider ?? 'campplus',
       pcm_pool_ms: this.config.pcm_pool_ms,
       no_output_timeout_ms: this.config.no_output_timeout_ms,
     };
@@ -187,7 +197,8 @@ export class VadController {
     if (this.presenceCache && nowMs - this.presenceCache.at_ms < 2000) {
       return this.presenceCache.value;
     }
-    const value = fs.existsSync(this.modelPath) && fs.existsSync(this.cmvnPath);
+    const value = Boolean(this.modelPath) && Boolean(this.cmvnPath)
+      && fs.existsSync(this.modelPath) && fs.existsSync(this.cmvnPath);
     this.presenceCache = { value, at_ms: nowMs };
     return value;
   }
@@ -390,6 +401,30 @@ export class VadController {
       && (this.poolBytes > maxBytes || this.pool[0].at_ms < cutoff)) {
       this.poolBytes -= this.pool.shift().pcm.length;
     }
+  }
+
+  /**
+   * ⭐ **可执行体是一个会迟到的事实，⛔ 不是一个只在开机为真的常量。**
+   *
+   * ⚠ 与 `AsrController.applyLogical` 同一件事、同一个理由（docs/103 §8.2⑥）：
+   *   speech 比模型管理器先起来时，启动那一刻解析不到 FireRedVAD，
+   *   于是它**永远** `degraded`，而重启一次就好了。
+   * ⛔ 已经声明过常驻时不许就地改路径——见 [ResidentGraph.configure]。
+   * @returns 有没有真的换过
+   */
+  applyLogical({ graph, cmvnFile } = {}) {
+    if (this.modelsReady || (this.modelPath && this.cmvnPath)) return false;
+    if (!graph?.path || !cmvnFile) return false;
+    this.executable = graph;
+    this.modelPath = graph.path;
+    this.cmvnPath = cmvnFile;
+    this.graph.configure({
+      modelPath: graph.modelPath ?? null,
+      ctxPath: graph.ctxPath ?? null,
+      ctxKey: graph.ctxKey ?? null,
+    });
+    this.onChange();
+    return true;
   }
 
   ensureModelFiles() {
@@ -707,7 +742,10 @@ export class VadController {
       ready: this.modelsReady && this.sessionReady && this.transport?.connected === true,
       model: {
         id: 'fireredvad',
+        // ⭐ 报的是**实际载入的那一份**，并说清它是不是编译产物。
         model_path: this.modelPath,
+        executable_kind: this.executable?.kind ?? null,
+        loaded_as: this.executable?.isContext ? 'ctx_path' : 'model_path',
         cmvn_path: this.cmvnPath,
         files_present: this.filesPresent(),
         runtime: 'android-app-ort-qnn-htp',

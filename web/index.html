@@ -22,29 +22,36 @@
       <div id="mem-avail" class="mem-cols" title="实时可用内存（参考值）"></div>
       <!-- Row 2: 状态多列指示网格（Label 上，Value/Dot 下，列间有分隔线） -->
       <div class="status-panel">
+        <!--
+          ⭐ 这六格的**每一个值**都来自 `app_pipeline` 域（App effective + App runtime），
+             ⛔ 不再读 `lifecycle.chain` / `pipeline.owner` / `listen.engaged` / `asr.model`。
+          ⚠ 那四个旧来源描述的是**已经不在跑**的执行体：真机上 `lifecycle.chain` 恒为
+             `stopped` 而 App pipeline 正在 `running`，于是 Header 说"语音链已停止"、
+             Overview 说"运行中"——同一页面两个答案。
+        -->
         <div class="status-col">
           <span class="status-lbl">语音链</span>
-          <span id="st-dot-chain" class="status-dot off" title="语音链已停止"></span>
+          <span id="st-dot-chain" class="status-dot off" title="正在读取 App pipeline…"></span>
         </div>
         <div class="status-col">
           <span class="status-lbl">收音</span>
-          <span id="st-dot-mic" class="status-dot off" title="未在收音"></span>
+          <span id="st-dot-mic" class="status-dot off" title="正在读取麦克风状态…"></span>
         </div>
         <div class="status-col">
           <span class="status-lbl">实时状态</span>
           <span id="st-dot-live" class="status-dot warn" title="连接中"></span>
         </div>
         <div class="status-col">
-          <span class="status-lbl">VAD</span>
-          <span id="st-val-vad" class="status-val text-good" title="VAD 模式：自动 (CAM++)">A</span>
+          <span class="status-lbl">触发</span>
+          <span id="st-val-gate" class="status-val text-good" title="触发层：正在读取…">—</span>
         </div>
         <div class="status-col">
-          <span class="status-lbl">ASR</span>
-          <span id="st-val-asr" class="status-val text-good" title="ASR 模型：SenseVoice">SV</span>
+          <span class="status-lbl">断句</span>
+          <span id="st-val-vad" class="status-val text-good" title="断句层：正在读取…">—</span>
         </div>
         <div class="status-col">
-          <span class="status-lbl">GATE</span>
-          <span id="st-val-gate" class="status-val text-good" title="当前 Gate 控制：RMS">RMS</span>
+          <span class="status-lbl">转录</span>
+          <span id="st-val-asr" class="status-val text-good" title="转录层：正在读取…">—</span>
         </div>
       </div>
     </div>
@@ -65,22 +72,53 @@
        Overview：只读事实。RMS → VAD → ASR 的当前状态全部在这里。
        ============================================================ -->
   <section class="page" id="page-overview" role="tabpanel" hidden>
-    <!-- 顶部模式选择 tablist（自动转录 / 手动转录 / 停止收音，三选一） -->
-    <div class="ov-mode-tablist" role="tablist" aria-label="转录模式选择">
-      <button id="btn-mode-auto" role="tab" type="button" class="ov-mode-tab" data-mode="auto" aria-selected="false">自动转录</button>
-      <button id="man-toggle" role="tab" type="button" class="ov-mode-tab" data-mode="manual" aria-selected="false">手动转录</button>
-      <button id="ac-mic" role="tab" type="button" class="ov-mode-tab" data-mode="stop" aria-selected="true">停止收音</button>
+    <!--
+      三层 Pipeline（docs/096/097）。⭐ 每次切换 merge 三层后**一次 PUT**，⛔ 不再分别调三个旧 API。
+      ⚠ 这里曾经沿用 `.ov-mode-tablist`——那是给「自动转录 | 手动转录 | 停止」三个**按钮**用的
+        38px 高、三等分网格。塞进三个带 label 的 select 之后，44px 的全局 select 最小高度
+        与 label 的 margin 一起把它撑破，而状态字被挤成第四列。
+        ⭐ **控件换了，容器就得换**：现在是三列 selector + 独立一行的状态字。
+    -->
+    <div class="ov-pipe-row" role="group" aria-label="三层 Pipeline">
+      <label class="ov-pipe"><span>触发</span>
+        <select id="pipe-trigger">
+          <option value="stop">停止</option>
+          <option value="passthrough">直通</option>
+          <option value="volume">音量</option>
+          <option value="clap">拍掌</option>
+        </select></label>
+      <label class="ov-pipe"><span>断句</span>
+        <select id="pipe-segment">
+          <option value="fireredvad">FireRedVAD</option>
+          <option value="fireredvad_camplus">FR + CAM++</option>
+        </select></label>
+      <label class="ov-pipe"><span>转录</span>
+        <select id="pipe-asr">
+          <option value="sensevoice">SenseVoice</option>
+        </select></label>
     </div>
+    <p id="pipe-state" class="ov-pipe-state">—</p>
 
     <!-- ⭐ 「门永远不会开」必须说在使用者真的在看的那一页上。
          ⚠ 它与「一切正常，只是没人说话」在界面上原本长得一模一样。 -->
     <p id="ov-gate-blocked" class="message bad" hidden></p>
 
-    <!-- Gate 状态条（卡片外部）：RMS -(N%)- VAD(Ns) -(N%)- ASR -->
+    <!-- ⭐ 「断句层挂了」必须说在这一页上。
+         ⚠ 真机 SSR 事故：running/admitted/loaded/health 四个全为真、四个绿灯全亮，
+            而每一次图执行都失败——它与「一切正常，只是没人说话」原本长得一模一样。 -->
+    <p id="ov-segment-stalled" class="message bad" hidden></p>
+
+    <!--
+      三层流水线状态条：[触发] -(N%)- [断句](Ns) -(N%)- [转录]
+      ⭐ 视觉结构一格没动，⛔ 但三个节点的名字**不再写死**成 RMS/VAD/ASR——
+         它们是 effective pipeline 的三层，名字随选择变（直通 / FireRedVAD / SenseVoice）。
+      ⚠ id 保持不变（`gn-rms`/`gn-vad`/`gn-asr`）：它们是**位置**的名字不是内容的名字，
+         改 id 只会让每一处引用同步失败而不带来任何澄清。
+    -->
     <div class="gate-flow-container">
       <div class="gate-flow" id="gate-flow">
         <div class="gate-slot slot-left">
-          <span class="gate-box active" id="gn-rms">RMS</span>
+          <span class="gate-box active" id="gn-rms">触发</span>
         </div>
         <div class="gate-slot slot-conn">
           <span class="gate-dash">-</span>
@@ -89,7 +127,7 @@
         </div>
         <div class="gate-slot slot-center">
           <span class="gate-box" id="gn-vad">
-            <span class="gate-name">VAD</span><span class="gate-countdown" id="gc-vad">(0s)</span>
+            <span class="gate-name">断句</span><span class="gate-countdown" id="gc-vad">(—)</span>
           </span>
         </div>
         <div class="gate-slot slot-conn">
@@ -98,7 +136,7 @@
           <span class="gate-dash">-</span>
         </div>
         <div class="gate-slot slot-right">
-          <span class="gate-box" id="gn-asr">ASR</span>
+          <span class="gate-box" id="gn-asr">转录</span>
         </div>
       </div>
     </div>
@@ -108,7 +146,7 @@
       <div class="section-title">
         <div>
           <h2>LIVE</h2>
-          <p id="cam-off" class="note">浅蓝虚线：RMS 阈值 · 橙色虚线：CAM++ 阈值</p>
+        <p id="cam-off" class="note">RMS · CAM++ / FireRedVAD · 1秒/柱</p>
         </div>
         <span id="cam-now" class="badge">—</span>
       </div>
@@ -197,7 +235,6 @@
         <div class="badge-stack"><span id="asr-state" class="badge">STANDBY</span><span id="asr-precision" class="badge tag">—</span></div>
       </div>
       <div class="transcript-fact live-fact"><span>正在识别</span><strong id="ov-current">等待语音…</strong></div>
-      <div class="transcript-fact"><span>最近识别</span><strong id="ov-latest">尚未产生转写</strong><small id="tx-latest-meta">—</small></div>
       <div class="tx-history-section">
         <ul id="tx-history-list" class="tx-history-list"></ul>
       </div>
@@ -215,68 +252,87 @@
          两个入口写同一个字段，迟早会各说各的，而症状是「改了没用」。
          保存 = 一次完整 PUT（generation+1），⛔ 不是逐字段 setter。
          ============================================================ -->
-    <details class="card settings-group" id="card-policy" open>
+    <details class="card settings-group" id="card-policy">
       <summary>策略参数（policy）</summary>
       <div class="settings-inner">
-        <p class="note">这一张卡就是 <code>speech-policy.json</code> 的全部可调项。
-          保存时整份原子替换（版本号 +1）；段落进行中修改会等到下一段生效。</p>
+        <p class="note">调整后保存；需要等到下一段语音的参数会在边界处生效。</p>
 
-        <h2>开门（gate）</h2>
-        <!-- ⭐ 触发方式**就是 policy 的一个字段**（`gate.mode`）。
-             它曾经在这张卡外面另有一组 tab——那是第二个入口，而这张卡的规矩就是
-             「每个可调项只出现一次」。⛔ 两个入口写同一个字段，迟早各说各的。 -->
-        <label for="pol-gate-mode">触发方式<em class="when">下一次开门生效</em></label>
-        <select id="pol-gate-mode">
-          <option value="volume">音量触发</option>
-          <option value="feature">拍掌触发</option>
+        <!-- ============================================================
+             ⭐ **三层 Pipeline 就是 Settings 的骨架**（docs/097 §十一）。
+             旧结构是「开门 / 说话人 / 语音检测 / 分段」四段，那是执行体还在本包时的分法；
+             现在执行体在 App，可选的东西只有三层 + 每层的参数。
+             ⚠ 三个 selector 与 Overview 顶部那三个是**同一个控件的两个视图**：
+               同一个渲染器写、同一个 PUT 写回。⛔ 不是"两个入口写同一个字段"——
+               那正是 `gate.mode=音量` 与 `pipeline.trigger=直通` 各说各话的来源。
+             ============================================================ -->
+        <h2>触发（trigger）</h2>
+        <label for="set-pipe-trigger">触发方式</label>
+        <select id="set-pipe-trigger">
+          <option value="stop">停止</option>
+          <option value="passthrough">直通</option>
+          <option value="volume">音量</option>
+          <option value="clap">拍掌</option>
         </select>
         <p id="trg-note" class="message"></p>
-        <label for="open-threshold">音量阈值 <em class="when">gate.volume_threshold</em></label>
+        <p id="set-trigger-current" class="hint">当前运行：读取中…</p>
+        <label for="open-threshold">音量阈值</label>
         <div class="gate-field"><input id="open-threshold" type="range" min="0.001" max="0.200" step="0.001"><input id="open-number" type="number" min="0.001" max="1" step="0.001" inputmode="decimal"></div>
         <div class="config-grid">
-          <div><label for="pol-gate-frames">连续几帧越线才开门 <em class="when">volume_frames</em></label><input id="pol-gate-frames" type="number" min="1" max="20" step="1" inputmode="numeric"></div>
-          <div><label for="pol-gate-tol">拍掌容许度 <em class="when">feature_tolerance</em></label><select id="pol-gate-tol"><option value="strict">strict（严）</option><option value="standard">standard</option><option value="loose">loose（松）</option></select></div>
+          <div><label for="pol-gate-frames">连续几帧越线才开门</label><input id="pol-gate-frames" type="number" min="1" max="20" step="1" inputmode="numeric"></div>
+          <div><label for="pol-gate-tol">拍掌容许度</label><select id="pol-gate-tol"><option value="strict">strict（严）</option><option value="standard">standard</option><option value="loose">loose（松）</option></select></div>
         </div>
 
-        <h2>说话人（speaker · CAM++）</h2>
-        <p id="speaker-model-hint" class="hint">模型依赖按当前 policy 判断。</p>
+        <h2>断句（segment）</h2>
+        <label for="set-pipe-segment">断句方式</label>
+        <select id="set-pipe-segment">
+          <option value="fireredvad">FireRedVAD</option>
+          <option value="fireredvad_camplus">FireRedVAD + CAM++（本人过滤）</option>
+        </select>
+        <p id="set-segment-current" class="hint">当前运行：读取中…</p>
+        <p id="vad-model-hint" class="hint">模型依赖按当前 Pipeline 判断。</p>
         <div class="config-grid">
-          <div><label for="pol-spk-enter">进入阈值 <em class="when">enter_threshold</em></label><input id="pol-spk-enter" type="number" min="-1" max="1" step="0.01" inputmode="decimal"></div>
-          <div><label for="pol-spk-exit">退出阈值 <em class="when">exit_threshold</em></label><input id="pol-spk-exit" type="number" min="-1" max="1" step="0.01" inputmode="decimal"></div>
-          <div><label for="pol-spk-encf">进入确认窗数 <em class="when">enter_confirm</em></label><input id="pol-spk-encf" type="number" min="1" max="10" step="1" inputmode="numeric"></div>
-          <div><label for="pol-spk-excf">退出确认窗数 <em class="when">exit_confirm</em></label><input id="pol-spk-excf" type="number" min="1" max="10" step="1" inputmode="numeric"></div>
-          <div><label for="pol-spk-window">窗长 ms <em class="when">window_ms</em></label><input id="pol-spk-window" type="number" min="500" max="4000" step="50" inputmode="numeric"></div>
-          <div><label for="pol-spk-step">窗步进 ms <em class="when">step_ms</em></label><input id="pol-spk-step" type="number" min="100" max="1000" step="10" inputmode="numeric"></div>
-          <div><label for="pol-spk-headmode">句首模式 <em class="when">head_mode</em></label><select id="pol-spk-headmode"><option value="trim">trim（按位移裁）</option><option value="safe">safe（不裁）</option></select></div>
-          <div><label for="pol-spk-usertimeout">关门倒计时 ms <em class="when">user_timeout_ms</em></label><input id="pol-spk-usertimeout" type="number" min="2000" max="120000" step="500" inputmode="numeric"></div>
+          <div><label for="pol-seg-head">句首回溯 ms</label><input id="pol-seg-head" type="number" min="0" max="3000" step="50" inputmode="numeric"></div>
+          <div><label for="pol-seg-tail">句尾保留 ms</label><input id="pol-seg-tail" type="number" min="0" max="2000" step="50" inputmode="numeric"></div>
+          <div><label for="pol-seg-grace">续句等待 ms</label><input id="pol-seg-grace" type="number" min="0" max="4000" step="100" inputmode="numeric"></div>
+          <!-- ⭐ 硬切时长：**两个句尾方案共用**，同时也是阶梯曲线的终点（docs/098）。
+               ⚠ 它曾经是代码里写死的 15 秒，于是「切得太长」没有任何旋钮可调。 -->
+          <div><label for="pol-seg-hardcap">硬切时长 ms</label><input id="pol-seg-hardcap" type="number" min="2000" max="20000" step="500" inputmode="numeric"></div>
         </div>
-        <p class="hint">⭐ 关门倒计时在**每次确认到你在说话时重新计时**，不是从开门起算死的。
-          调大它 = 停顿更久也不关门；调小 = 说完更快回到待机。</p>
 
-        <h2>语音检测（vad）</h2>
-        <p id="vad-model-hint" class="hint">模型依赖按当前 ASR 配置判断。</p>
+        <h3 class="sub-h">FireRedVAD 句尾判定</h3>
+        <p id="set-vad-end-hint" class="hint">只在断句方式为 FireRedVAD 时生效；CAM++ 的句尾由说话人判定给出。</p>
+        <label for="pol-vad-endmode">句尾方案</label>
+        <select id="pol-vad-endmode">
+          <option value="hangover">固定悬停（最后一个语音帧 + 悬停）</option>
+          <option value="stepped">阶梯式悬停（先松后紧 · 回选停顿谷）</option>
+        </select>
+        <p id="vad-end-note" class="hint"></p>
         <div class="config-grid">
-          <div><label for="pol-vad-provider">判定来源 <em class="when">provider</em></label><select id="pol-vad-provider"><option value="camplus">camplus</option><option value="fireredvad">fireredvad</option></select></div>
-          <div><label for="pol-vad-th">语音概率阈值 <em class="when">speech_threshold</em></label><input id="pol-vad-th" type="number" min="0" max="1" step="0.05" inputmode="decimal"></div>
-          <div><label for="pol-vad-look">否决回看 ms <em class="when">gate_lookback_ms</em></label><input id="pol-vad-look" type="number" min="0" max="5000" step="50" inputmode="numeric"></div>
-          <div><label for="pol-vad-gates">FireRedVAD 否决权 <em class="when">gates_speaker</em></label><input id="pol-vad-gates" type="checkbox"></div>
+          <div><label for="pol-vad-hangover">固定悬停 ms</label><input id="pol-vad-hangover" type="number" min="100" max="3000" step="100" inputmode="numeric"></div>
+          <div><label for="pol-vad-hgmax">阶梯起点（松）ms</label><input id="pol-vad-hgmax" type="number" min="100" max="3000" step="100" inputmode="numeric"></div>
+          <div><label for="pol-vad-hgmin">阶梯终点（紧）ms</label><input id="pol-vad-hgmin" type="number" min="100" max="3000" step="100" inputmode="numeric"></div>
+          <div><label for="pol-vad-pressure">压力起点 ms</label><input id="pol-vad-pressure" type="number" min="0" max="10000" step="100" inputmode="numeric"></div>
         </div>
-        <p class="hint">⚠ 打开否决权会让 App 额外逐帧跑 FireRedVAD（多一张 HTP 会话）；关着时 CAM++ 是唯一权威。</p>
+        <p class="hint">阶梯刻度固定 100 ms —— 它是 PCM 帧(100 ms)与 FireRedVAD 帧(10 ms)的最小公倍数，两个时钟都能精确表达。</p>
 
-        <h2>分段（segment）</h2>
+        <h3 class="sub-h">CAM++ 本人过滤参数</h3>
+        <p id="speaker-model-hint" class="hint">模型依赖按当前 Pipeline 判断。</p>
+        <p id="set-camplus-idle" class="hint" hidden>当前未开启 CAM++ 本人过滤，这几项此刻不生效；改了仍会保存。</p>
         <div class="config-grid">
-          <div><label for="pol-seg-head">句首回溯 ms <em class="when">head_lookback_ms</em></label><input id="pol-seg-head" type="number" min="0" max="3000" step="50" inputmode="numeric"></div>
-          <div><label for="pol-seg-tail">句尾保留 ms <em class="when">tail_keep_ms</em></label><input id="pol-seg-tail" type="number" min="0" max="2000" step="50" inputmode="numeric"></div>
-          <div><label for="pol-seg-grace">续句等待 ms <em class="when">continuation_grace_ms</em></label><input id="pol-seg-grace" type="number" min="0" max="4000" step="100" inputmode="numeric"></div>
+          <div><label for="pol-spk-enter">进入阈值</label><input id="pol-spk-enter" type="number" min="-1" max="1" step="0.01" inputmode="decimal"></div>
+          <div><label for="pol-spk-exit">退出阈值</label><input id="pol-spk-exit" type="number" min="-1" max="1" step="0.01" inputmode="decimal"></div>
+          <div><label for="pol-spk-encf">进入确认窗数</label><input id="pol-spk-encf" type="number" min="1" max="10" step="1" inputmode="numeric"></div>
+          <div><label for="pol-spk-excf">退出确认窗数</label><input id="pol-spk-excf" type="number" min="1" max="10" step="1" inputmode="numeric"></div>
+          <div><label for="pol-spk-window">窗长 ms</label><input id="pol-spk-window" type="number" min="500" max="4000" step="50" inputmode="numeric"></div>
+          <div><label for="pol-spk-step">窗步进 ms</label><input id="pol-spk-step" type="number" min="100" max="1000" step="10" inputmode="numeric"></div>
+          <div><label for="pol-spk-headmode">句首模式</label><select id="pol-spk-headmode"><option value="trim">trim（按位移裁）</option><option value="safe">safe（不裁）</option></select></div>
+          <div><label for="pol-spk-usertimeout">关门倒计时 ms</label><input id="pol-spk-usertimeout" type="number" min="2000" max="120000" step="500" inputmode="numeric"></div>
         </div>
+        <p class="hint">每次确认说话都会重置倒计时。</p>
 
         <h2>历史音频（history）</h2>
-        <p class="note">⭐ 归档不在这里：termux-speech 按 50 句一组滚动，
-          并<strong>始终保留两个活组</strong>，所以未归档的句子池在 50–99 之间；
-          一组被归档时文字进 SQLite、那一组的 WAV 才删。
-          下面这个数字是 App 侧的<strong>安全上限</strong>（防止 speech 不转组时磁盘无限涨），
-          ⛔ 不是保留策略——把它设到 150 以下，App 会抢在归档前删掉还活着的句子。</p>
-        <label for="pol-hist-keep">App 音频上限（条）<em class="when">wav_keep · 立即生效</em></label>
+        <p class="note">App 音频上限是安全上限，不是归档保留数量。建议保持 200；过低可能提前删除未归档录音。</p>
+        <label for="pol-hist-keep">App 音频上限（条）</label>
         <input id="pol-hist-keep" type="number" min="0" max="500" step="10" inputmode="numeric">
 
         <div id="policy-facts" class="facts vc-facts"></div>
@@ -291,11 +347,13 @@
     <details class="card settings-group" open>
       <summary>ASR</summary>
       <form id="form-daily" class="settings-inner">
-        <p class="note">自动转录与手动转录共用 SenseVoice。</p>
+        <!-- ⭐ 与 Overview 的「转录」是同一个控件：同一份 effective 写、同一个 Pipeline PUT 写回。
+             ⛔ 不再有第二个真相（旧 `asr.model` 字段）。 -->
         <label for="asr-model">转写模型</label>
         <select id="asr-model"><option value="sensevoice">SenseVoice</option></select>
         <p id="asr-model-note" class="message"></p>
-        <p id="asr-model-dependency" class="hint">模型需求会跟随当前选择。</p>
+        <p id="set-asr-current" class="hint">当前运行：读取中…</p>
+        <p id="asr-model-dependency" class="hint">模型需求会跟随当前 Pipeline。</p>
         <label for="asr-language">识别语言<em class="when">即时生效</em></label>
         <select id="asr-language"><option value="auto">自动</option><option value="zh">普通话</option><option value="yue">粤语</option><option value="en">English</option><option value="ja">日本語</option><option value="ko">한국어</option></select>
         <div class="form-actions"><p id="daily-note" class="message"></p><button id="save-daily" type="submit">保存 ASR 设置</button></div>
@@ -306,8 +364,12 @@
       <summary>Audio 输入 / Lifecycle</summary>
       <section class="settings-inner">
         <h2>Audio 输入</h2><p id="connection-note" class="note">正在连接 Android App…</p>
-        <p class="hint">这里管理麦克风来源与生命周期。App automatic CAM++/VAD 的执行参数统一在上面的 Product Policy；manual/diagnostics 专用参数不作为 automatic 产品设置。</p>
-        <div class="facts input-facts"><div><span>当前配置</span><strong id="selected">—</strong></div><div><span>实际路由</span><strong id="routed">—</strong></div><div><span>PCM 直连</span><strong id="pcm-state">—</strong></div><div><span>麦克风持有者</span><strong id="mic-holders">—</strong></div></div>
+        <p class="hint">这里管理麦克风来源与收音生命周期。</p>
+        <!-- ⚠ 「PCM 直连」这一格已删：新架构下 PCM 从不离开 App，本包那条 WS 不再是产品路径，
+             把它摆在使用者面前只会让一个必然「等待鉴权」的字段看起来像故障。
+             ⛔ 只删界面事实，App 的麦克风架构一个字节没动。节点作为兼容钩子隐藏保留。 -->
+        <div class="facts input-facts"><div><span>当前配置</span><strong id="selected">—</strong></div><div><span>实际路由</span><strong id="routed">—</strong></div><div><span>永久收音</span><strong id="mic-persistent">—</strong></div><div><span>麦克风持有者</span><strong id="mic-holders">—</strong></div></div>
+        <span id="pcm-state" hidden aria-hidden="true"></span>
         <label for="input-device">输入设备<em class="when">即时生效</em></label><select id="input-device" aria-label="选择 Input Device"><option value="system_default">系统默认</option></select>
         <label>永久收音<em class="when">跨停链与重启</em></label><p class="note">只想用语音链不需要开启；它由你明确关闭。</p>
         <div class="actions"><button id="enable" type="button">开启永久收音</button><button id="disable" class="danger" type="button">关闭永久收音</button></div><p id="action-note" class="message"></p>
@@ -317,7 +379,7 @@
 
     <details class="card settings-group" id="card-models-wrap">
       <summary>模型需求</summary>
-      <div id="card-models"><div class="section-title"><div><h2>模型需求</h2><p class="note">这里显示当前 ASR、VAD、自动说话人 policy 实际需要的 logical model。</p></div><button id="models-refresh" type="button" class="ghost">刷新</button></div><p id="models-summary" class="message"></p><p id="models-freshness" class="note"></p><a id="models-manager-link" class="secondary" href="#" target="_blank" rel="noopener" hidden>模型管理</a><div id="models-list" class="model-list"></div></div>
+      <div id="card-models"><div class="section-title"><div><h2>模型需求</h2><p class="note">这里显示当前 Pipeline（触发 → 断句 → 转录）实际需要的模型。</p></div><button id="models-refresh" type="button" class="ghost">刷新</button></div><p id="models-summary" class="message"></p><p id="models-freshness" class="note"></p><a id="models-manager-link" class="secondary" href="#" target="_blank" rel="noopener" hidden>模型管理</a><div id="models-list" class="model-list"></div></div>
     </details>
   </section>
 

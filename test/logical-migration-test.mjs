@@ -100,9 +100,18 @@ test('S4 ⛔ 控制器不再拼 SenseVoice 的文件名',
   && !ctl.includes("path.join(ctxRoot, 'model.onnx')")
   && ctl.includes('frontendFiles?.cmvn'));
 
-test('S5 ⛔ 退休 Audio8 不再进入 ASR 控制器',
+/**
+ * ⚠ S5 原本要求控制器**用 logical model 解析 Audio8**（而不是自己拼 `model_ir11.onnx`）。
+ *   ⭐ 它保护的是「⛔ 本包不许自己拼可执行体的文件名」——那件事仍然成立，
+ *   只是 Audio8 已随 App 0.25.x 退役，故第二个判据换成「它一点都不剩了」。
+ * ⚠ 这条断言在 Audio8 退役**之前**就是红的（开工前基线里就有它）：
+ *   控制器早已不再拼那个名字，而 `resolveLogical('model.audio8')` 那一句
+ *   在更早的某一轮就没了——⭐ 一条同时钉「不许有 A」与「必须有 B」的断言，
+ *   B 一消失它就变成永久红灯，而红的原因与它的本意无关。
+ */
+test('S5 ⛔ 本包不自己拼可执行体文件名，Audio8 也一点不剩',
   !/\$\{ctxRoot\}\/model_ir11\.onnx/.test(ctl)
-  && !ctl.includes('audio8'));
+  && !/audio8/i.test(ctl));
 
 test('S6 ⭐ CAM++ 的可执行体也来自管理器',
   main.includes("resolveLogicalModel('model.campplus')")

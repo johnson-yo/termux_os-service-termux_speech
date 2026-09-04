@@ -441,7 +441,7 @@ const feed = async (gate, frames, { amplitude = 4000, startMono = 10_000 } = {})
      */
     return main.includes('syncRmsObserver();')
       && !main.includes("consumers.setEnabled('rms', on);")
-      && main.includes("consumers.setEnabled('vad', on && listenEngaged());")
+      && main.includes("consumers.setEnabled('vad', on && fireRedSelected());")
       && main.includes('const applyChainConsumers = (on) =>')
       && main.includes('applyChainConsumers(true)')
       && main.includes('applyChainConsumers(false)');

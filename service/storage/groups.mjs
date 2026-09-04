@@ -23,6 +23,11 @@ export const GROUP_SIZE = 50;
 export const STATE_SCHEMA = 'termux-os.speech-records-state.v1';
 export const ITEM_SCHEMA = 'termux-os.speech-record-item.v1';
 
+/** 往回看几条就够：重开总是紧跟着上一条定稿发生（真机实录相隔 <2 s）。 */
+const DUPLICATE_WINDOW_LOOKBACK = 5;
+/** 单调时钟会在重启/换代时归零；不限时间窗的话旧记录能"包含"新记录。 */
+const DUPLICATE_WINDOW_MAX_AGE_MS = 60_000;
+
 const pad = (value) => String(value).padStart(6, '0');
 const groupIdFor = (seq) => `group-${pad(seq)}`;
 
@@ -98,10 +103,13 @@ export class RecordGroups {
      * ⭐ **最新的那一句**，两条处理门共用的唯一来源。
      *
      * ⚠ 概览页曾读记录组、诊断页读 `asr.transcripts.last`（那是 **SenseVoice 控制器**
-     *   自己的最后一条）——于是选 Audio8 时诊断页永远显示「尚未产生转写」，而句子
+     *   自己的最后一条）——于是选另一个 backend 时诊断页永远显示「尚未产生转写」，而句子
      *   正在一条条落库。两个页面问的是同一个问题，就必须读同一个字段。
      */
     this.lastSentence = null;
+    /** 被「音频区间已提交」判据挡掉的次数。⛔ 静默丢弃 = 查不出来的丢弃。 */
+    this.suppressedDuplicates = 0;
+    this.lastSuppressed = null;
     /**
      * ⭐ transcript feed 的游标（docs/061 §七）。
      *
@@ -246,6 +254,19 @@ export class RecordGroups {
     const items = this.readItems(group.group_id);
     if (items.some((item) => item.segment_id === segmentId)) {
       return { admitted: false, reason: 'duplicate_segment', segment_id: segmentId };
+    }
+    const covered = this.#alreadyCommittedWindow(segment);
+    if (covered) {
+      this.suppressedDuplicates += 1;
+      this.lastSuppressed = {
+        segment_id: segmentId,
+        covered_by: covered.segment_id,
+        start_ms: segment.start_ms ?? null,
+        end_ms: segment.end_ms ?? null,
+        at: new Date(this.now()).toISOString(),
+      };
+      return { admitted: false, reason: 'audio_window_already_committed', segment_id: segmentId,
+        covered_by: covered.segment_id };
     }
     const appOwned = segment.source_kind === 'app_segment' || segment.source === 'app_segment';
     const wavPath = path.join(this.groupDir(group.group_id), `${segmentId}.wav`);
@@ -460,6 +481,47 @@ export class RecordGroups {
   }
 
   /**
+   * ⭐ **同一段音频不许变成两条句子**（docs/097 §十九）。
+   *
+   * 判据是**音频区间的包含关系**，⛔ 不是「文字长得一样」——后者会把一个人
+   * 真的说了两遍的同一句话删掉一条，而那是使用者的数据。
+   *
+   * 真机实录（boundary journal seq 429–438）：seg-159 在 rev2 定稿并关段之后，
+   * 同一个 candidate 27 的 `full_shutter` 又来了；此时 coordinator 里没有活动段落，
+   * 于是它**用那个 candidate 的 effective onset 重新开了 seg-160**，
+   * 区间与 seg-159 逐毫秒相同（34081076..34089876），转出来的字自然一模一样。
+   * ⇒ 根因在 App 的 [SegmentCoordinator]（见报告），这里是**记录层的兜底**：
+   *   一段已经被完整提交过的音频，不该因为被转写第二次而在历史里多出一行。
+   *
+   * ⚠ 三条收紧，缺一不可：
+   *   ① 只看**最近几条**（重开总是在几秒内发生）；
+   *   ② 两条都必须带完整区间；
+   *   ③ 参照那条必须是**刚刚**落库的——单调时钟会在重启/换代时归零，
+   *      不限时间窗的话，重启前的一条长记录能"包含"重启后的一条新记录。
+   */
+  #alreadyCommittedWindow(segment) {
+    const start = Number(segment?.start_ms);
+    const end = Number(segment?.end_ms);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+    const nowMs = this.now();
+    let seen = 0;
+    for (const group of [...this.liveGroups()].reverse()) {
+      for (const item of this.readItems(group.group_id).reverse()) {
+        if (seen >= DUPLICATE_WINDOW_LOOKBACK) return null;
+        seen += 1;
+        if (item.status !== 'succeeded') continue;
+        const at = Date.parse(item.completed_at ?? item.created_at ?? '');
+        if (!Number.isFinite(at) || nowMs - at > DUPLICATE_WINDOW_MAX_AGE_MS) return null;
+        const prevStart = Number(item.segment_start_ms);
+        const prevEnd = Number(item.segment_end_ms);
+        if (!Number.isFinite(prevStart) || !Number.isFinite(prevEnd)) continue;
+        if (prevStart <= start && prevEnd >= end) return item;
+      }
+    }
+    return null;
+  }
+
+  /**
    * 按 segment_id 找一条记录，**跨全部活组**。
    *
    * ⚠ 不要用 `recent()` 代替它。`recent` 是一个**显示用**的窗口（上限 50 条），
@@ -555,6 +617,9 @@ export class RecordGroups {
       groups_on_disk: live.length,
       last_rotation: this.lastRotation,
       archive: this.archive?.stats() ?? null,
+      /** ⭐ 被「音频区间已提交」挡掉的重复。看得见的重复只是待办，看不见的才是债。 */
+      suppressed_duplicates: this.suppressedDuplicates ?? 0,
+      last_suppressed: this.lastSuppressed ?? null,
       last_error: this.lastError,
     };
   }

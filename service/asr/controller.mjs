@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: Apache-2.0
  * [INPUT]: Staged VAD WAVs, ASR config, Pipeline lease snapshots, the App graph HTP API,
  *          and `../storage/text.mjs` for the one blank judgement.
- * [OUTPUT]: Multi-backend transcripts, record-group admission (`onResult`), an incremental feed,
+ * [OUTPUT]: SenseVoice transcripts, record-group admission (`onResult`), an incremental feed,
  *           bounded blank-discard diagnostics, and the standby hand-back when idle.
  * [POS]: WAV-only backend stage; it never reads PCM/Pool or controls VAD segmentation.
  *        ⭐ It is also the **admission point**: a segment becomes a record only once this stage has a
@@ -23,6 +23,7 @@ import {
   tensorSpec,
 } from './features.mjs';
 import { ResidentGraph } from '../residents.mjs';
+import { executableGraphArgs } from '../logical-models.mjs';
 import { BlankStats, normalizeTranscript } from '../storage/text.mjs';
 
 /**
@@ -188,17 +189,27 @@ export class AsrController {
     this.target = target;
     this.modelReady = Boolean(this.executablePath && this.cmvnPath && this.tokensPath);
     /**
-     * ⚠ 兼容：`ctxPath` / `modelPath` 这两个名字仍被下面的 `ResidentGraph` 使用。
-     * ⭐ 现在它们指向**同一个** executable —— 因为对 App 来说「用哪一份」这件事
-     *   已经在上游决定完了。`ctx_path` 走的是 App 那条「外来 artifact 不许删」的路径。
+     * ⭐ **路由规则只有一处**：`executableGraphArgs`（`logical-models.mjs`）。
+     *
+     * ⚠ 这里以前是手写的 `ctxPath = executablePath; modelPath = null` —— 结论**是对的**，
+     *   但它是这个文件自己得出的。同一条结论在另外三个 FireRedVAD 消费者里就没有被得出，
+     *   而那正是 `EP_CONTEXT_AS_MODEL_PATH` 的来源。
+     * ⭐ **一条正确但只写在一个文件里的规则，和一条没有写下来的规则，寿命一样长。**
+     * ⚠ `ctxKey` 也由它给（绑版本），⛔ 不再是裸的 `'sensevoice'`：
+     *   旧版本编出来的 ctx 不许被当成新版本的可执行体。
      */
-    this.ctxPath = this.executablePath;
-    this.modelPath = null;
+    const routed = executableGraphArgs({
+      executable: this.executablePath
+        ? { path: this.executablePath, kind: this.executableKind }
+        : null,
+    });
+    this.ctxPath = routed?.ctxPath ?? null;
+    this.modelPath = routed?.modelPath ?? null;
     this.graph = new ResidentGraph({
       android,
       id: residentId,
       model: 'sensevoice',
-      ctxKey: 'sensevoice',
+      ctxKey: routed?.ctxKey ?? null,
       // ⭐ 給絕對路徑，不只給名字（VAD 那邊踩過：只給名字時 cmvn 來自 asset store
       // 而**圖來自舊裸路徑**，兩份都在時看起來完全正常）。
       modelPath: this.modelPath,
@@ -423,6 +434,43 @@ export class AsrController {
   }
 
   /**
+   * ⭐ **可执行体是一个会迟到的事实，⛔ 不是一个只在开机为真的常量。**
+   *
+   * ⚠ 真机复现两次：speech 比模型管理器先起来时，启动那一刻解析不到伴生文件，
+   *   于是 SenseVoice 永远报 `model_not_enabled`，而**重启一次 speech 就好了**。
+   *   docs/101 的同一条：**一个只在开机试一次的解析，等于把一次瞬时故障变成永久故障**。
+   *
+   * ⛔ 已经声明过常驻时不许就地改路径：App 的对账器看到「声明有、实际也有」会跳过，
+   *   改 spec 不触发重载（docs/054 §4.4）。故只在**还没就绪**时接受更新——
+   *   那正是这个缺口存在的全部场景。
+   * @returns 有没有真的换过（供调用方决定要不要说出来）
+   */
+  applyLogical({ executablePath, executableKind, frontendFiles, target } = {}) {
+    if (this.modelReady) return false;
+    const cmvn = frontendFiles?.cmvn ?? null;
+    const tokens = frontendFiles?.tokens ?? null;
+    if (!executablePath || !cmvn || !tokens) return false;
+    this.executablePath = executablePath;
+    this.executableKind = executableKind ?? null;
+    this.cmvnPath = cmvn;
+    this.tokensPath = tokens;
+    if (target) this.target = target;
+    const routed = executableGraphArgs({
+      executable: { path: this.executablePath, kind: this.executableKind },
+    });
+    this.ctxPath = routed?.ctxPath ?? null;
+    this.modelPath = routed?.modelPath ?? null;
+    this.graph.configure({
+      ctxKey: routed?.ctxKey ?? null,
+      modelPath: this.modelPath,
+      ctxPath: this.ctxPath,
+    });
+    this.modelReady = true;
+    this.onChange();
+    return true;
+  }
+
+  /**
    * 保证常驻声明存在，且 heal 带着**正确的**输出名。
    *
    * 输出名（`ctc_logits` 还是 `_ctc_logits`）是模型的静态属性，旧实现为了问出它做
@@ -470,7 +518,7 @@ export class AsrController {
     this.onChange();
     return this.graph.snapshot();
   }
-  /** 处理门切换前的正式准备动作。当前唯一 backend 是 SenseVoice。 */
+  /** 处理门切换前的正式准备动作；每个 backend 都走自己的正式 runtime seam。 */
   async prepareBackend(variant = this.config.model ?? 'sensevoice') {
     if (variant === 'sensevoice') {
       if (!this.modelReady) return { backend: variant, ready: false };
@@ -577,7 +625,7 @@ export class AsrController {
       language: this.config.language,
       /** 当前唯一执行体，运行时事实与配置/selector保持同一来源。 */
       model: {
-        id: 'sensevoice',
+        id: job.ran_backend ?? this.config.model ?? 'sensevoice',
         runtime: 'android-app-ort-qnn-htp',
         precision: 'qnn-context',
         htp: this.target?.htp ?? null,
@@ -816,6 +864,9 @@ export class AsrController {
     const filesPresent = senseVoice.files.length > 0 && senseVoice.files_present;
     const senseReady = this.modelReady && filesPresent
       && (this.graph.declared || this.lastErrorBackend !== 'sensevoice');
+    /** ⭐ 只剩一个 backend，但 `variant` 这一层留着：它是**运行时事实**的名字，
+     *   ⛔ 不是「有几个选项」的函数。⚠ 持久化的旧 backend 值在 [config.mjs] 那一层
+     *   已经被强制成 `sensevoice` 并如实说出来。 */
     const variant = 'sensevoice';
     const selected = {
       id: variant,

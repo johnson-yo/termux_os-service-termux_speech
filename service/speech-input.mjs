@@ -30,6 +30,7 @@ export function projectSpeechInput({
     && Number(rmsStream.last_frame_age_ms) <= 1000;
   const recording = mic?.recording === true;
   const pool = vad?.pcm_pool ?? null;
+  const camPlusMode = String(vadMode).startsWith('campplus');
   return {
     schema: SPEECH_INPUT_SCHEMA,
     capability: 'speech.input',
@@ -66,6 +67,17 @@ export function projectSpeechInput({
       binary_frames: Number(rmsStream?.binary_frames) || 0,
       payload_exposed_by_capability: false,
     },
+    /**
+     * ⭐ **麦克风的需求聚合必须投影出来。**
+     *
+     * ⚠ 这个字段以前不在这里，而页面读的是 `value?.demand` ⇒ 恒为 `undefined`
+     *   ⇒ `holders ?? []` 给出一个**合法的空数组** ⇒ 「麦克风持有者」永远显示
+     *   「无人持有 · 已释放」。于是使用者按下「关闭永久收音」之后，提示说已关闭、
+     *   持有者说无人持有，**而麦克风还在录**——屏幕上没有一个字是真的（docs/056 家族）。
+     * ⭐ 原样透传 App 的对象：`user_persistent` 是那个按钮**自己**的状态，
+     *   `holders`/`other_holders` 才回答「凭什么还在采集」。
+     */
+    demand: mic?.demand ?? null,
     rms_gate: rmsGate,
     pcm_pool: pool,
     pipeline,
@@ -73,9 +85,9 @@ export function projectSpeechInput({
     vad,
     asr,
     downstream: {
-      path: vadMode === 'camplus_automatic'
+      path: camPlusMode
         ? 'pcm_to_rms_to_camplus_vad_to_wav_to_asr_text'
-        : vadMode === 'fireredvad_manual'
+        : String(vadMode).startsWith('fireredvad')
           ? 'pcm_to_rms_to_fireredvad_to_wav_to_asr_text'
           : 'pcm_to_rms_to_vad_to_wav_to_asr_text',
       vad_mode: vadMode,
@@ -85,19 +97,19 @@ export function projectSpeechInput({
       stages: [
         { id: 'rms', role: 'open_admission', connected: rmsGate?.available === true
           && rmsStream?.connected === true },
-        { id: 'pool', role: vadMode === 'camplus_automatic'
+        { id: 'pool', role: camPlusMode
           ? 'camplus_preroll_only' : 'fireredvad_preroll_only',
           connected: pool?.connected === true },
-        { id: 'vad', role: vadMode === 'camplus_automatic'
+        { id: 'vad', role: camPlusMode
           ? 'camplus_user_to_wav' : 'fireredvad_staircase_to_wav',
-          connected: vadMode === 'camplus_automatic'
+          connected: camPlusMode
             ? true : vad?.model?.files_present === true },
         { id: 'asr', role: 'wav_to_text_only', connected: asr?.ready === true },
       ],
     },
     storage: {
       hot_pcm_owner: 'termux-speech',
-      hot_pcm_scope: vadMode === 'camplus_automatic'
+      hot_pcm_scope: camPlusMode
         ? 'process-memory-rolling-camplus-preroll' : 'process-memory-after-rms-admission',
       rms_transport: 'authenticated_app_loopback_rms_ws',
       raw_pcm_transport: 'authenticated_app_loopback_pcm_ws_on_demand',

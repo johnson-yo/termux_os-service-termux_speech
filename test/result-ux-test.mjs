@@ -154,8 +154,14 @@ test('U15 App 私有绝对路径不进 records', !/wav_path: r\.archive_wav/.tes
   test('U18 ⭐ App 段落的音频可用性由结构保证（活组 + App 上限高于活跃池天花板）',
     row.audio_available === true && row.audio_source === 'app');
 
+  /**
+   * ⚠ 这两段原本共用同一个时间窗（0–800ms），于是第二条被
+   *   `audio_window_already_committed` 去重挡掉——⭐ 那是**正确**的产品行为
+   *   （同一段音频不许落两条记录），只是它比这条测试晚出现，而测试没跟上。
+   * ⛔ 修 fixture，不动产品：给它一个自己的窗。
+   */
   const speechOwned = g.admit({ segment_id: 'seg-21', source_kind: 'vad_segment', wav_path: null,
-    start_ms: 0, end_ms: 800, duration_ms: 800 },
+    start_ms: 1000, end_ms: 1800, duration_ms: 800 },
   { status: 'succeeded', text: '手动那条', revision: 1, backend: 'sensevoice' });
   const manual = g.recent(5).find((i) => i.segment_id === 'seg-21');
   test('U19 ⛔ 非 App 段落不许被这条规则顺手标成可用',

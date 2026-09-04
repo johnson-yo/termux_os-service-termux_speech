@@ -4,7 +4,7 @@
 本文列出的字段与语义是冻结面；未在本文出现的一律是内部实现，随时可能改名或消失。
 
 - Package: `github.termux-os.service.termux-speech`
-- Version: **0.22.5**
+- Version: **0.24.1**
 - Capability: **`speech.state`**（`kind: action`）
 - Schema: **`termux-os.speech-product-state.v1`**
   ⚠ 不是 `termux-os.speech-state.v1`——那个名字属于状态流的**信封**

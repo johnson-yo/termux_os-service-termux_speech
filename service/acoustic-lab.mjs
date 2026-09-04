@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: Apache-2.0
  * [INPUT]: 与正式链**同一条** PCM WS 上分流来的帧（consumer `lab`）+ 自己那张 FireRedVAD 常驻图
  * [OUTPUT]: 对外提供「录参考值 → 看实时 RMS/VAD → 看 KEEP/DROP → 听 HALF/FULL WAV」的实验工具
- * [POS]: docs/078。⛔ **这条链到 WAV 为止**——不进 SenseVoice、不进 Audio8、
+ * [POS]: docs/078。⛔ **这条链到 WAV 为止**——不进 SenseVoice、
  *        不 `records.admit`、不占 50 句 group。所有事件都带 `source=acoustic_lab, debug_only=true`。
  *
  * ⭐ 为什么要有自己的一张 VAD 图：正式 `VadController` 那张是**有状态的流**
@@ -89,16 +89,28 @@ const modalOf = (values, binDb = 2) => {
 };
 
 export class AcousticLab {
-  constructor({ android, modelFile = null, cmvnFile = null, dataRoot, residentId, onChange = () => {} }) {
+  /** @param graph 已经路由好的图参数（见 `executableGraphArgs`）；⛔ 不是裸路径。 */
+  constructor({ android, graph = null, cmvnFile = null, dataRoot, residentId, onChange = () => {} }) {
     this.android = android;
     /** 两条路径都来自 FireRedVAD logical descriptor，⛔ 类内不拼 source 文件名。 */
-    this.modelPath = modelFile;
+    this.executable = graph ?? null;
+    this.modelPath = graph?.path ?? null;
     this.cmvnPath = cmvnFile;
+    /** ⭐ 与 [VadController.applyLogical] 同一件事：可执行体是会迟到的事实。 */
+    this.applyLogical = ({ graph: g, cmvnFile: c } = {}) => {
+      if (this.modelPath && this.cmvnPath) return false;
+      if (!g?.path || !c) return false;
+      this.executable = g; this.modelPath = g.path; this.cmvnPath = c;
+      return true;
+    };
     this.dataRoot = path.resolve(dataRoot);
     this.onChange = onChange;
     this.graph = new ResidentGraph({
       android, id: residentId, model: 'fireredvad',
-      modelPath: this.modelPath, estMemMb: LAB_EST_MEM_MB,
+      modelPath: graph?.modelPath ?? null,
+      ctxPath: graph?.ctxPath ?? null,
+      ctxKey: graph?.ctxKey ?? null,
+      estMemMb: LAB_EST_MEM_MB,
     });
     this.cmvn = null;
 

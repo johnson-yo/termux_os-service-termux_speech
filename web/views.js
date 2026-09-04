@@ -37,17 +37,30 @@
 
   const deviceName = (device) => {
     if (!device) return '系统默认';
-    return String(device.product_name || device.type_name || '未知输入设备');
+    const type = String(device.type_name ?? '').toLowerCase();
+    const raw = `${device.address ?? ''} ${device.product_name ?? ''}`.toLowerCase();
+    const position = raw.includes('bottom') ? '底部'
+      : raw.includes('back') || raw.includes('rear') ? '后置'
+        : raw.includes('front') || raw.includes('top') ? '前置' : null;
+    if (type === 'built_in_mic' || type === 'builtin_mic') {
+      return `本机${position ? ` · ${position}` : ''} · 麦克风`;
+    }
+    const route = ROUTE_LABELS[type] ?? null;
+    if (route) {
+      const kind = type.includes('mic') ? '麦克风'
+        : type.includes('head') ? '耳机' : type.includes('usb') ? '音频设备' : '音频路由';
+      return `${route} · ${kind}`;
+    }
+    return device.product_name
+      ? String(device.product_name)
+      : `本机麦克风 · id:${device.id ?? '未知'}`;
   };
   const deviceDetail = (device) => {
     if (!device) return 'Android 自动选择实际路由';
-    return [device.type_name, device.address].filter(Boolean).join(' · ') || 'Android 输入设备';
+    return deviceName(device);
   };
   const labelDevice = (device) => {
-    if (!device) return '系统默认';
-    const title = deviceName(device);
-    const detail = deviceDetail(device);
-    return title === detail ? title : `${title} · ${detail}`;
+    return deviceName(device);
   };
 
   /**
@@ -104,6 +117,14 @@
     sensevoice: 'SenseVoice',
   });
   const modelLabel = (id) => MODEL_LABELS[id] ?? String(id ?? '—');
+
+  const vadProvider = (vad, cam) => {
+    const mode = String(cam?.vad_mode ?? '');
+    if (mode.startsWith('fireredvad')) return 'fireredvad';
+    if (mode.startsWith('campplus')) return 'campplus';
+    return vad?.config?.provider === 'fireredvad' ? 'fireredvad' : 'campplus';
+  };
+  const vadLabel = (provider) => provider === 'fireredvad' ? 'FireRedVAD' : 'CAM++';
 
   const ROUTE_LABELS = Object.freeze({
     built_in: '内建',
@@ -197,7 +218,10 @@
     if (value && value.ready !== true && value.reason) {
       push('bad', `收音不可用：${REASON_TEXT[value.reason] ?? value.reason}`);
     }
-    if (live?.vad?.model?.files_present === false) push('bad', 'FireRedVAD 模型文件缺失');
+    const provider = vadProvider(live?.vad, live?.speaker_activity);
+    if (provider === 'fireredvad' && live?.vad?.model?.files_present === false) {
+      push('bad', 'FireRedVAD 模型文件缺失');
+    }
     // 问的是「我选的 backend 能不能工作」，文件型和 App session 型各自回答。
     const selected = live?.asr?.model?.selected;
     if (selected?.ready === false) {
@@ -660,13 +684,18 @@
   }
 
   function renderVad(vad, cam, listen, pipeline) {
-    const probability = number(vad?.activity?.probability);
-    const active = vad?.activity?.active === true;
+    const provider = vadProvider(vad, cam);
+    const providerName = vadLabel(provider);
+    const fireRed = provider === 'fireredvad';
+    const probability = number(fireRed ? vad?.activity?.probability : cam?.last_similarity);
+    const active = fireRed
+      ? vad?.activity?.active === true
+      : ['USER', 'MAYBE_USER', 'MAYBE_END'].includes(String(cam?.current_activity_state ?? ''));
     const handoff = vad?.handoff?.active === true;
     const camLive = cam?.active === true || cam?.automatic_cam_live === true;
     const last = vad?.wav?.last_segment;
-    const mode = listen?.engaged === true ? 'FireRedVAD · 手动'
-      : cam?.vad_mode === 'camplus_automatic' ? 'CAM++VAD · 自动' : '未启用';
+    const mode = cam?.vad_mode?.endsWith('_manual') ? `${providerName} · 手动`
+      : cam?.vad_mode?.endsWith('_automatic') ? `${providerName} · 自动` : '未启用';
     setText($('vad-mode'), `VAD 模式：${mode}`);
     $('vad-probability').textContent = fixed(probability, 3);
     $('vad-countdown').textContent = seconds(vad?.countdown?.remaining_ms);
@@ -675,9 +704,9 @@
     $('vad-fill').className = `vad-fill ${active ? 'speech' : ''}`.trim();
     $('vad-live-label').textContent = active ? '语音中' : handoff ? '寻找切点' : '待机';
     setText($('vad-owner'), pipeline?.owner ?? (listen?.engaged ? 'speech.vad' : 'speech.rms'));
-    setText($('vad-live'), listen?.engaged
-      ? (active || handoff ? 'FireRedVAD 正在处理' : 'FireRedVAD 等待声音')
-      : camLive ? 'CAM++ live inference' : 'CAM++ waiting for RMS');
+    setText($('vad-live'), fireRed
+      ? (active || handoff ? `${providerName} 正在处理` : `${providerName} 等待声音`)
+      : camLive ? `${providerName} live inference` : `${providerName} waiting for RMS`);
     qs('.vad-meter')?.setAttribute('aria-valuenow', String(probability ?? 0));
     setBadge($('vad-state'), active ? 'SPEECH' : handoff ? 'PROCESSING' : 'IDLE', active || handoff ? 'ok' : '');
     setNote($('vad-note'), vad?.last_error
@@ -685,9 +714,11 @@
       : handoff
         ? `回溯 ${seconds(vad?.handoff?.pre_roll_ms)} · 推理 ${vad?.last_inference_ms ?? '—'} ms · 梯度切句 ${
           vad?.gradient?.cuts ?? 0} 次`
-        : `模型${vad?.model?.files_present ? '已就绪' : '缺失'} · ${
-          listen?.engaged ? '手动 FireRedVAD' : camLive ? '自动 CAM++ live' : '等待 RMS 准入'}`,
-    vad?.last_error ? 'bad' : vad?.model?.files_present ? 'good' : 'bad');
+        : fireRed
+          ? `模型${vad?.model?.files_present ? '已就绪' : '缺失'} · ${
+            listen?.engaged ? `手动 ${providerName}` : `自动 ${providerName}`}`
+          : `${providerName} ${camLive ? '正在接收声音' : '等待 RMS 准入'}`,
+    vad?.last_error ? 'bad' : (!fireRed || vad?.model?.files_present) ? 'good' : 'bad');
     $('vad-last-wav').textContent = last?.wav_path ?? '尚未产出';
     $('vad-last-wav-detail').textContent = last
       ? `${last.duration_ms} ms · trim ${last.trim?.leading_non_speech_ms ?? 0} ms · 本次运行第 ${
@@ -708,18 +739,27 @@
           lastDrop ? ` · 最后一次：${DROP_REASONS[lastDrop.reason] ?? lastDrop.reason}` : ''}`;
   }
 
-  function renderAsr(asr, pipeline, asrBackend) {
+  /**
+   * @param ap `app_pipeline` 域。⭐ **转录层的身份与状态以它为准**——
+   *   `asr.model.selected` 是本包 conf 里的第二个真相，真机上它能与 App 的
+   *   effective 长期不一致而毫无提示（Header 说 SV、实际在跑 A8）。
+   */
+  function renderAsr(asr, pipeline, asrBackend, ap) {
     const owner = pipeline?.owner ?? 'speech.rms';
     const authoritative = asr?.authority?.active === true && owner === 'speech.asr';
-    const state = asr?.state?.toUpperCase() ?? 'IDLE';
+    const effAsr = ap?.effective?.asr ?? null;
+    const appAsr = ap?.asr ?? {};
+    /** ⭐ 状态取 App 的段落状态；读不到才回落本包（⛔ 不反过来）。 */
+    const state = String(appAsr.active === true ? 'TRANSCRIBING'
+      : appAsr.state ?? asr?.state ?? 'IDLE').toUpperCase();
     const selected = asr?.model?.selected;
     const runtimeReady = selected?.ready === true;
     setBadge($('asr-state'), state,
-      asr?.last_error ? 'bad' : ['QUEUED', 'TRANSCRIBING', 'LISTENING'].includes(state) ? 'ok' : '');
+      asr?.last_error ? 'bad' : ['QUEUED', 'TRANSCRIBING', 'LISTENING', 'CAPTURING'].includes(state) ? 'ok' : '');
     $('asr-owner').textContent = authoritative ? 'speech.asr' : owner;
     $('asr-countdown').textContent = seconds(asr?.ending?.remaining_ms);
     $('asr-total').textContent = String(asr?.transcripts?.total ?? 0);
-    const modelName = modelLabel(selected?.id ?? asr?.model?.model ?? 'sensevoice');
+    const modelName = modelLabel(effAsr ?? selected?.id ?? asr?.model?.model ?? 'sensevoice');
     const htp = asr?.model?.htp ?? 'v73';
     const qnn = asr?.model?.qnn ? `QNN ${asr?.model?.qnn}` : 'QNN 2.47';
     setBadge($('asr-precision'), `${modelName} (${htp}|${qnn})`, 'tag');
@@ -749,7 +789,7 @@
     const autoReady = asrBackend?.automatic_ready;
     const lastAsrError = asrBackend?.app_asr_error ?? null;
     facts($('asr-model-facts'), [
-      ['当前档位', modelLabel(selected?.id ?? asr?.model?.model)],
+      ['当前档位（App effective）', effAsr ? modelLabel(effAsr) : '正在读取…'],
       ['选中档位状态', selected?.ready === true ? '已就绪'
         : selected?.reason ?? '无法判定'],
       ['自动转写可执行', autoReady === true ? '可执行'
@@ -767,7 +807,7 @@
         : []),
       ['运行时', asr?.model?.runtime],
       ['当前 session', asr?.model?.session ?? (selected?.session_loaded ? 'App session' : null)],
-      ['SenseVoice 资产', asr?.model?.files_present === true ? '已就位'
+      [`${modelName} 运行状态`, asr?.model?.files_present === true || runtimeReady ? '已就位'
         : asr?.model?.files_present === false ? '缺失' : null],
       ['CTC 输出名', asr?.model?.output_name],
       ['队列深度', asr?.queue?.depth],
@@ -814,8 +854,10 @@
               fixed(gate?.open_threshold, 3)}${gate?.open_armed === false ? '（且需先掉回阈值以下重置）' : ''}。`);
 
       const vad = live.vad;
-      if (vad?.model?.files_present !== true) add('bad', 'FireRedVAD 模型文件缺失，切段无法工作。');
-      else if (vad?.last_error) add('bad', `切段异常：${vad.last_error}`);
+      const provider = vadProvider(vad, live.speaker_activity);
+      if (provider === 'fireredvad' && vad?.model?.files_present !== true) {
+        add('bad', 'FireRedVAD 模型文件缺失，切段无法工作。');
+      } else if (vad?.last_error) add('bad', `切段异常：${vad.last_error}`);
       else if (vad?.activity?.processed_frames > 0) {
         add('ok', `切段正常：已处理 ${vad.activity.processed_frames} 帧，本次运行产出 ${
           vad?.wav?.segments_published ?? 0} 段。`);
@@ -837,12 +879,14 @@
 
       /** 常驻图是资源事实，不能冒充当前 active；当前活动看明确的 live 投影。 */
       const cam = live.speaker_activity;
-      if (cam?.vad_mode === 'camplus_automatic') {
+      if (cam?.vad_mode === 'campplus_automatic') {
         add(cam.active === true ? 'ok' : 'warn', cam.active === true
           ? 'CAM++ 正在接收 RMS 准入的 PCM。'
           : 'CAM++ 图已就绪，但 RMS 未准入，当前没有 CAM++ 推理。');
-      } else if (listen?.engaged) {
-        add('ok', '手动模式由 FireRedVAD 接收 PCM。');
+      } else if (cam?.vad_mode?.startsWith('fireredvad')) {
+        add(vad?.activity?.active === true ? 'ok' : 'warn',
+          listen?.engaged ? '手动模式由 FireRedVAD 接收 PCM。'
+            : '自动模式由 FireRedVAD 接收 PCM。');
       }
 
       /**

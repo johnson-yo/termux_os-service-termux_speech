@@ -41,13 +41,20 @@ export class CamPlusEmbedder {
    *   运行时才用 HTP（实测两侧 centroid cos=0.999992，见 INTEGRATION_READINESS.md）。
    */
   constructor({ android, residentId, modelPath, estMemMb = 32,
-                backend = 'cpu', ctxPath = null }) {
+                backend = 'cpu', ctxPath = null, resolveModelPath = null }) {
     this.modelPath = modelPath;
+    /** 用时解析的兜底（见 [ensure]）。⛔ 不是「另一个来源」，是**同一个**来源晚一点问。 */
+    this.resolveModelPath = resolveModelPath;
     this.backend = backend;
     this.ctxPath = ctxPath;
+    /**
+     * ⭐ 登记用的 CAM++ 是 **CPU + 动态长度**的临时会话。
+     * ⛔ 它与 App 那张常驻 `app-speaker-cam`（HTP、固定 `[1,148,80]`）**不是同一张图**，
+     *   也不该常驻：登记是罕见的一次性动作，而那张图吃不下整段任意长度的录音。
+     */
     this.graph = new ResidentGraph({
       android, id: residentId, model: 'campplus',
-      modelPath, backend, ctxPath, estMemMb, priority: 40,
+      modelPath, backend, ctxPath, estMemMb, priority: 40, ephemeral: true,
     });
     this.lastError = null;
     this.lastMs = null;
@@ -65,7 +72,26 @@ export class CamPlusEmbedder {
   /** 释放这张图（只在 docs/084 验收模式用；⛔ 常驻声纹门不该 churn HTP 会话）。 */
   async release() { try { await this.graph.undeclare(); } finally { this.lastError = null; } }
 
+  /**
+   * ⭐ **登记用的那张图改成用时解析。**
+   *
+   * ⚠ 它只在使用者点「登记」时才用到，而旧代码在**服务启动那一刻**把它解析成一个常量。
+   *   真机复现过两种失败，且都不报错、只在几分钟后表现成一句 `CAM++ model missing`：
+   *   ① Manager 比本服务晚起一秒 ⇒ 整个 descriptor 拿不到；
+   *   ② Manager 答了话但 `companions` 还没派生完 ⇒ **答案完整合法，只是少了这一项**。
+   * ⭐ 启动时解析一个只在人点按钮时才需要的东西，等于把一次瞬时竞态变成永久故障。
+   * ⛔ 解析不到仍然明确失败，不猜路径、不回落。
+   */
+  setModelPath(next) {
+    if (!next || next === this.modelPath) return;
+    this.modelPath = next;
+    this.graph.modelPath = next;
+  }
+
   async ensure() {
+    if (!this.filesPresent && typeof this.resolveModelPath === 'function') {
+      this.setModelPath(await this.resolveModelPath().catch(() => null));
+    }
     if (!this.filesPresent) throw new Error(`CAM++ model missing: ${this.modelPath}`);
     await this.graph.declare();
     return this.graph.snapshot();

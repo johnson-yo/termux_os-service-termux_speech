@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: Apache-2.0
  * [INPUT]: config 的 ASR selector 与迁移函数
  * [OUTPUT]: docs/074 §27 点名的 selector / 迁移 / 互斥契约回归
- * [POS]: ⭐ 这套钉的是「退休不是藏起来」：旧值必须一次迁移并写回合法配置，不能继续运行旧后端。
+ * [POS]: ⭐ 这套钉的是产品 selector 与实际 runtime 一致；Qwen 迁移，Audio8 保持正式可选。
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 import fs from 'node:fs';
@@ -33,13 +33,19 @@ const read = (p) => fs.readFileSync(path.join(root, p), 'utf8');
 
 // ---------------------------------------------------------------- selector
 
-test('selector 恰好只剩 sensevoice',
-  ASR_MODELS.length === 1 && ASR_MODELS[0] === 'sensevoice');
+/**
+ * ⚠ 这三条原本钉的是「selector 有 SenseVoice 与 Audio8 两个正式值」。
+ *   Audio8 随 App 0.25.x 退役（它那条链的 App 端点 `/api/asr/audio8/*` 已被删除），
+ *   ⭐ 所以断言按新意图改写：**选项表只有一个正式值**，而 `audio8` 从「正式值」
+ *   变成「必须被迁移掉的旧值」——⛔ 不是删掉这几条测试。
+ */
+test('selector 只有 SenseVoice 一个正式值',
+  JSON.stringify(ASR_MODELS) === JSON.stringify(['sensevoice']));
 test('sensevoice 被接受', resolveAsrModel('sensevoice').model === 'sensevoice');
-test('audio8 只作为一次性迁移输入',
+test('audio8 不再是可选值，而是被迁移掉并说出它从哪来',
   resolveAsrModel('audio8').model === 'sensevoice'
   && resolveAsrModel('audio8').migratedFrom === 'audio8');
-test('产品唯一值仍是 sensevoice',
+test('默认产品值仍是 sensevoice',
   loadWith({}).asr.model === 'sensevoice');
 
 // ---------------------------------------------------------------- 迁移
@@ -49,7 +55,11 @@ test('qwen3-q4 迁移到默认值并记下它是从哪来的',
   && resolveAsrModel('qwen3-q4').migratedFrom === 'qwen3-q4');
 test('qwen3-q8 同样迁移',
   resolveAsrModel('qwen3-q8').model === 'sensevoice');
-test('两个旧值都在 deprecated 名单里（而不是被当成未知值）',
+/**
+ * ⭐ **一个还存着 `audio8` 的设备如果不迁移，会去调一个已经不存在的 App 端点**，
+ *   而那个失败看起来像「转写坏了」，不像「这个后端已经没有了」。
+ */
+test('退役名单里是两个 Qwen 旧值加上 audio8',
   ASR_DEPRECATED_MODELS.includes('audio8')
     && ASR_DEPRECATED_MODELS.includes('qwen3-q4') && ASR_DEPRECATED_MODELS.includes('qwen3-q8'));
 test('未知值也落到默认值，不抛不崩',
@@ -79,7 +89,13 @@ const appJs = read('web/app.js');
 const main = read('service/main.mjs');
 
 test('UI 不再提供 qwen3 选项', !/value="qwen3-/.test(indexHtml) && !/qwen3-q[48]/.test(appJs));
-test('UI 不提供 Audio8 选项', !indexHtml.includes('value="audio8"') && !appJs.includes('Audio8'));
+/**
+ * ⛔ 界面上不许再出现一个**选了也跑不了**的后端：它背后的 App 端点已经没有了。
+ * ⚠ 判据同时看两处：`<option>` 与文案——只删其中一处会留下「点不到但仍写着」的残影。
+ */
+test('UI 不再提供 Audio8 选项', !indexHtml.includes('value="audio8"'));
+test('UI 文案里不再出现 Audio8 这个名字',
+  !/Audio8/.test(appJs.replace(/\/\*[\s\S]*?\*\//g, '')));
 test('runtime 不再有 Qwen3 分支', !/transcribeQwen|qwenPaths|QWEN_ASSETS/.test(controller));
 test('走到非本 pipeline 的引擎时明确报错，而不是按 SenseVoice 悄悄跑',
   controller.includes('is not served by this pipeline'));
@@ -96,11 +112,17 @@ const reengageAt = applySection.indexOf('engageProcessing', generationAt);
 test('切换：先关旧门 → 目标 backend 就绪 → generation++ → 再用新实现开同一扇门',
   closeDoorAt >= 0 && closeDoorAt < prepareAt
     && prepareAt < generationAt && reengageAt > generationAt);
-test('Audio8 backend 已从 runtime 退休',
-  !controller.includes('ensureAudio8Session')
-    && !controller.includes("'/api/asr/audio8/session'")
-    && !controller.includes("'/api/asr/audio8/transcribe'")
-    && !main.includes('ensureAudio8ForApp'));
+/**
+ * ⚠ 这条原本钉「Audio8 走 App 的正式 session/transcribe endpoint」。那两个端点
+ *   **已经在 App 里被删除**，所以按新意图倒过来钉：⛔ 本包不许再调它们。
+ * ⭐ 一个调用已删除端点的分支，症状是「转写坏了」而不是「这个后端没有了」——
+ *   而它可以在代码里活很久，因为没人会去选一个不在界面上的后端。
+ */
+test('⛔ 不再调用任何已删除的 Audio8 App 端点',
+  !controller.includes('/api/asr/audio8/')
+    && !main.includes('/api/asr/audio8/'));
+test('⛔ 运行时也不再有 Audio8 分支',
+  !/audio8/i.test(controller.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*/g, '')));
 // ⭐ 判断门与麦克风在切换时**一概不动**。旧版在这里 stopChain，于是 demand 归零、
 //    麦克风真的停掉，而后台重启 microphone FGS 会被 Android 拒绝（docs/074 实测 969 次重试）。
 test('切换不碰判断门，也不制造 demand=0 的一瞬',
@@ -137,9 +159,15 @@ test('启动先同步/收敛 backend，再启动 chain，消灭首次进入的�
   const chainAt = main.indexOf("startChain('boot')", syncAt);
   return syncAt >= 0 && chainAt > syncAt;
 })());
-test('App 段落 backend 固定由唯一 SenseVoice 配置事实同步',
-  main.includes("const configuredBackend = () => 'sensevoice';")
-    && main.includes("if (target !== 'sensevoice')"));
+/**
+ * ⚠ 原断言把**当时的两个取值**写进了字符串。⭐ 它真正要保护的是
+ *   「`cfg.asr.model` 是唯一的选择源，且送去 App 之前要过一次白名单」——
+ *   那件事与「有几个后端」无关，故改为钉在**同一张表**上（[ASR_MODELS]），
+ *   ⛔ 不再把取值枚举抄进测试里（抄一次，加一个后端就得改两处）。
+ */
+test('App 段落 backend 跟随唯一 cfg.asr.model 事实同步',
+  main.includes('const configuredBackend = () => (ASR_MODELS.includes(cfg.asr?.model)')
+    && main.includes('if (!ASR_MODELS.includes(target))'));
 test('SenseVoice 迟到结果在切走后不许进库',
   main.includes('backendOwns(outcome?.backend ?? \'sensevoice\', resultGeneration)')
     && main.includes('staleBackendDropped += 1'));

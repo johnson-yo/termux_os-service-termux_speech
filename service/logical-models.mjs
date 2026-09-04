@@ -45,29 +45,51 @@ export async function resolveLogicalModel(id, { fetchImpl = fetch, timeoutMs = 8
    */
   const url = `${FRAMEWORK_URL}/api/packages/${MANAGER}/model/resolve`
     + `?id=${encodeURIComponent(id)}`;
+  /**
+   * ⭐ **够不到 Manager 要重试；够到了才算答案。**
+   *
+   * ⚠ 真机付过这个代价：本服务与 Manager 在**同一轮 reconcile** 里启动（相差约一秒），
+   *   本服务先起来，第一次 `fetch` 得到 `fetch failed`，于是三个模型全被解析成
+   *   「不可用」——**而这个答案会被缓存到下次重启为止**。症状是声纹登记报
+   *   `FireRedVAD logical executable is unavailable`，而那个 ctx 就在盘上、
+   *   Manager 一秒后也好好的，`/model/resolve` 手工打过去一切正常。
+   * ⭐ `assets.mjs` 早就为**同一件事**写过 6 次重试；那条教训没有被带进取代它的这一层。
+   *   ⛔ 只对**传输失败**重试：「这个模型没启用」是一个确定的答案，重试它只是在等一件不会发生的事。
+   */
+  const ATTEMPTS = 6;
   let payload;
-  try {
-    const r = await fetchImpl(url, {
-      headers: { Authorization: `Bearer ${SYSTEM_KEY}` },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    payload = await r.json().catch(() => null);
-    if (!r.ok || payload?.ok !== true) {
-      /**
-       * ⚠ 够不到 Manager 与「模型没准备好」是**两件事**，⛔ 不能压成一个。
-       *   前者要去看服务，后者要去点「使用」。
-       */
-      return {
-        available: false, model_id: id,
-        reason: 'model_manager_unavailable',
-        hint: `模型管理器不可达（${payload?.error ?? `HTTP ${r.status}`}）。`,
-      };
+  let lastTransport = null;
+  for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
+    try {
+      const r = await fetchImpl(url, {
+        headers: { Authorization: `Bearer ${SYSTEM_KEY}` },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      payload = await r.json().catch(() => null);
+      if (!r.ok || payload?.ok !== true) {
+        /**
+         * ⚠ 够不到 Manager 与「模型没准备好」是**两件事**，⛔ 不能压成一个。
+         *   前者要去看服务，后者要去点「使用」。
+         * ⭐ 但**服务回了话**就是一个答案，⛔ 不重试。
+         */
+        return {
+          available: false, model_id: id,
+          reason: 'model_manager_unavailable',
+          hint: `模型管理器不可达（${payload?.error ?? `HTTP ${r.status}`}）。`,
+        };
+      }
+      lastTransport = null;
+      break;
+    } catch (error) {
+      lastTransport = error;
+      await new Promise((resolve) => { setTimeout(resolve, 500 * (attempt + 1)); });
     }
-  } catch (error) {
+  }
+  if (lastTransport) {
     return {
       available: false, model_id: id,
       reason: 'model_manager_unavailable',
-      hint: `模型管理器不可达（${String(error?.message ?? error)}）。`,
+      hint: `模型管理器不可达（${String(lastTransport?.message ?? lastTransport)}，重试 ${ATTEMPTS} 次）。`,
     };
   }
   return payload;
@@ -83,6 +105,48 @@ export async function requireLogicalModel(id, opts) {
   if (d?.available !== true) throw new ModelNotEnabled(id, d?.reason ?? 'unknown', d?.hint);
   return d;
 }
+
+/**
+ * 编译产物（EPContext）的两种 `kind`。
+ * ⭐ `prebuilt` = Asset 装来的，`local` = 本机 `prepare` 编的；对**调用方**它们是同一类东西：
+ *   **一份编译好的上下文**，⛔ 不是一张可以拿去编译的源图。
+ */
+const CONTEXT_KINDS = new Set(['local', 'prebuilt']);
+
+/**
+ * ⭐ **把一个 executable 翻译成 App 图会话的参数。这条规则只许存在于这里。**
+ *
+ * ⚠ `descriptor.executable.path` **不是** `model_path`。它多数时候是一份 EPContext：
+ *   当成 `model_path` 送过去，加载器会拿它**去编译一份新的 context**，而它内部那个
+ *   `ep_cache_context` 相对引用就再也解析不到自己的目录了。App 侧的 `ModelPreflight`
+ *   会以 `EP_CONTEXT_AS_MODEL_PATH` 明确拒绝，并直接告诉你该传 `ctx_path`。
+ * ⚠ 这条规则 `asr/controller.mjs` 早就做对了（`ctxPath = executablePath; modelPath = null`），
+ *   而三个 FireRedVAD 消费者（vad / speaker-lab / acoustic-lab）在 docs/093 迁移时被漏下。
+ * ⭐ **一条只在四分之三的调用点生效的规则，失效方式恰恰就是这一种**——
+ *   所以判据收在这一个函数里，消费者拿到的是**已经路由好的参数**，
+ *   ⛔ 它们不许知道 `kind` 这个字段存在。
+ *
+ * @returns `{path, kind, isContext, modelPath, ctxPath, ctxKey}`，或 null（没有可执行体）
+ */
+export const executableGraphArgs = (descriptor, { ctxKey = null } = {}) => {
+  const exe = descriptor?.executable;
+  if (!exe?.path) return null;
+  const isContext = CONTEXT_KINDS.has(String(exe.kind ?? ''));
+  return {
+    path: exe.path,
+    kind: exe.kind ?? null,
+    isContext,
+    modelPath: isContext ? null : exe.path,
+    ctxPath: isContext ? exe.path : null,
+    /**
+     * ⚠ 绑版本：`fireredvad-1.1.0.ctx.onnx` → `fireredvad-1.1.0`。
+     *   ⛔ 不能是裸模型名——旧版本编出来的 ctx 会被当成新版本的可执行体。
+     *   给了 `ctx_path` 时 App 直接用那一份，这个键只决定「自编那份叫什么」。
+     */
+    ctxKey: ctxKey ?? String(exe.path).split('/').pop()
+      .replace(/\.onnx$/, '').replace(/\.ctx$/, ''),
+  };
+};
 
 /**
  * 从 descriptor 里按 **role** 取一个伴随文件的绝对路径。

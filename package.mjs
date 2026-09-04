@@ -304,7 +304,9 @@ export async function register(context) {
   const proxy = (method, route, servicePath = route, { timeoutMs } = {}) => {
     context.routes.register(method, route, async (req, res, { json, readBody }) => {
       try {
-        const body = method === 'POST' ? await readBody() : undefined;
+        // ⚠ 只判 POST 会让 PUT 的 body **静默变成 undefined**：路由注册了、返回 200、
+        //   而下游收到一个空 patch ⇒ 「什么都没改」和「改了没生效」长得一模一样。
+        const body = (method === 'POST' || method === 'PUT') ? await readBody() : undefined;
         const query = method === 'GET'
           ? new URL(req.url, 'http://framework.local').search
           : '';
@@ -337,6 +339,9 @@ export async function register(context) {
   proxy('GET', '/records');
   proxy('GET', '/records/archive');
   proxy('GET', '/pipeline');
+  // ⭐ docs/096：三层 Pipeline 的唯一写入口（一次 PUT 提交整套）。
+  //   ⚠ 路由必须在**这里**注册——service 里处理了但没注册的症状是 `unknown_package_route`（docs/079）。
+  proxy('PUT', '/pipeline', '/pipeline', { timeoutMs: 240000 });
   proxy('GET', '/listen');
   proxy('GET', '/states');
   proxy('GET', '/rms');

@@ -83,7 +83,7 @@ const fresh = () => new PcmConsumers([
 test('W1 RMS/raw 两个水源只由各自聚合决定，chain/backend/处理门都不是总开关',
   main.includes('const wantRms = consumers.wantsRms() || consumers.wantsPcm();')
     && main.includes('const wantPcm = consumers.wantsPcm();')
-    && /const syncPcmDemand = \(\) => \{[\s\S]{0,700}lifecycle\.acquireMic\(\)[\s\S]{0,300}lifecycle\.releaseMic\(\)/.test(main));
+    && /const syncPcmDemand = \(\) => \{[\s\S]*?lifecycle\.acquireMic\(\)[\s\S]{0,400}lifecycle\.releaseMic\(\)/.test(main));
 test('W2 RMS WS 与 PCM WS 在各自入口分流，RMS 与 VAD 各自可关',
   main.includes('const ingestRmsFrame = (meta) =>')
     && main.includes("if (consumers.enabled('vad')) vad.ingestPcm(frame, meta);"));
@@ -109,9 +109,40 @@ test('W4 停链只关它自己那几个 consumer，不直接掐水源',
  * 自动等待期本包一条 WS 都不订，但麦克风必须还持着——门现在由 App 判，
  * 而 App 要判就得有音频。⚠ 把两者绑在一起会让「关掉一条遥测」变成「把整条链弄哑」。
  */
+/**
+ * W4b 的意图不变：**链开着就持麦，即使一条传输都不需要**（P2 把 RMS product consumer
+ * 关掉之后，本包在自动等待期一条传输都不需要，而 App 的 Gate 要判就得有音频）。
+ * 断言从「钉住那一行的字面」改成「钉住那个判据里必须有 chain」——语义没改，是被收紧了。
+ */
 test('W4b 链开着就持麦，即使一条传输都不需要',
-  /const wantMic = wantRms \|\| wantPcm \|\| lifecycle\?\.chain === 'started';/.test(main)
-    && /if \(wantMic\) \{[\s\S]{0,200}acquireMic/.test(main));
+  /const productMic = [\s\S]{0,300}lifecycle\?\.chain === 'started'/.test(main)
+    && /if \(productMic\) \{[\s\S]{0,200}acquireMic/.test(main));
+
+/**
+ * ⭐ **观察者不是打开麦克风的理由。**
+ *
+ * 真机复现过：使用者按下「关闭永久收音」，麦克风**真的停了**
+ * （`remaining_holders=[]` / `recording=false` / `fgs=false`），
+ * 然后页面下一次轮询 `/state` 续了 RMS 观察者租约 ⇒ `wantRms` 为真 ⇒ 麦克风被开回来。
+ * 从使用者的座位上看，那个按钮什么也没做。
+ * 规则：观察者可以让一支**已经开着**的麦克风继续开着（页面要看到实时值），
+ * ⛔ 但它自己永远不许把一支关着的打开。
+ * ⚠ 校准台（lab / speaker）不算观察者——那是使用者按了「开始测试」。
+ */
+/**
+ * ⚠ 判据必须**只框住 `productMic` 这个表达式本身**（到它的 `;` 为止）。
+ *   按字符数扫一段会把下面 `else if (… && !wantRms)` 里的 `wantRms` 一起算进来——
+ *   于是这条断言会在代码完全正确时变红。第一版就是这么写错的。
+ */
+const productMicExpr = (main.match(/const productMic = ([^;]*);/) ?? [])[1] ?? '';
+test('W4d 观察者只能维持麦克风，⛔ 不能打开它',
+  // 打开的资格里没有 wantRms
+  productMicExpr !== '' && !productMicExpr.includes('wantRms')
+    // 但已经开着时，只要还有观察者就不释放
+    && /else if \(lifecycle\.micHeld && !wantRms\) \{[\s\S]{0,120}releaseMic/.test(main)
+    // 校准台是使用者按下的产品需求，不是观察者
+    && productMicExpr.includes("consumers.enabled('lab')")
+    && productMicExpr.includes("consumers.enabled('speaker')"));
 /** ⭐ RMS 传输从此只服务观察者：product Gate 不再是它的需求方。 */
 test('W4c RMS 传输由 observer 租约驱动，⛔ 不再由链驱动',
   main.includes('const RMS_OBSERVER_TTL_MS')

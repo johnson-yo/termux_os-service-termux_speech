@@ -355,10 +355,19 @@ const fakeAndroid = {
     throw new Error(`unexpected VAD fixture route: ${options.method ?? 'GET'} ${route}`);
   },
 };
+/**
+ * ⚠ 这个 fixture 曾经传 `modelFile:` —— 而 docs/093 的 logical-model 迁移把那个参数
+ *   改成了已路由好的 `graph:`（`executableGraphArgs` 的产物）。**构造器不接 `modelFile`，
+ *   于是它被静默忽略**，`modelPath` 恒为 null，`arm()` 每次都以
+ *   `FireRedVAD logical executable is unavailable` 失败。
+ * ⭐ 后果不是一条红断言，是 `enqueue()` 抛异常**把整个文件打断**——
+ *   自那之后本文件 99 条断言里有 **69 条从来没有执行过**，而报告只显示一条红。
+ *   ⭐ **一个传了却没人读的构造参数，和一个根本不存在的参数，在测试里长得一模一样。**
+ */
 const vad = new VadController({
   android: fakeAndroid,
   dataRoot: vadRoot,
-  modelFile: path.join(modelRoot, 'model.onnx'),
+  graph: { path: path.join(modelRoot, 'model.onnx'), kind: 'source', isContext: false },
   cmvnFile: path.join(modelRoot, 'cmvn.bin'),
   residentId: 'fixture-vad',
   config: { pcm_pool_ms: 6000, no_output_timeout_ms: 15_000 },
@@ -381,7 +390,7 @@ test(
     const rolling = new VadController({
       android: fakeAndroid,
       dataRoot: path.join(temporaryRoot, 'vad-rolling'),
-      modelFile: path.join(modelRoot, 'model.onnx'),
+      graph: { path: path.join(modelRoot, 'model.onnx'), kind: 'source', isContext: false },
       cmvnFile: path.join(modelRoot, 'cmvn.bin'),
       residentId: 'fixture-vad',
       config: { pcm_pool_ms: 6000, no_output_timeout_ms: 15_000 },
@@ -629,12 +638,15 @@ test(
 );
 test(
   'the SenseVoice output name is probed once and then declared with heal from cached config',
-  asrDeclares.length === 2
-    && asrDeclares[0].model === 'sensevoice'
-    && asrDeclares[0].ctx_key === 'sensevoice'
-    && asrDeclares[0].heal === undefined
-    && asrDeclares[1].heal?.check_output === '_ctc_logits'
-    && asrDeclares[1].heal?.kind === 'ctc_argmax_degeneracy'
+  /**
+   * ⚠ 本条原本还断言「声明两次、第二次带 heal」。docs/096 之后
+   *   `LEGACY_RESIDENT_OWNERSHIP = false`——**speech 不再拥有任何常驻**，
+   *   `declare()` 是空操作，于是 `asrDeclares` 合法为空。
+   * ⭐ 但**它保护的东西没变**：输出名只探**一次**，并且**落盘**，
+   *   这样下次启动不必重演探名仪式（那正是 docs/046 的 QNN churn 风险）。
+   *   ⛔ 声明次数不再是这条测试的判据，因为已经没有声明了。
+   */
+  asrDeclares.length === 0
     && asrPersisted?.output_name === '_ctc_logits',
 );
 
@@ -737,33 +749,20 @@ for (let attempt = 0; attempt < 200 && !asrWarm.snapshot().transcripts.last; att
 }
 test(
   'a cached output name declares the SenseVoice resident exactly once with heal already correct',
-  asrDeclares.length === 1
-    && asrDeclares[0].heal?.check_output === '_ctc_logits'
+  /** ⚠ 同上：docs/096 之后没有声明可数；⭐ 真正的收益是**缓存过的名字不再重探**。 */
+  asrDeclares.length === 0
     && asrWarm.snapshot().transcripts.last?.text === '你好'
     && asrWarm.snapshot().model.output_name_cached === true,
 );
 asrWarm.close();
 
 /**
- * ⭐ Audio8 曾经走 Asset → App session；现在整个 backend 已退役。
- * 这里锁住的是「旧配置不会在第一段语音时才爆炸」：边界层负责迁移，
- * controller 对旧值明确拒绝，运行时不再偷偷创建旧 session。
+ * ⚠ 这里曾有一整块 Audio8 的运行时测试（它走 App 的 `/api/asr/audio8/session|transcribe`）。
+ *   Audio8 随 App 0.25.x 退役、那两个端点已从 App 删除，故整块删掉。
+ * ⭐ 值得记下来的是：**这块测试在被删之前，已经很久没有被执行过了**——
+ *   本文件在更靠前的地方因为一个静默失效的构造参数抛异常而中断，
+ *   于是它和它后面的 69 条断言一起，在报告里表现为「不存在」而不是「失败」。
  */
-{
-  const retired = new AsrController({
-    android: { json: async () => { throw new Error('retired backend must not call App'); } },
-    dataRoot: path.join(temporaryRoot, 'asr-data-retired'),
-    frontendRoot: senseFrontendRoot,
-    residentId: 'fixture-asr-retired',
-    config: { enabled: true, model: 'audio8', language: 'auto' },
-  });
-  let rejected = null;
-  await retired.prepareBackend('audio8').catch((error) => { rejected = String(error.message); });
-  test('retired Audio8 is rejected before any App session request',
-    rejected?.includes('not served by this pipeline')
-      && retired.snapshot().model.id === 'sensevoice');
-  retired.close();
-}
 
 asr.observePipeline({
   owner: PIPELINE_OWNERS.ASR,
@@ -869,10 +868,7 @@ const appJs = ['web/app.js', 'web/views.js']
   .join('\n');
 const styleCss = fs.readFileSync(path.join(root, 'web/style.css'), 'utf8');
 
-/**
- * ⭐ 记录必须来自实际执行的 backend。当前产品只有 SenseVoice，
- *   因此它的运行时 metadata 必须仍然明确写出 SenseVoice，而不是沿用旧值。
- */
+/** ⭐ 记录必须来自实际执行的 backend；SenseVoice/Audio8 共用同一条记录契约。 */
 {
   const controller = fs.readFileSync(path.join(root, 'service/asr/controller.mjs'), 'utf8');
   const body = controller.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
@@ -882,7 +878,7 @@ const styleCss = fs.readFileSync(path.join(root, 'web/style.css'), 'utf8');
      * ⚠ 0.21.8：判据从「发布时的配置」收紧成「**开跑时**记下的 `ran_backend`」，
      *   并且它必须写在 `inFlight` 快照之前，否则那个字段永远是空的。
      */
-    /model:\s*\{\s*id:\s*'sensevoice'/.test(body)
+    /model:\s*\{\s*id:\s*job\.ran_backend \?\? this\.config\.model/.test(body)
       && /backend: job\.ran_backend \?\? this\.config\.model \?\? 'sensevoice'/.test(body)
       && /job\.ran_backend = this\.config\.model[\s\S]{0,200}this\.inFlight = /.test(body),
   );
@@ -896,7 +892,7 @@ test(
    * 于是「改了内容却没改版本号」不可能悄悄通过——上一轮正是这样让 `0.20.0`
    * 同时指向两套差 11.5k 行的代码。
    */
-    manifest.version === '0.22.5'
+    manifest.version === '0.24.1'
     && manifest.id === 'github.termux-os.service.termux-speech'
     && manifest.capabilities.requires.some((item) => item.id === 'termux-os.app.api' && item.required)
     /**
@@ -929,16 +925,9 @@ test(
     && manifest.release.repository.includes('termux_os-service-termux_speech'),
 );
 test(
-  'retired ASR backends leave no speech-package metadata',
-  /**
-   * ⭐ 下线的定义是**四个层面都消失**：selector / runtime / UI / **依赖与资产声明**。
-   *   只删 selector 不够；否则管理页仍会提供一个永远不会被本包加载的重量级资产。
-   */
-  /**
-   *   Speech 当前只声明 SenseVoice、FireRedVAD 与 CAM++；Audio8/Qwen 资产由
-   *   旧安装或 Manager 历史保留，但不再属于这个发布包。
-   */
-  !/audio8|qwen3/i.test(JSON.stringify(manifest))
+  'Speech package keeps Qwen retired and leaves Audio8 artifacts to Manager/App contract',
+  /** Speech 不声明 Qwen 产品或裸 Audio8 文件；Audio8 的内部依赖由 Manager 隐藏管理。 */
+  !/qwen3/i.test(JSON.stringify(manifest))
     && manifest.assets.requires.some((a) => a.id === 'model.sensevoice.frontend' && a.required === false)
     && manifest.assets.requires.some((a) => a.id === 'model.sensevoice.ctx' && a.required === false)
     && manifest.assets.requires.some((a) => a.id === 'model.sensevoice.graph' && a.required === false),
@@ -1085,7 +1074,8 @@ test(
        * `htp_models_dir` 去拼。两份文件恰好都在，所以 Device Verify 全绿、看起来完全正常。
        * 给绝对路径才是真的搬完。
        */
-      && vadSource.includes('modelPath: this.modelPath,')
+      /** ⚠ docs/093 之后这里的来处是 `graph`（已路由好的参数），⛔ 不再是裸的 modelFile。 */
+      && vadSource.includes('modelPath: graph?.modelPath ?? null,')
       && /modelPath[\s\S]{0,200}body\.model_path = this\.modelPath/.test(
         fs.readFileSync(path.join(root, 'service/residents.mjs'), 'utf8'))
       // 启动时现问，而不是注册时冻结一个会过期的环境变量。
@@ -1093,30 +1083,32 @@ test(
       && assetsSource.includes("asset.ready !== true"),
   );
 }
-// 0.13.0：转写配置 + 顶部实时可用内存。
-// 当前 Speech 只提供 SenseVoice；内存只是显示值，不参与任何自动决策。
+// 转写配置 + 顶部实时可用内存；内存只是显示值，不参与任何自动决策。
 const asrControllerSource = fs.readFileSync(new URL('../service/asr/controller.mjs', import.meta.url), 'utf8');
 const configSource = fs.readFileSync(new URL('../service/config.mjs', import.meta.url), 'utf8');
 const appJsSource = appJs;
 const indexHtmlSource = indexHtml;
 // docs/074：产品面只剩两条 pipeline，各自持有已验证成熟的 VAD。
+/** ⚠ selector 曾有 SenseVoice 与 Audio8 两项；Audio8 随 App 0.25.x 退役，只剩一项。 */
 test(
-  'the ASR selector offers exactly SenseVoice',
+  'the ASR selector offers exactly one real engine',
   configSource.includes("ASR_MODELS = ['sensevoice']")
     && configSource.includes("model: 'sensevoice'")
     && indexHtmlSource.includes('id="asr-model"')
     && appJsSource.includes("$('asr-model').value"),
 );
-// ⭐ 下线不是「藏起来」：旧值必须在四个层面都消失，只留一条会警告的迁移路径。
+/**
+ * ⭐ 下线不是「藏起来」：旧值必须**迁移**，⛔ 不许留一个选了就调不存在端点的分支。
+ * ⚠ Audio8 现在与两个 Qwen 旧值同类——它那条链的 App 端点已被删除。
+ */
 test(
-  'retired ASR engines are gone from selector, UI and runtime',
-  !configSource.includes("ASR_MODELS = ['sensevoice', 'audio8']")
-    && !configSource.includes("ASR_MODELS = ['sensevoice', 'qwen3")
-    && !/value="qwen3-/.test(indexHtmlSource)
+  'every retired engine is gone from the runtime and listed as deprecated',
+  !/value="qwen3-/.test(indexHtmlSource)
     && !/value="audio8"/.test(indexHtmlSource)
     && !/transcribeQwen/.test(asrControllerSource)
-    && !/transcribeAudio8/.test(asrControllerSource)
-    && configSource.includes('ASR_DEPRECATED_MODELS'),
+    && !/audio8/i.test(asrControllerSource)
+    && configSource.includes('ASR_DEPRECATED_MODELS')
+    && configSource.includes("'audio8'"),
 );
 test(
   'a retired engine value migrates to the product default with one warning, never silently',
@@ -1284,7 +1276,7 @@ test(
   'the records renderer survives the overview rebuild and still tells the truth about rotation',
   appJs.includes('renderAsrLive')
     && appJs.includes('overview-asr-live')
-    && indexHtml.includes('id="ov-latest"')
+    && !indexHtml.includes('id="ov-latest"')
     && !indexHtml.includes('id="rec-groups"'),
 );
 
@@ -1451,9 +1443,15 @@ test(
 
 test(
   'the manual entry uses one control and the chain has one opening path',
+  /**
+   * ⚠ `man-toggle` 是**已被刻意删除**的旧模式按钮（app.js 里只剩一句注释说它已删）。
+   * ⭐ 这条真正保护的是「**手动入口只有一个、语音链只有一条开门路径**」——
+   *   那件事与那个按钮叫什么无关，故判据换成「⛔ 旧的三个模式按钮一个都不许回来」。
+   */
   indexHtml.includes('id="ac-chain"')
     && !indexHtml.includes('id="chain-toggle"')
-    && (indexHtml.match(/id="man-toggle"/g) ?? []).length === 1
+    && !indexHtml.includes('id="man-toggle"')
+    && !indexHtml.includes('id="btn-mode-auto"')
     && appJs.includes("request(started ? '/chain/stop' : '/chain/start'")
     && appJs.includes('停止语音链会强行收走它们的听写')
     && appJs.includes('force = true;')
@@ -1488,7 +1486,8 @@ test(
     && !indexHtml.includes('id="form-detect"')
     && !indexHtml.includes('id="form-recognition"')
     && !indexHtml.includes('id="vad-max-wavs"')
-    && indexHtml.includes('id="man-toggle"')
+    /** ⚠ `man-toggle` 已随旧模式按钮删除；手动入口现在是 `pd-manual` 那一组。 */
+    && indexHtml.includes('id="pd-manual"')
     && indexHtml.includes('id="asr-model"'),
 );
 // 产品导航收敛为 Overview / Settings / My Voice；内部阶段事实按产品职责归位。
@@ -1498,7 +1497,7 @@ test(
     .every((page) => indexHtml.includes(`data-page="${page}"`)
       && indexHtml.includes(`id="page-${page}"`))
     && ['rms-current', 'rms-avg', 'rms-peak', 'rms-cam-countdown', 'cam-live', 'cam-owner',
-      'vad-probability', 'vad-owner', 'asr-owner', 'asr-state', 'ov-current', 'ov-latest']
+      'vad-probability', 'vad-owner', 'asr-owner', 'asr-state', 'ov-current']
       .every((id) => indexHtml.includes(`id="${id}"`))
     && !indexHtml.includes('data-page="speech"')
     && !indexHtml.includes('data-page="diagnostics"')
@@ -1519,7 +1518,7 @@ test(
    */
   'Overview answers the three product questions and reacts the moment there is sound',
   ['pd-service-badge', 'act-meter', 'act-fill', 'act-badge', 'act-who',
-    'ov-current', 'ov-latest'].every((id) => indexHtml.includes(`id="${id}"`))
+    'ov-current'].every((id) => indexHtml.includes(`id="${id}"`))
     // ⛔ 旧的开发者卡整块退出产品路径
     && !indexHtml.includes('id="alerts"')
     && !indexHtml.includes('id="ov-route"')
@@ -1590,38 +1589,46 @@ test(
    * 不变的仍然是这条：**成功也必须回读后端**，⛔ 页面不许自称换成功了；
    * 而后端没有任何自动回退机制，页面也就不许出现那种字样。
    */
-  /await request\('\/asr\/config'\)/.test(appJs)
-    && appJs.includes("confirmed.value.model !== wantedModel")
-    && appJs.includes('后端保留了')
+  /**
+   * ⭐ **再次按新意图改写**（docs/097 §十五）：回读这条一个字没让，回读的**对象**变了。
+   * OLD → 回读本包 `/asr/config` 的 `model` 并比对。
+   * WHY OBSOLETE → 那是第二个真相。转录层归 Pipeline 所有，本包 conf 里那个
+   *   `asr.model` 与 App 的 effective 能长期不一致而毫无提示。
+   * NEW → 等 **App 的 effective** 真的变成目标值且不再 transitioning；
+   *   超时/错误如实报出，⛔ 页面仍然不许自称换成功了，也不许出现自动回退字样。
+   */
+  appJs.includes("app?.effective?.asr === wantedModel && app?.state !== 'transitioning'")
+    && appJs.includes('切换超时：App 仍未报告新的 effective')
     // ⛔ 已经没有第二个入口了
     && !appJs.includes('asr-model-apply')
     && !/自动降级|自动回退|自动 fallback/.test(appJs),
 );
-// 一个叫「用了哪个模型」的字段必须对应真实执行体。当前产品只有 SenseVoice，
-// 所以记录明确写出它，并且旧 backend 不再有自己的执行路径。
+// 一个叫「用了哪个模型」的字段必须对应真实执行体；两个 backend 共用同一条记录路径。
 test(
   'a transcript records the model that actually produced it',
   // docs/074：这条 pipeline 只服务 SenseVoice；controller 在跑前冻结 backend，
   // 结果的 model 与 backend 都来自这条唯一执行事实。
-  asrControllerSource.includes("id: 'sensevoice',")
-    && asrControllerSource.includes("model: {\n        id: 'sensevoice',")
+  asrControllerSource.includes("id: job.ran_backend ?? this.config.model ?? 'sensevoice',")
     && asrControllerSource.includes("job.ran_backend = this.config.model ?? 'sensevoice';")
+    /** ⭐ 只剩一条执行体，故 runtime/session 是常量——但 `id` 仍来自**跑过的那次**。 */
     && asrControllerSource.includes("runtime: 'android-app-ort-qnn-htp',")
-    && asrControllerSource.includes('is not served by this pipeline'),
+    && asrControllerSource.includes('session: this.graph.id,'),
 );
-// `files_present` 当前只回答 SenseVoice；不存在「选了别的引擎却伪造文件状态」的分支。
+// `files_present` 跟随选定 backend；⛔ 不许因为只剩一个 backend 就不报 readiness。
 test(
-  'only SenseVoice is probed and old backend-specific fields are gone',
+  'the selected ASR backend still reports an explicit readiness',
   asrControllerSource.includes("const variant = 'sensevoice';")
     && asrControllerSource.includes('session_loaded')
-    && !asrControllerSource.includes('audio8_session_not_loaded')
-    && !asrControllerSource.includes('transcribeAudio8'),
+    && asrControllerSource.includes('sensevoice_not_ready')
+    && !asrControllerSource.includes('transcribeQwen'),
 );
 test(
-  'the SenseVoice tier is probed on its own and keeps an explicit readiness meaning',
+  'the selected ASR tier keeps an explicit readiness meaning',
   asrControllerSource.includes('const presence = (files, nowMs = Date.now())')
+    /** ⚠ Audio8 退役后只剩一个 tier；⭐ 但「必须给出显式 readiness」这条没变。 */
     && asrControllerSource.includes("const variant = 'sensevoice';")
-    // 旧 backend 的路径来自旧 Asset map；当前源码不再保留裸路径常量。
+    && asrControllerSource.includes('const selectedReady = selected.ready === true;')
+    && asrControllerSource.includes('senseReady')
     && !asrControllerSource.includes('QWEN_MEL_ONNX')
     && !/const QWEN_ROOT = /.test(asrControllerSource)
     /**
@@ -1671,9 +1678,21 @@ test(
    *   因为 lease 回答的是「谁能关门」，不是「谁在工作」。
    */
   'lighting separates "who is working" from "who may close", so VAD stays lit while ASR transcribes',
-  // 概览：说话与否单独判定，⛔ 不从 owner 推出来
-  appJs.includes('const speaking = act.active === true;')
-    && appJs.includes("const heard = level >= 0.02 || rms?.state === 'open';")
+  /**
+   * ⭐ **第三次按新意图改写**（docs/097 §五）。区分本身仍在，只是两边都换了来处：
+   *   「在说话」由**断句层**回答（CAM++ 判 USER / FireRedVAD 判 speech），
+   *   「听到了」由**触发层**回答（门开了，或电平越过阈值）。
+   * ⛔ 三个流水线节点的点亮判据仍然互不推导，也仍然不许由 lease 的 owner 决定。
+   */
+  appJs.includes('const segmentSpeaking = !stopped && gateOpen && (fireRedSelected')
+    && appJs.includes('const heard = level >= 0.02 || gateOpen;')
+    /**
+     * ⚠ docs/100 之后这里**多了一个 `stalled` 守卫**：一次 NPU SSR 里
+     *   `running` 全程为 true 而链路一帧都没处理。⭐ 代码比原断言更严，
+     *   故断言跟上——⛔ 不是把守卫从代码里拿掉去迁就测试。
+     */
+    && appJs.includes('const segmentActive = !stopped && gateOpen')
+    && appJs.includes('apSegment.running === true && apSegment.stalled !== true;')
     // 诊断：owner 仍然逐阶段可见
     && indexHtml.includes('id="asr-owner"')
     // ⛔ 旧的「只看 owner」与靠历史字段点亮的写法都不许回来

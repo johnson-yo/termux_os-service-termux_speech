@@ -234,6 +234,23 @@ header {
 .status-val.text-good {
   color: var(--good, #22c55e);
 }
+/* 切换中：值仍是旧的 effective，⛔ 不能画成"已经生效"。 */
+.status-val.text-warn {
+  color: #fbbf24;
+  text-shadow: 0 0 6px rgba(251, 191, 36, 0.3);
+}
+/* 读数陈旧 / 还没读到：⛔ 不许拿最后一次读到的值冒充"现在"。 */
+.status-val.text-muted {
+  color: #7d8fa3;
+  text-shadow: none;
+}
+/* Settings 里 CAM++ 参数的小标题（比 h2 轻一级）。 */
+.sub-h {
+  margin: 12px 0 4px;
+  font: 800 0.72rem/1.2 system-ui, sans-serif;
+  color: #9fb3c8;
+  letter-spacing: .02em;
+}
 
 /* ASR 队列深度指示器：■ ■ □ □ □ */
 .asr-queue-note {
@@ -921,6 +938,69 @@ pre {
 }
 .meter-fill.live { background: var(--good, #46b17b); }
 
+/* ============================================================
+   Overview 三层 Pipeline 选择行（docs/097 §三）
+   ⭐ 沿用同一张暗色卡片的观感，⛔ 不引入新的 UI 体系。
+   ⚠ 三个 select 必须用 `minmax(0,1fr)`：`1fr` 的最小尺寸是内容尺寸，
+     而 `FireRedVAD` 这种长 option 会把列撑到溢出——390px 下就横滚了。
+   ============================================================ */
+.ov-pipe-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  padding: 6px;
+  margin-bottom: 4px;
+  box-sizing: border-box;
+  background: rgba(18, 25, 36, 0.85);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  width: 100%;
+}
+.ov-pipe {
+  display: block;
+  min-width: 0;
+  margin: 0;
+}
+.ov-pipe > span {
+  display: block;
+  margin: 0 0 3px;
+  color: var(--muted);
+  font: 700 0.58rem/1 system-ui, sans-serif;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+/* ⛔ 不吃全局的 44px：这一行是导航不是表单，44px 会把它顶成两倍高。 */
+.ov-pipe > select {
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  height: 32px;
+  padding: 0 6px;
+  font-size: 0.74rem;
+  font-weight: 700;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: #0d141d;
+  color: var(--text);
+}
+.ov-pipe-state {
+  margin: 0 0 8px;
+  text-align: center;
+  font: 700 0.7rem/1.3 system-ui, sans-serif;
+  color: var(--muted);
+}
+.ov-pipe-state.is-running { color: #4ade80; }
+.ov-pipe-state.is-transitioning { color: #fbbf24; }
+.ov-pipe-state.is-stopped { color: #f87171; }
+.ov-pipe-state.is-bad { color: #f87171; }
+/* 极窄屏（折叠机外屏 / 分屏）：标签藏起来，靠 select 自己的文字表达。 */
+@media (max-width: 340px) {
+  .ov-pipe > span { display: none; }
+  .ov-pipe-row { gap: 4px; padding: 4px; }
+  .ov-pipe > select { font-size: 0.68rem; padding: 0 3px; }
+}
+
 /* ---------- Overview 顶部模式切换 Tablist（自动转录 / 手动转录 / 停止收音，三选一） ---------- */
 .ov-mode-tablist {
   display: grid;
@@ -1007,9 +1087,16 @@ pre {
   width: 100%;
   box-sizing: border-box;
 }
+/**
+ * ⚠ 列宽原本是 `56px 1fr 92px 1fr 56px`——为 `RMS` / `VAD` / `ASR` 三个三字母标签量的。
+ * ⭐ 三个节点现在显示 effective 的真名（`直通` / `FireRedVAD` / `SenseVoice`），
+ *   固定像素宽必然溢出（390px 下实测 `gate-flow` 的 scrollWidth 超出 clientWidth）。
+ *   改成按比例分配 + `minmax(0, …)`：⛔ 裸 `1fr` 的最小尺寸是内容尺寸，长 option 照样撑破。
+ */
 .gate-flow {
   display: grid;
-  grid-template-columns: 56px 1fr 92px 1fr 56px;
+  grid-template-columns: minmax(0, 0.82fr) auto minmax(0, 1.75fr) auto minmax(0, 1.05fr);
+  gap: 2px;
   align-items: center;
   width: 100%;
   max-width: 440px;
@@ -1052,11 +1139,23 @@ pre {
   transition: background 0.2s, border-color 0.2s, box-shadow 0.2s, color 0.2s;
   box-sizing: border-box;
 }
-#gn-rms, #gn-asr {
-  width: 54px;
+#gn-rms, #gn-asr, #gn-vad {
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
 }
-#gn-vad {
-  width: 90px;
+/* 名字长于格子时截断，⛔ 不许把整条流水线撑到横滚。 */
+#gn-rms, #gn-asr, #gn-vad > .gate-name {
+  text-overflow: ellipsis;
+  overflow: hidden;
+}
+.gate-slot.slot-conn { font-size: 0.58rem; gap: 1px; }
+.gate-slot.slot-conn .gate-dash { opacity: .55; }
+@media (max-width: 400px) {
+  .gate-flow { font-size: 0.6rem; }
+  .gate-flow-container { padding: 5px 4px; }
+  .gate-box { padding: 0 2px; gap: 1px; }
 }
 .gate-box.active {
   background: #1e3a5f;

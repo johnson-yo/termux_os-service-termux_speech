@@ -1,7 +1,7 @@
 /**
  * SPDX-License-Identifier: Apache-2.0
- * [INPUT]: Framework/App transports, PCM, FireRedVAD/SenseVoice assets, and Package data/config.
- * [OUTPUT]: Mutually exclusive RMS→CAM++VAD→ASR and manual RMS→FireRedVAD→ASR paths,
+ * [INPUT]: Framework/App transports, PCM, CAM++/FireRedVAD assets, and Package data/config.
+ * [OUTPUT]: Mutually exclusive RMS→selected VAD→selected ASR paths,
  *           a monotonic rolling CAM++ USER watchdog, WAV/transcript feeds, speech.idle,
  *           and the loopback-only Android Assistant primary action. `cfg.asr.model` is the
  *           single ASR selector; App segment policy is only its low-frequency projection.
@@ -14,6 +14,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { writeStatus } from './status.mjs';
 import {
+  ASR_MODELS,
   loadConfig,
   saveAsrConfig,
   saveLifecycleConfig,
@@ -25,6 +26,7 @@ import {
 } from './config.mjs';
 import { systemKeyAuthorized } from './http-auth.mjs';
 import { createAndroidAppClient, UpstreamError } from './app-api.mjs';
+import { createAppPipelineClient, TRIGGERS, SEGMENTS, ASRS, canonicalSegment } from './app-pipeline.mjs';
 import { ForegroundGate, framesToDb } from './asr/foreground.mjs';
 import { RelativeForegroundGate } from './asr/relative-foreground.mjs';
 import { SessionCalibrator } from './asr/session-calibrator.mjs';
@@ -58,7 +60,7 @@ import {
 import { StateBus } from './states.mjs';
 import { LifecycleController, MIC_REQUESTER } from './lifecycle/controller.mjs';
 import { resolveAssetRoot } from './assets.mjs';
-import { resolveLogicalModel, companionFile, companionRoot } from './logical-models.mjs';
+import { resolveLogicalModel, companionFile, companionRoot, executableGraphArgs } from './logical-models.mjs';
 import { AppEventsClient, CaptureWatchdog } from './capture/app-events.mjs';
 import { RecordArchive } from './storage/archive.mjs';
 import { RecordGroups } from './storage/groups.mjs';
@@ -110,30 +112,32 @@ const VAD_DATA_ROOT = process.env.VAD_DATA_ROOT || '.runtime-dev/data/termux-spe
  * ⛔ 没有匹配本机的 ctx 就如实报不可用，**绝不静默回落 CPU**：
  *   CPU 也能算出一个分数，而那正是这类验收最容易骗人的地方。
  */
-const campplusGraph = await resolveOptionalAssetRoot('model.campplus.graph');
-if (campplusGraph) {
-  console.log(`[termux-speech] model.campplus.graph ${campplusGraph.version} → ${campplusGraph.root}`);
-}
-/** ⭐ 按 **role** 取；没有 role 就保持 capability unavailable，⛔ 不拼文件名。 */
-const CAMPLUS_MODEL_PATH = campplusGraph?.files?.model
-  ? path.join(campplusGraph.root, campplusGraph.files.model)
-  : null;
 /**
- * ⭐ **docs/093：CAM++ 的可执行体由模型管理器给出。**
+ * ⭐ **CAM++ 的两个文件都从 logical model 的 descriptor 取，⛔ 不再自己 resolve 资产。**
  *
- * ⛔ 迁移前这里自己 `ensureAssetRoot('model.campplus.ctx')` 再拼 `model_ir11.onnx` ——
- *   那是 speech 在替 Asset 层做「用哪一份」的决定。而 CAM++ 现在按小模型策略
- *   **不再提供预制 CTX**，正确的可执行体来自本机准备。
- * ⚠ 没准备好就留 null：由 `SpeakerActivity.start()` 明确拒绝，
- *   ⛔ 不在这里让整个服务起不来，也⛔ 不静默回落 CPU（CPU 也能算出一个分数，
+ * ⚠ 旧代码写的是 `(await resolveOptionalAssetRoot('model.campplus.graph'))?.files?.model`，
+ *   而 `resolveAssetRoot` 的返回值**只有** `{root, version, package}` —— 它从来不带 `files`。
+ *   于是这个表达式**恒为 undefined** ⇒ `CAMPLUS_MODEL_PATH` 永远是 null ⇒ 声纹登记
+ *   永远报 `CAM++ model missing: null`。⭐ 报错里那个字面的 `null` 就是它自己的供词。
+ *   （Framework 的 `/api/assets/<id>` 本来也只回角色**名**数组 `["model"]`，不回文件名，
+ *   所以就算把 `files` 透传上来也拿不到路径——这条路结构上就走不通。）
+ *
+ * ⭐ 两个文件是**两张不同的图**，⛔ 不能互相顶替：
+ *   · `companions['model.campplus.graph']` = 动态 `[1,'T',80]` → **登记**走 CPU，任意长度；
+ *   · `executable`                          = 固定 `[1,148,80]` → **运行时**跑 HTP，1500 ms 窗。
+ *   合成一个坑位的后果实测过：HTP 通了而登记不了。
+ * ⚠ 取不到就留 null：由调用方明确拒绝，⛔ 不静默回落 CPU（CPU 也能算出一个分数，
  *   而那正是这类验收最容易骗人的地方）。
  */
+let CAMPLUS_MODEL_PATH = null;
 let CAMPLUS_CTX_PATH = null;
 {
   const m = await resolveLogicalModel('model.campplus');
   if (m?.available === true) {
     CAMPLUS_CTX_PATH = m.executable.path;
+    CAMPLUS_MODEL_PATH = companionFile(m, 'model.campplus.graph', 'model');
     console.log(`[termux-speech] model.campplus → ${CAMPLUS_CTX_PATH} (${m.executable.kind})`);
+    console.log(`[termux-speech] model.campplus enrollment graph → ${CAMPLUS_MODEL_PATH}`);
   } else {
     console.log(`[termux-speech] model.campplus not usable: ${m?.reason} — ${m?.hint ?? ''}`);
   }
@@ -276,6 +280,358 @@ const android = createAndroidAppClient({
   frameworkUrl: FRAMEWORK_URL,
   systemKey: SYSTEM_KEY,
 });
+
+/**
+ * ⭐ docs/096：**App 三层 Pipeline 是唯一 runtime source of truth**。
+ * Speech 只保存 desired，effective 永远现读 App。
+ */
+const appPipeline = createAppPipelineClient(android);
+
+/** 使用者想要的三层组合（落 conf）。⛔ 它**不是** effective。 */
+const desiredPipeline = () => {
+  const d = cfg.pipeline ?? {};
+  return {
+    trigger: TRIGGERS.includes(d.trigger) ? d.trigger : 'stop',
+    // ⛔ 旧值先规范化再判：`camplus` 是合法的持久值，不是错误输入。
+    segment: SEGMENTS.includes(canonicalSegment(d.segment ?? ''))
+      ? canonicalSegment(d.segment) : 'fireredvad',
+    asr: ASRS.includes(d.asr) ? d.asr : 'sensevoice',
+  };
+};
+
+/** 读 App 的真实 pipeline；读不到就如实说读不到，⛔ 不拿 desired 冒充。 */
+const appPipelineSnapshot = async () => {
+  try {
+    return { ok: true, value: await appPipeline.get() };
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+};
+
+/**
+ * ⭐ **App runtime telemetry 的本地缓存**（docs/097 §七）。
+ *
+ * 页面上所有 runtime 事实——三层 effective、触发门、断句、ASR、麦克风、RMS——
+ * 从此**只有这一个来处**。⛔ 不再从本包的 `rms_gate` / `vad` / `speaker_activity`
+ * 推导：那三个域的执行体早已搬进 App，它们此刻描述的是一台**停着的机器**
+ * （真机实录：`rms.last_frame_age_ms = 12,735,059`，即三个半小时前的最后一帧，
+ * 而 App 那边 `frame_seq` 每 100 ms 加一次）。
+ * ⚠ 这正是「读得出值、类型也对、答案安静地错」的那一类：页面照旧画得出柱子，
+ *   只是画的是三个半小时前的世界。
+ *
+ * ⭐ **观测的成本正比于有没有人在看**：没有观测者时这里一次 HTTP 都不发。
+ *   两档节奏刻意分开——RMS 与 CAM/VAD 每秒都在动（fast），
+ *   三层 effective 与门配置几秒才可能变一次（slow）。合成一档的话，
+ *   要么慢档把 LIVE 拖成静止图，要么快档把不变的东西每 300 ms 问一遍。
+ */
+const APP_TELEMETRY_FAST_MS = 300;
+const APP_TELEMETRY_SLOW_MS = 1500;
+/** 超过这个岁数就不再假装它是"现在"。两档各有各的预算。 */
+const APP_TELEMETRY_STALE_MS = 4000;
+const APP_TELEMETRY_SLOW_STALE_MS = 8000;
+
+const appRuntime = {
+  pipeline: null,
+  pipeline_error: null,
+  activity: null,
+  activity_error: null,
+  gate: null,
+  gate_error: null,
+  segment: null,
+  segment_error: null,
+  mic: null,
+  mic_error: null,
+  policy: null,
+  policy_error: null,
+  slow_at_ms: 0,
+  fast_at_ms: 0,
+  slow_polls: 0,
+  fast_polls: 0,
+  poll_errors: 0,
+};
+
+const applyTelemetryPart = (key, part) => {
+  if (!part) return;
+  if (part.ok) {
+    appRuntime[key] = part.value ?? null;
+    appRuntime[`${key}_error`] = null;
+  } else {
+    appRuntime[`${key}_error`] = part.error ?? 'unknown';
+    appRuntime.poll_errors += 1;
+  }
+};
+
+/**
+ * ⭐ **两档各有各的互斥锁**，⛔ 不共用一个。
+ *
+ * ⚠ 第一版共用一把：fast 每 300ms 一次、slow 每 1500ms 一次，两次 HTTP 的 in-flight
+ *   窗口足以让 fast **每一次**都把 slow 挡在门外——真机实测 `fast=1053 / slow=2`。
+ *   症状极其难看出来：页面上六个值互相一致、RMS 在动、`fresh=true`，
+ *   只是 `effective` 停在切换之前。⭐ **用一个和它无关的时钟去证明另一件事的新鲜度**，
+ *   得到的是一个自信的错误答案。
+ */
+let fastInFlight = false;
+let slowInFlight = false;
+const pollAppTelemetry = async (kind = 'slow') => {
+  const fast = kind === 'fast';
+  if (fast ? fastInFlight : slowInFlight) return;
+  if (fast) fastInFlight = true; else slowInFlight = true;
+  try {
+    if (kind === 'fast') {
+      const parts = await appPipeline.fastTelemetry();
+      applyTelemetryPart('activity', parts.activity);
+      applyTelemetryPart('mic', parts.mic);
+      appRuntime.fast_at_ms = Date.now();
+      appRuntime.fast_polls += 1;
+    } else {
+      const parts = await appPipeline.telemetry();
+      applyTelemetryPart('pipeline', parts.pipeline);
+      applyTelemetryPart('activity', parts.activity);
+      applyTelemetryPart('gate', parts.gate);
+      applyTelemetryPart('segment', parts.segment);
+      applyTelemetryPart('mic', parts.mic);
+      applyTelemetryPart('policy', parts.policy);
+      appRuntime.slow_at_ms = Date.now();
+      appRuntime.fast_at_ms = appRuntime.slow_at_ms;
+      appRuntime.slow_polls += 1;
+    }
+    hub?.markHot();
+    hub?.schedule();
+  } catch (error) {
+    appRuntime.poll_errors += 1;
+  } finally {
+    if (fast) fastInFlight = false; else slowInFlight = false;
+  }
+};
+
+/**
+ * ⭐ 与 [ResidentGraphs] 同形的**对账收敛器**，⛔ 不是「开机试一次」：
+ *   一个只在启动时跑一次的轮询，一次瞬时故障就会变成永久故障（docs/087 §14①）。
+ */
+const startAppTelemetry = () => {
+  /**
+   * ⭐ **一个 tick 决定两档**，⛔ 不是两个各自独立的 setInterval。
+   * ⚠ 两个 timer 的版本里，慢档的判据是"此刻有没有 watcher"——而 watcher 在两次
+   *   长轮询之间会短暂消失，1.5 秒的采样点正好经常落在那个缝里。
+   *   现在慢档的判据换成**它自己上一次跑是多久以前**，与 watcher 的抖动无关。
+   */
+  const tick = setInterval(() => {
+    if (!hub?.watching) return;
+    void pollAppTelemetry('fast');
+    if (Date.now() - appRuntime.slow_at_ms >= APP_TELEMETRY_SLOW_MS) void pollAppTelemetry('slow');
+  }, APP_TELEMETRY_FAST_MS);
+  if (typeof tick.unref === 'function') tick.unref();
+  void pollAppTelemetry('slow');
+};
+
+/** 短标签（Header 那六格只有两三个字符的宽度）。 */
+const TRIGGER_SHORT = Object.freeze({
+  stop: 'STOP', passthrough: 'PASS', volume: 'VOL', clap: 'CLAP',
+});
+const TRIGGER_LABEL = Object.freeze({
+  stop: '停止', passthrough: '直通', volume: '音量', clap: '拍掌',
+});
+/**
+ * ⭐ docs/099：断句器只有 FR 一个；CAM++ 是可选的 **outer 本人过滤**。
+ * ⚠ 旧值 `camplus` 仍留在表里 —— 那是**读**得懂旧配置的需要，
+ *   ⛔ 不是说它还是一个断句器。
+ */
+const SEGMENT_SHORT = Object.freeze({
+  fireredvad: 'FR', fireredvad_camplus: 'FR+C', camplus: 'FR+C',
+});
+const SEGMENT_LABEL = Object.freeze({
+  fireredvad: 'FireRedVAD',
+  fireredvad_camplus: 'FireRedVAD + CAM++（本人过滤）',
+  camplus: 'FireRedVAD + CAM++（本人过滤）',
+});
+const ASR_SHORT = Object.freeze({ sensevoice: 'SV' });
+const ASR_LABEL = Object.freeze({ sensevoice: 'SenseVoice' });
+
+/**
+ * ⭐ **页面上每一个 runtime 事实的唯一投影**（docs/097）。
+ *
+ * ⛔ 这里不新建任何状态机：`effective`/`state`/`generation` 全部由 App 计算，
+ *   本函数只把四个只读端点摆成页面直接能用的形状，并**如实标注新鲜度**。
+ * ⚠ `fresh=false` 时页面必须说「读不到」，⛔ 不许把最后一次读到的值当成现在——
+ *   那正是本轮要修的那个毛病，只是换了一层。
+ */
+const appPipelineProjection = () => {
+  const now = Date.now();
+  const p = appRuntime.pipeline;
+  /**
+   * ⚠ **两种形状**：`GET /api/speech/pipeline` 在 App 那边是**扁的**
+   *   （`{requested, effective, state, generation, runtime}`），而本包对外那条
+   *   `/pipeline` 把它包进 `app`。这里读的是 App 的原始响应，⛔ 不是本包的包装。
+   * ⭐ 第一版写成 `p?.app` ⇒ 恒为 `null` ⇒ 整份投影 `effective/state/generation`
+   *   全是 `null`，而 `ok:true`、`errors:0`、日志一个字都没有——页面只写着
+   *   「App 状态未知」。**读一个不存在的字段会得到一个合法但错误的答案**（docs/092 同形）。
+   *   两种形状都认，判据是「有没有 `effective` 这个字段」而不是猜。
+   */
+  const app = (p && typeof p === 'object' && 'effective' in p) ? p : (p?.app ?? null);
+  const eff = app?.effective ?? null;
+  const req = app?.requested ?? null;
+  const rt = app?.runtime ?? {};
+  const act = appRuntime.activity ?? {};
+  const gateState = appRuntime.gate ?? {};
+  const seg = appRuntime.segment ?? {};
+  const mic = appRuntime.mic ?? {};
+  /** ⭐ 阈值只有一个来处：**App 的 policy**。⛔ 不再从本包 conf 里读第二份。 */
+  const policy = appRuntime.policy ?? {};
+  const desired = desiredPipeline();
+  const trigger = eff?.trigger ?? null;
+  const provider = eff?.segment ?? rt.segment_provider ?? act.segment_provider ?? null;
+  const asrBackend = eff?.asr ?? rt.asr_provider ?? seg.backend ?? null;
+  const state = app?.state ?? null;
+  const camConfig = policy.speaker ?? {};
+  /**
+   * ⭐ 「切换中」是一个**真状态**，⛔ 不是 desired≠effective 的推论：
+   *   App 自己知道它在不在做全图 reset，而那件事最长 7 秒。
+   */
+  const transitioning = state === 'transitioning' || app?.transition != null;
+  return {
+    schema: 'termux-os.speech-app-pipeline.v1',
+    ok: p != null,
+    error: appRuntime.pipeline_error,
+    observed_at_ms: appRuntime.slow_at_ms || null,
+    fast_at_ms: appRuntime.fast_at_ms || null,
+    /**
+     * ⭐ **新鲜度按各自的时钟算**，⛔ 不拿 fast 的时钟替 slow 背书：
+     *   RMS 在动**不能**证明 `effective` 是现在的（真机上正是这样错过一次）。
+     */
+    fresh: appRuntime.fast_at_ms > 0 && (now - appRuntime.fast_at_ms) < APP_TELEMETRY_STALE_MS
+      && appRuntime.slow_at_ms > 0 && (now - appRuntime.slow_at_ms) < APP_TELEMETRY_SLOW_STALE_MS,
+    age_ms: appRuntime.fast_at_ms > 0 ? now - appRuntime.fast_at_ms : null,
+    pipeline_age_ms: appRuntime.slow_at_ms > 0 ? now - appRuntime.slow_at_ms : null,
+    polls: { fast: appRuntime.fast_polls, slow: appRuntime.slow_polls, errors: appRuntime.poll_errors },
+    /** 使用者保存在 conf 里的三层组合。⛔ 它不是 runtime。 */
+    desired,
+    requested: req,
+    effective: eff,
+    labels: eff
+      ? {
+        trigger: TRIGGER_LABEL[eff.trigger] ?? eff.trigger,
+        segment: SEGMENT_LABEL[eff.segment] ?? eff.segment,
+        asr: ASR_LABEL[eff.asr] ?? eff.asr,
+        trigger_short: TRIGGER_SHORT[eff.trigger] ?? '—',
+        segment_short: SEGMENT_SHORT[eff.segment] ?? '—',
+        asr_short: ASR_SHORT[eff.asr] ?? '—',
+      }
+      : null,
+    state,
+    transitioning,
+    generation: app?.generation ?? null,
+    transition: app?.transition ?? null,
+    last_error: app?.last_error ?? p?.app_error ?? null,
+    running: state === 'running',
+    stopped: trigger === 'stop' || state === 'stopped',
+    /** 麦克风：App 说了算。⛔ 页面不再从 holders 里猜。 */
+    mic: {
+      enabled: mic.enabled === true || rt.mic_enabled === true,
+      recording: mic.recording === true,
+      fgs_running: mic.fgs_running === true,
+      rms: Number.isFinite(Number(mic.rms)) ? Number(mic.rms) : null,
+      frame_seq: mic.frame_seq ?? null,
+      rate: mic.rate ?? null,
+      routed_device: mic.routed_input_device ?? null,
+      error: appRuntime.mic_error,
+    },
+    /** 触发层（第一层）。`armed` 与 `open` 是两件事：布防 vs 此刻开着。 */
+    trigger: {
+      mode: trigger,
+      label: TRIGGER_LABEL[trigger] ?? null,
+      short: TRIGGER_SHORT[trigger] ?? null,
+      armed: rt.trigger_armed === true,
+      /** ⭐ 直通就是「永远开着」——⛔ 不该再显示 RMS 阈值判定当作触发。 */
+      open: trigger === 'passthrough' ? true : rt.admitted === true || act.admitted === true,
+      gate_mode: rt.gate_mode ?? gateState.mode ?? null,
+      running: gateState.running === true,
+      threshold: Number(gateState.volume?.threshold ?? policy.gate?.volume_threshold ?? NaN),
+      frames: gateState.volume?.frames ?? policy.gate?.volume_frames ?? null,
+      streak: gateState.volume?.streak ?? null,
+      tolerance: gateState.tolerance ?? null,
+      clap_profile_ready: gateState.profile?.ready === true,
+      clap_candidates: gateState.feature?.candidates ?? null,
+      clap_last_score: gateState.feature?.last_match_score ?? null,
+      last_snr_db: gateState.feature?.last_snr_db ?? null,
+      /** 拍掌模板空 ⇒ 门永远开不了，而这件事页面上必须说得出来。 */
+      blocked: trigger === 'clap' && gateState.profile?.ready !== true,
+      error: appRuntime.gate_error,
+    },
+    /** 断句层（第二层）。两个 provider 的字段刻意分开摆，⛔ 不互相冒充。 */
+    segment: {
+      provider,
+      label: SEGMENT_LABEL[provider] ?? null,
+      short: SEGMENT_SHORT[provider] ?? null,
+      running: rt.segment_running === true || act.running === true,
+      admitted: act.admitted === true || rt.admitted === true,
+      backend: rt.segment_backend ?? act.graph?.backend ?? null,
+      compute_unit: act.compute_unit ?? null,
+      windows_run: act.windows_run ?? null,
+      windows_due: act.windows_due ?? null,
+      vad_frames_run: act.vad_frames_run ?? null,
+      last_infer_ms: Number.isFinite(Number(act.last_infer_ms)) ? Number(act.last_infer_ms) : null,
+      infer_ms_total: Number.isFinite(Number(act.infer_ms_total)) ? Number(act.infer_ms_total) : null,
+      state: act.state ?? null,
+      transitions: act.transitions ?? null,
+      /** CAM++ 专有 */
+      /** ⭐ CAM++ 相似度只在**开了本人过滤**时有意义（docs/099）。 */
+      cam_filter: provider === 'fireredvad_camplus',
+      similarity: provider === 'fireredvad_camplus' && Number.isFinite(Number(act.last_similarity))
+        ? Number(act.last_similarity) : null,
+      profile_ready: act.profile_ready === true,
+      enter_threshold: Number(camConfig.enter_threshold ?? 0.4),
+      exit_threshold: Number(camConfig.exit_threshold ?? 0.35),
+      last_user_mono_ms: act.last_user_mono_ms ?? null,
+      user_confirms: act.user_confirms ?? null,
+      /** FireRedVAD 专有 */
+      vad_probability: Number.isFinite(Number(act.last_vad_probability))
+        ? Number(act.last_vad_probability) : null,
+      vad_threshold: Number(policy.vad?.speech_threshold ?? 0.5),
+      /**
+       * ⭐ **帧级断句器的实况**（docs/098）。⛔ 页面不从 policy 推「现在按哪套在切」——
+       *   policy 是**想要什么**，这里是 App 报回来的**正在跑什么**。
+       */
+      segmenter: act.vad_segmenter ?? null,
+      boundaries: act.vad_boundaries ?? null,
+      last_boundary: act.last_vad_boundary ?? null,
+      /**
+       * ⭐ **断句层此刻跑不跑得动**——⛔ 与 `running`（执行体线程活着）不是一回事。
+       *
+       * ⚠ 真机（app 0.22.0，2026-08-29）：NPU SSR 1007 之后 `running`/`admitted`/
+       *   常驻 `state:"loaded"`/`/api/inference/health` 全部为真，页面四个绿灯全亮，
+       *   而 2658 个 tick **成功批次 0**。当时错误字符串就躺在这份 JSON 的
+       *   `counters.vad_last_error` 里，而本投影读的是 `act.last_error`——
+       *   那是 **CAM++ 的**错误槽，恒为 null。
+       * ⭐ **两个不同的错误共用了「error」这个名字，而页面读的恰好是不会出错的那一个。**
+       */
+      stalled: act.vad_stalled === true,
+      stall_error: act.counters?.vad_last_error ?? null,
+      worker_health: act.vad_health?.worker_state ?? null,
+      graph_repairs: act.counters?.vad_graph_repairs ?? null,
+      error: act.last_error ?? appRuntime.activity_error,
+    },
+    /** 转录层（第三层）。 */
+    asr: {
+      backend: asrBackend,
+      label: ASR_LABEL[asrBackend] ?? null,
+      short: ASR_SHORT[asrBackend] ?? null,
+      ready: rt.asr_ready === true || seg.readiness?.ready === true,
+      in_flight: rt.asr_in_flight ?? null,
+      paused: rt.asr_paused === true,
+      state: seg.state ?? null,
+      active: seg.active === true,
+      counters: seg.counters ?? null,
+      session: seg.readiness?.session ?? null,
+      reason: seg.readiness?.reason ?? null,
+      error: appRuntime.segment_error,
+    },
+    graphs: rt.graphs ?? null,
+    /** 使用者可调的那一组参数：⛔ 页面不再从本包 conf 读第二份（docs/097 §十一）。 */
+    policy: policy.schema ? policy : null,
+    policy_error: appRuntime.policy_error,
+  };
+};
+
 const gate = new RmsGate(cfg.rms_gate);
 const pipeline = new PipelineLease();
 const bus = new StateBus({
@@ -323,6 +679,22 @@ let speakerActivity = null;
  * ⛔ 与 `speakerActivity`（旧的 legacy 执行体）是**二选一**，⛔ 不是叠加的两条链：
  *   `cfg.speaker_activity.executor` 决定此刻谁在执行，`executorClaims` 决定状态里怎么说。
  */
+/**
+ * ⭐ **旧 runtime ownership 的单一总闸**（docs/096）。
+ *
+ * App 的三层 Pipeline（Trigger → Segment → ASR）是唯一 execution owner。
+ * 这个常量为 `false` 时，Speech **绝不**再写 App 的 runtime：
+ *   ⛔ 不 syncAppSegmentBackend、⛔ 不 startChain('boot')、
+ *   ⛔ 不 /api/speech/activity/{model,config,start,mode,admission}、
+ *   ⛔ 不声明任何 tsp-* 常驻。
+ *
+ * ⚠ 为什么先加闸而不是直接删：上一轮已经证明**旧 Speech 一启动就会覆盖 App**
+ *   （`chain_desired="started"` ⇒ startChain('boot') ⇒ ensureRunning + admit）。
+ *   删代码要改十几处，而在删干净之前的任何一次 dev reload 都可能把 App 打翻。
+ *   ⭐ **先让危险路径一行都跑不到，再从容删**——闸是过渡物，不是第二套状态机。
+ */
+const LEGACY_RUNTIME_OWNERSHIP = false;
+
 let appActivity = null;
 /**
  * ⭐ docs/088 P4：自动模式的断句 / A-B / ASR 全在 App，本包只**消费结果**。
@@ -352,6 +724,8 @@ let appAsrError = null;
  */
 let AUTOMATIC_CAM_TIMEOUT_MS = DEFAULT_USER_WATCHDOG_TIMEOUT_MS;
 const automaticCamWatchdog = new UserWatchdog({ timeoutMs: AUTOMATIC_CAM_TIMEOUT_MS });
+/** FireRedVAD provider 在自动模式的当前 arm 代次；防止每一帧重复开 session。 */
+let automaticFireRedArmEpoch = null;
 
 /**
  * policy 改了倒计时长度。⚠ **不重置正在跑的那一轮**：使用者正说着话时改参数，
@@ -368,6 +742,11 @@ const applyUserTimeout = (ms) => {
 /** CAM++ start/stop 必须串行，避免手动切入时与自动启动交叉。 */
 let speakerActivityTransition = Promise.resolve();
 
+/** 当前 VAD provider 是配置语义，不由 listen/自动模式另存一份。 */
+const selectedVadProvider = () => cfg.vad?.provider === 'fireredvad' ? 'fireredvad' : 'campplus';
+const campPlusSelected = () => selectedVadProvider() === 'campplus';
+const fireRedSelected = () => selectedVadProvider() === 'fireredvad';
+
 /**
  * ⭐ 自动 CAM++ 的三个事实分开投影：
  *   ① `automatic_cam_live`：RMS 已开门，当前帧才有资格进入 CAM++；
@@ -378,7 +757,10 @@ let speakerActivityTransition = Promise.resolve();
  * PCM；只看它会把上一次开门留下的 USER/相似度误投影到 RMS 门前。
  */
 const automaticCamModeActive = () =>
-  lifecycle?.leases?.size === 0 && cfg.speaker_activity?.enabled === true;
+  campPlusSelected()
+  && lifecycle?.chain === 'started'
+  && lifecycle?.leases?.size === 0
+  && cfg.speaker_activity?.enabled === true;
 
 /** 使用者选的执行器（⛔ 不代表它此刻真的在跑，见 `appActivityActive`）。 */
 const activityExecutorMode = () => cfg.speaker_activity?.executor ?? 'app';
@@ -408,6 +790,18 @@ const automaticCamExecutorLive = () =>
 const automaticCamLiveAdmitted = (current = null) => {
   const snapshot = current ?? gate.snapshot();
   return automaticCamModeActive()
+    && automaticCamExecutorLive()
+    && pipeline.owner === PIPELINE_OWNERS.VAD
+    && snapshot?.state === 'open'
+    && snapshot?.pcm_admission === 'allow';
+};
+
+/** CAM++ provider 在自动与手动 listen 两种模式共用同一个 live 判据。 */
+const camPlusLiveAdmitted = (current = null) => {
+  const snapshot = current ?? gate.snapshot();
+  const modeActive = campPlusSelected()
+    && (automaticCamModeActive() || listenEngaged());
+  return modeActive
     && automaticCamExecutorLive()
     && pipeline.owner === PIPELINE_OWNERS.VAD
     && snapshot?.state === 'open'
@@ -772,8 +1166,9 @@ const publishStates = (value) => {
  * ⭐ 「有没有人在说话，是不是本人」——由**判定方**的事实归一，⛔ 不是页面猜的。
  *
  * 两条链的权威不同，所以来源也不同：
- *   · 常驻链由 CAM++ 判 USER/OTHER ⇒ `source=resident`，`user_state` 有意义；
- *   · 手动链只有 FireRedVAD（它只回答「有没有人声」）⇒ `source=manual`，
+ *   · CAM++（自动或手动）由选定的 App/legacy 执行体判 USER/OTHER
+ *     ⇒ `source=resident`，`user_state` 有意义；
+ *   · FireRedVAD（自动或手动）只回答「有没有人声」⇒ `source=manual`，
  *     `user_state=unknown`——⚠ **不假装做了声纹判断**。
  * ⛔ CAM++ 的 similarity 分数不进公共状态：那是实现细节，下游读了也没法用。
  */
@@ -784,8 +1179,8 @@ const syncPublicActivity = () => {
    *   consumer 是关着的（它不需要 PCM），于是这里会掉进「手动 FireRedVAD」那一支，
    *   把 CAM++ 的 USER 判决整个投影成 `unknown`，**而两边都不报错**。
    */
-  if (appActivityActive()) {
-    if (!automaticCamLiveAdmitted()) {
+  if (campPlusSelected() && appActivityActive()) {
+    if (!camPlusLiveAdmitted()) {
       return publicState.setActivity({ active: false, source: null, userState: 'unknown' });
     }
     const fsm = String(appActivity.snapshot().app_state ?? '');
@@ -803,10 +1198,10 @@ const syncPublicActivity = () => {
    * RMS 关门时 CAM 的模型可以仍然 resident，但它没有 live 输入资格。
    * 先清掉公共活动，再读 CAM 快照；否则上一次门内的 USER 会一直挂在页面上。
    */
-  if (camEnabled && !automaticCamLiveAdmitted()) {
+  if (camEnabled && !camPlusLiveAdmitted()) {
     return publicState.setActivity({ active: false, source: null, userState: 'unknown' });
   }
-  if (cam?.enabled) {
+  if (campPlusSelected() && cam?.enabled) {
     const fsm = String(cam.state ?? '');
     const active = fsm === 'USER' || fsm === 'MAYBE_USER' || fsm === 'MAYBE_END';
     return publicState.setActivity({
@@ -861,6 +1256,7 @@ const observeGateLifecycle = (snapshot, nowMs = Date.now()) => {
   vad.observeGate(snapshot, nowMs);
   if (lifecycle.type === 'idle') {
     automaticCamWatchdog.clear();
+    automaticFireRedArmEpoch = null;
     /** 清掉门内残留的相似度/FSM；不释放 CAM 图，只结束这次 RMS 准入。 */
     if (consumers.enabled('speaker_activity')) {
       speakerActivity.resetAdmission('rms_gate_closed');
@@ -868,14 +1264,29 @@ const observeGateLifecycle = (snapshot, nowMs = Date.now()) => {
     syncPublicActivity();
   }
   /**
-   * RMS 是 admission，不是自动启动 FireRedVAD 的命令。
-   * 自动模式的唯一处理者是 CAM++；这里仅建立它的 8 秒 USER 准入窗口。
-   * FireRedVAD 的 arm 只允许从显式 listen 路径进入。
-   *
-   * 不把建立动作绑死在 open 事件上：CAM++ 可能晚于 RMS 开门完成加载，
-   * `ensureAutomaticCamAdmission` 会沿用本次门的 opened_at_ms，不重置计时。
+   * RMS 是 admission。CAM++ 只建立 USER 准入窗口；选择 FireRedVAD 时，
+   * 同一个 gate lifecycle 在自动模式 arm 一张 FireRedVAD，绝不同时启动 CAM++。
    */
   ensureAutomaticCamAdmission(snapshot, monotonicNowMs());
+  if (fireRedSelected() && !listenEngaged()
+    && lifecycle?.chain === 'started'
+    && pipeline.owner === PIPELINE_OWNERS.VAD
+    && snapshot?.state === 'open'
+    && snapshot?.pcm_admission === 'allow') {
+    const epoch = pipeline.epoch;
+    if (automaticFireRedArmEpoch !== epoch) {
+      automaticFireRedArmEpoch = epoch;
+      void armVadForCurrentPipeline(
+        { source: 'automatic', reason: 'automatic_fireredvad' },
+        'automatic_fireredvad',
+      ).then((result) => {
+        if (!result?.ok && result?.reason !== 'stale_pipeline') automaticFireRedArmEpoch = null;
+      }).catch((error) => {
+        automaticFireRedArmEpoch = null;
+        console.log(`[termux-speech] automatic FireRedVAD arm failed: ${error?.message ?? error}`);
+      });
+    }
+  }
   // ⭐ P3：门的开关低频告诉 App 执行体。⛔ 只在生命周期真的变了的这一点上调。
   syncAppActivityAdmission(lifecycle.type === 'idle' ? 'rms_gate_closed' : 'rms_gate');
   return lifecycle;
@@ -991,11 +1402,21 @@ async function primeAmbientForSession(reason) {
 
 async function armVadForCurrentPipeline(trigger, reason) {
   const epoch = pipeline.epoch;
-  if (!listenEngaged()) {
+  const automaticFireRed = !listenEngaged()
+    && fireRedSelected()
+    && lifecycle?.chain === 'started';
+  if (!listenEngaged() && !automaticFireRed) {
     return { ok: false, reason: 'manual_listen_required' };
   }
   if (pipeline.owner !== PIPELINE_OWNERS.VAD) {
     return { ok: false, reason: `owner_${pipeline.owner}` };
+  }
+  // CAM++ 自己就是 selected VAD provider。它需要 gate/pipeline 的所有权，
+  // 但不应再额外 arm FireRedVAD；否则两张 VAD 会同时消费同一条音频。
+  if (campPlusSelected()) {
+    syncPipelineAuthority();
+    onStageChange();
+    return { ok: true, reason: 'campplus_provider', owner: PIPELINE_OWNERS.VAD };
   }
   foreground.reset(reason);
   await primeAmbientForSession(reason);
@@ -1061,13 +1482,16 @@ const engageProcessing = (trigger, reason) => engagePipeline(trigger, reason);
  */
 const listenEngaged = () => lifecycle?.leases?.size > 0;
 
-const currentVadMode = () => listenEngaged()
-  ? 'fireredvad_manual'
-  : consumers.enabled('speaker_activity') ? 'camplus_automatic' : 'idle';
+const currentVadMode = () => {
+  if (listenEngaged()) return campPlusSelected() ? 'campplus_manual' : 'fireredvad_manual';
+  if (lifecycle?.chain === 'started') {
+    return campPlusSelected() ? 'campplus_automatic' : 'fireredvad_automatic';
+  }
+  return 'idle';
+};
 
 /**
- * 两个处理模式的唯一分界：没有 listen lease 时由 CAM++ 工作，
- * 有 listen lease 时由 FireRedVAD 工作。
+ * VAD provider 由配置选择；listen 只改变当前模式，不偷偷替换 provider。
  */
 const camPlusOwnsAutomaticSpeech = () =>
   automaticCamModeActive();
@@ -1093,7 +1517,7 @@ const transitionSpeakerActivity = (enabled, reason) => {
       await appActivity.ensureRunning(activityRuntimeConfig());
       // ⚠ 起来之后立刻把当前门的状态补一次：门可能**先于**执行体开着，
       //   而 admission 是边沿触发的——不补的话这一轮永远等不到开门。
-      await appActivity.admit(automaticCamLiveAdmitted(), 'executor_started');
+      await appActivity.admit(camPlusLiveAdmitted(), 'executor_started');
     }
     if (wantLegacy && !speakerActivity.enabled) await speakerActivity.start();
   }).catch((error) => {
@@ -1129,17 +1553,20 @@ const syncAppActivityAdmission = (reason) => {
    *   开机那一刻的一次瞬时失败不该变成永久失败，而使用者能观察到的
    *   最频繁的事实就是「他拍了一下手」——把对账挂在它上面，成本正比于使用次数。
    */
-  if (activityExecutorMode() === 'app') void appActivity?.ensureRunning(activityRuntimeConfig());
-  // ⭐ App 段落 backend 固定跟随当前唯一的 SenseVoice 事实。
+  // ⛔ docs/096：backend 与 admission 都归 App Pipeline，Speech 不再从这里写它。
+  if (!LEGACY_RUNTIME_OWNERSHIP) return;
+  // ⭐ App 段落 backend 固定跟随当前 cfg.asr.model 选择。
   void syncAppSegmentBackend(configuredBackend(), reason).catch((error) => {
     console.log(`[termux-speech] App ASR backend sync (${reason}) failed: ${error?.message ?? error}`);
   });
+  if (!campPlusSelected()) return;
+  if (activityExecutorMode() === 'app') void appActivity?.ensureRunning(activityRuntimeConfig());
   if (!appActivityActive()) return;
-  void appActivity.admit(automaticCamLiveAdmitted(), reason);
+  void appActivity.admit(camPlusLiveAdmitted(), reason);
 };
 
 const automaticCamSegmentAllowed = () => {
-  return automaticCamLiveAdmitted();
+  return camPlusLiveAdmitted();
 };
 
 const noteAutomaticCamUser = (event) => {
@@ -1203,14 +1630,32 @@ const assistantMicProjection = (mic) => {
   };
 };
 
+const automaticProviderReady = () => {
+  if (fireRedSelected()) return consumers.enabled('vad');
+  return activityExecutorMode() === 'app'
+    ? appActivityActive()
+    : consumers.enabled('speaker_activity');
+};
+
 const assistantMode = () => {
   if (listenEngaged()) return 'manual';
-  if (lifecycle?.chain === 'started' && consumers.enabled('speaker_activity')) return 'automatic';
+  // The selected VAD owns automatic readiness: FireRedVAD owns the PCM VAD
+  // consumer; CAM++ follows the App/legacy activity executor.  Do not ask
+  // every provider to satisfy the retired CAM++ consumer check.
+  if (lifecycle?.chain === 'started' && automaticProviderReady()) return 'automatic';
   return 'stop';
 };
 
 const assistantCallProjection = () => {
   const cam = speakerActivity?.snapshot?.() ?? {};
+  const fireRed = fireRedSelected();
+  const selectedConsumer = fireRed ? consumers.enabled('vad') : consumers.enabled('speaker_activity');
+  const selectedGraphLoaded = fireRed
+    ? vad?.snapshot?.()?.ready === true
+    : cam.graph_loaded === true || cam.graphLoaded === true;
+  const selectedInferenceAdmitted = fireRed
+    ? vad?.snapshot?.()?.handoff?.active === true
+    : automaticCamLiveAdmitted();
   const mic = assistantMicProjection(sources.mic);
   return {
     schema: 'termux-os.speech-assistant-call.v1',
@@ -1221,11 +1666,12 @@ const assistantCallProjection = () => {
     last: assistantCallState.last,
     mic,
     automatic: {
+      provider: selectedVadProvider(),
       enabled_in_config: cfg?.speaker_activity?.enabled === true,
-      consumer_enabled: consumers.enabled('speaker_activity'),
-      graph_enabled: cam.enabled === true,
-      graph_loaded: cam.graph_loaded === true || cam.graphLoaded === true,
-      inference_admitted: automaticCamLiveAdmitted(),
+      consumer_enabled: selectedConsumer,
+      graph_enabled: fireRed ? selectedConsumer : cam.enabled === true,
+      graph_loaded: selectedGraphLoaded,
+      inference_admitted: selectedInferenceAdmitted,
       watchdog: automaticCamAdmissionSnapshot(),
     },
     manual: {
@@ -1281,9 +1727,11 @@ const awaitValidPcm = async (timeoutMs = 8000) => {
 };
 
 const enterListen = async ({ reason, requester }) => {
-  // 先关 CAM++，再打开 FireRedVAD consumer；两个推理者不能重叠。
+  // 先停当前 CAM++ 执行体；随后只打开 policy 选中的 provider。
+  const useCamPlus = campPlusSelected();
   automaticCamWatchdog.clear();
   consumers.setEnabled('speaker_activity', false);
+  consumers.setEnabled('vad', false);
   syncPcmDemand();
   await transitionSpeakerActivity(false, 'manual_listen');
   // SpeakerActivity.stop() 会按进入前状态恢复旧的声纹门；手动模式仍要再明确关掉它。
@@ -1291,22 +1739,34 @@ const enterListen = async ({ reason, requester }) => {
   speakerGate.forceIdle('manual_listen');
   // 停链状态下也允许 listen：它要 PCM，就自己登记成 consumer（而不是绕过聚合去要麦克风）。
   consumers.setEnabled('rms', true);
-  consumers.setEnabled('vad', true);
+  consumers.setEnabled('vad', !useCamPlus);
   syncPcmDemand();
   const engaged = await lifecycle.engage(requester, { reason });
   if (!engaged.ok) {
     syncChainConsumers();          // 进不去就把临时打开的那两个收回去
     return { ok: false, reason: engaged.reason, error: engaged.error ?? null, value: listenSnapshot() };
   }
+  if (useCamPlus) {
+    consumers.setEnabled('speaker_activity', legacyActivityWanted());
+    syncPcmDemand();
+    await transitionSpeakerActivity(true, 'manual_listen');
+  }
   if (engaged.reason === 'already_engaged') {
     return { ok: true, reason: 'already_engaged', value: listenSnapshot() };
   }
-  pcm.ensure();
-  const ready = await awaitValidPcm();
-  if (!ready.ok) {
-    await lifecycle.release(requester, { force: true, reason: ready.reason });
-    syncChainConsumers();
-    return { ok: false, reason: ready.reason, value: listenSnapshot() };
+  // 正式 App CAM++ 不订阅 Speech 的 PCM WS：它在 App 内用 RMS 节拍和同一份
+  // PersistentMic 环完成 activity/segment admission。只有 FireRedVAD/legacy
+  // 路径才需要等待本包自己的 PCM prebuffer；无条件等待会把 CAM++ 手动模式
+  // 永远判成 pcm_prebuffer_unavailable。
+  const appCamPlus = useCamPlus && activityExecutorMode() === 'app';
+  if (!appCamPlus) {
+    pcm.ensure();
+    const ready = await awaitValidPcm();
+    if (!ready.ok) {
+      await lifecycle.release(requester, { force: true, reason: ready.reason });
+      syncChainConsumers();
+      return { ok: false, reason: ready.reason, value: listenSnapshot() };
+    }
   }
   const outcome = await engageProcessing(
     { source: requester, reason }, 'listen_mode', { cue: false },
@@ -1389,10 +1849,23 @@ const syncPcmDemand = () => {
    * 于是麦克风被释放、App 的 Gate 再也拿不到帧——
    * 「关掉一条遥测」变成了「把整条链弄哑」。
    */
-  const wantMic = wantRms || wantPcm || lifecycle?.chain === 'started';
-  if (wantMic) {
+  /**
+   * ⭐ **观察者不是打开麦克风的理由。**
+   *
+   * ⚠ 真机复现过：使用者按下「关闭永久收音」，麦克风**真的停了**（`remaining_holders=[]`
+   *   / `recording=false` / `fgs=false`），然后页面下一次轮询 `/state` 续了 RMS 观察者租约
+   *   ⇒ `wantRms` 为真 ⇒ 这里把麦克风又**开了回来**。从使用者的座位上看，那个按钮什么也没做。
+   * ⭐ 规则：观察者可以让一支**已经开着**的麦克风继续开着（页面要看到实时值），
+   *   ⛔ 但它自己永远不许把一支关着的麦克风打开。
+   * ⚠ 校准台（lab / speaker）不算观察者——那是使用者按了「开始测试」，是明确的产品需求。
+   */
+  const productMic = wantPcm
+    || lifecycle?.chain === 'started'
+    || consumers.enabled('lab')
+    || consumers.enabled('speaker');
+  if (productMic) {
     if (!lifecycle.micHeld) void lifecycle.acquireMic().catch(() => {});
-  } else if (lifecycle.micHeld) {
+  } else if (lifecycle.micHeld && !wantRms) {
     void lifecycle.releaseMic().catch(() => {});
   }
 };
@@ -1455,7 +1928,9 @@ const applyChainConsumers = (on) => {
    * ⚠ 麦克风仍然要持——那是 `syncPcmDemand` 里的 `wantMic`，与传输需求分开。
    */
   syncRmsObserver();
-  consumers.setEnabled('vad', on && listenEngaged());
+  // selected provider is the only VAD consumer. FireRedVAD may be automatic;
+  // CAM++ must never be accompanied by a second FireRedVAD run.
+  consumers.setEnabled('vad', on && fireRedSelected());
   /**
    * ⭐ 正式 CAM++VAD 跟着链走，⛔ **不再由 `/activity-test/start` 决定**。
    *
@@ -1465,7 +1940,8 @@ const applyChainConsumers = (on) => {
    * ⚠ 默认**关**：它要吃一张 HTP ctx，而本机的 HTP 会话预算已经很紧
    *   （§容量问题）。使用者显式打开，才算他愿意为它腾位子。
    */
-  const wantActivity = on && cfg.speaker_activity?.enabled === true && !listenEngaged();
+  const wantActivity = on && campPlusSelected()
+    && (cfg.speaker_activity?.enabled === true || listenEngaged());
   /**
    * ⭐ P3：**只有 legacy 执行体才需要 PCM**。选 App executor 时这个 consumer 保持关闭，
    *   于是聚合表算出的 `wants_pcm` 在自动等待与自动转写期间都是 false——
@@ -1502,11 +1978,11 @@ const syncChainConsumers = () => {
 
 /** 开/关一个 consumer，并让聚合去决定水源。⛔ consumer 之间互不调用。 */
 const setConsumer = (name, on) => {
-  if (name === 'vad' && on === true && !listenEngaged()) {
-    throw new UpstreamError('FireRedVAD is available only in manual listen mode', 409);
+  if (name === 'vad' && on === true && !fireRedSelected()) {
+    throw new UpstreamError('FireRedVAD is not the selected VAD provider', 409);
   }
-  if (name === 'speaker_activity' && on === true && listenEngaged()) {
-    throw new UpstreamError('CAM++VAD is disabled during manual listen mode', 409);
+  if (name === 'speaker_activity' && on === true && !campPlusSelected()) {
+    throw new UpstreamError('CAM++ is not the selected VAD provider', 409);
   }
   const changed = consumers.setEnabled(name, on);
   syncPcmDemand();
@@ -1590,7 +2066,7 @@ asr = new AsrController({
   dataRoot: ASR_DATA_ROOT,
   config: cfg.asr,
   frontendRoot: senseFrontend?.root ?? null,
-  frontendFiles: senseFrontend?.files ?? null,
+    frontendFiles: senseFrontend?.files ?? null,
   executablePath: senseModel?.executable?.path ?? null,
   executableKind: senseModel?.executable?.kind ?? null,
   target: senseTarget,
@@ -1794,7 +2270,17 @@ const handleVadSegment = (segment) => {
  * 也不在模型缺失时让 package import 失败。
  */
 const vadModel = await resolveLogicalModel('model.fireredvad');
-const VAD_MODEL_PATH = vadModel?.available === true ? vadModel.executable?.path ?? null : null;
+/**
+ * ⭐ **已经路由好的图参数**，⛔ 不是一个裸路径。
+ *
+ * ⚠ FireRedVAD 的 executable 在本机是一份 EPContext（`kind: "local"`）。
+ *   把它当 `model_path` 送给 App，加载器会拿它去**编译一份新的 context**，
+ *   而里面那个 `ep_cache_context` 相对引用再也解析不到自己的目录——
+ *   App 以 `EP_CONTEXT_AS_MODEL_PATH` 明确拒绝，并直接告诉你该传 `ctx_path`。
+ * ⚠ `asr/controller.mjs` 早就做对了；这三个 FireRedVAD 消费者在 docs/093 迁移时被漏下。
+ */
+const VAD_GRAPH = vadModel?.available === true ? executableGraphArgs(vadModel) : null;
+const VAD_MODEL_PATH = VAD_GRAPH?.path ?? null;
 const VAD_CMVN_PATH = vadModel?.available === true ? companionFile(vadModel, 'cmvn') : null;
 const fireRedVadReady = Boolean(VAD_MODEL_PATH && VAD_CMVN_PATH);
 console.log(`[termux-speech] model.fireredvad ${fireRedVadReady ? 'ready' : 'degraded'}`
@@ -1807,7 +2293,7 @@ console.log(`[termux-speech] model.fireredvad ${fireRedVadReady ? 'ready' : 'deg
  */
 const lab = new AcousticLab({
   android,
-  modelFile: VAD_MODEL_PATH,
+  graph: VAD_GRAPH,
   cmvnFile: VAD_CMVN_PATH,
   dataRoot: `${VAD_DATA_ROOT}/../acoustic-lab`,
   residentId: `${VAD_RESIDENT_ID}-lab`,
@@ -1823,10 +2309,18 @@ const speakerEmbedder = new CamPlusEmbedder({
   android,
   residentId: `${VAD_RESIDENT_ID}-spk-emb`,
   modelPath: CAMPLUS_MODEL_PATH,
+  /**
+   * ⭐ 启动时那一次可能拿不到（Manager 晚起，或答了话但 `companions` 还没派生完）。
+   *   登记是个**罕见的人为动作**，到那时再问一次，⛔ 不把一次瞬时竞态变成永久故障。
+   */
+  resolveModelPath: async () => {
+    const m = await resolveLogicalModel('model.campplus');
+    return m?.available === true ? companionFile(m, 'model.campplus.graph', 'model') : null;
+  },
 });
 const speakerLab = new SpeakerLab({
   android,
-  vadModelFile: VAD_MODEL_PATH,
+  vadGraph: VAD_GRAPH,
   vadCmvnFile: VAD_CMVN_PATH,
   residentId: `${VAD_RESIDENT_ID}-spk`,
   embedder: speakerEmbedder,
@@ -1970,7 +2464,13 @@ appEvents.onSegment = (segment, bootId) => {
  *   而门该按哪个关，答案是「正在执行的那个」。
  */
 appEvents.onPolicy = (policy) => {
-  if (applyUserTimeout(policy?.user_timeout_ms) !== null) onStageChange();
+  let providerChanged = false;
+  try {
+    providerChanged = syncPolicyVadProvider(policy?.vad?.provider, 'app_policy_event');
+  } catch (error) {
+    console.log(`[termux-speech] App policy VAD provider sync failed: ${error?.message ?? error}`);
+  }
+  if (applyUserTimeout(policy?.user_timeout_ms) !== null || providerChanged) onStageChange();
 };
 
 appActivity = new AppSpeakerActivity({
@@ -1986,8 +2486,8 @@ appActivity = new AppSpeakerActivity({
   onUserConfirmed: noteAutomaticCamUser,
   /** ⭐ 「此刻该不该跑」的唯一定义；对账器只读它，⛔ 不自己判断链的状态。 */
   wantRunning: () => lifecycle?.chain === 'started'
-    && cfg.speaker_activity?.enabled === true
-    && !listenEngaged(),
+    && campPlusSelected()
+    && (cfg.speaker_activity?.enabled === true || listenEngaged()),
   onChange: () => { hub?.markCold(); hub?.schedule(); },
   /**
    * ⚠ **P4 之后这条路只在 `segment_executor != app` 时才有东西进来**：
@@ -2117,7 +2617,7 @@ appSegments = new AppSegments({
 /** 正式状态域的 CAM++ 投影：模型 resident、RMS live 与当前 VAD 模式必须同时可见。 */
 const speakerActivityProjection = () => {
   const snapshot = speakerActivity.snapshot();
-  const live = automaticCamLiveAdmitted();
+  const live = camPlusLiveAdmitted();
   const app = appActivity?.snapshot?.() ?? null;
   const appLastSimilarity = app?.last_similarity ?? null;
   const appLastSegment = app?.last_segment ?? null;
@@ -2154,9 +2654,10 @@ const speakerActivityProjection = () => {
       status: appLastSegment.status ?? null,
     } : null,
   } : {}),
-  projection_ready: appActivityActive() ? app?.app_running === true : speakerActivity.enabled === true,
-  vad_mode: listenEngaged() ? 'fireredvad_manual'
-    : (consumers.enabled('speaker_activity') || appActivityActive()) ? 'camplus_automatic' : 'idle',
+  projection_ready: campPlusSelected()
+    ? (appActivityActive() ? app?.app_running === true : speakerActivity.enabled === true)
+    : vad?.snapshot?.()?.ready === true,
+  vad_mode: currentVadMode(),
   /** `active`/`inference_admitted` are the product fact; graph_loaded is resident only. */
   active: live,
   inference_admitted: live,
@@ -2167,7 +2668,7 @@ const speakerActivityProjection = () => {
 
 vad = new VadController({
   android,
-  modelFile: VAD_MODEL_PATH,
+  graph: VAD_GRAPH,
   cmvnFile: VAD_CMVN_PATH,
   dataRoot: VAD_DATA_ROOT,
   config: cfg.vad,
@@ -2373,6 +2874,7 @@ records = new RecordGroups({
  * ⚠ `backendGeneration` 是唯一的防串线判据：切换时它 +1，
  *   任何迟到的结果都要带着切换前的代次，于是能被认出来而不是被当成新结果。
  */
+/** ⭐ 只剩一个 backend；这一层保留是因为它描述**当前在跑的是谁**，⛔ 不是「有几个可选」。 */
 let activeBackend = 'sensevoice';
 let backendGeneration = 0;
 let staleBackendDropped = 0;
@@ -2446,8 +2948,8 @@ const awaitMicRecording = async (timeoutMs = 6000) => {
   return { ok: false, reason: last?.last_error ?? 'microphone_not_recording' };
 };
 
-/** cfg.asr.model is normalized at load/save time; the only legal value is SenseVoice. */
-const configuredBackend = () => 'sensevoice';
+/** cfg.asr.model is normalized at load/save time and is the sole ASR selector. */
+const configuredBackend = () => (ASR_MODELS.includes(cfg.asr?.model) ? cfg.asr.model : 'sensevoice');
 
 /**
  * ⭐ `cfg.asr.model` 是唯一的产品选择源。
@@ -2460,7 +2962,7 @@ const configuredBackend = () => 'sensevoice';
 let appSegmentBackendTarget = null;
 let appSegmentBackendSync = null;
 const syncAppSegmentBackend = async (target, reason = 'config') => {
-  if (target !== 'sensevoice') {
+  if (!ASR_MODELS.includes(target)) {
     throw new Error(`unsupported ASR backend: ${target}`);
   }
   if (appSegmentBackendTarget === target) {
@@ -2521,10 +3023,13 @@ const backendOwns = (backend, generation) => {
  */
 const applyBackend = async (target, reason = 'config') => {
   if (target === activeBackend) {
-    // 同档位再次保存配置也要能修复 SenseVoice worker 重生后的冷 session。
-    await asr.prepareBackend(target);
+    // 同档位再次保存配置也要能修复 worker 重生后的冷 session。
+    const prepared = await asr.prepareBackend(target);
+    if (reason === 'api' && prepared?.ready !== true) {
+      throw new Error(`${target} runtime is not ready`);
+    }
     const appBackend = await syncAppSegmentBackend(target, reason);
-    return { changed: false, active: activeBackend, prepared: true, app_backend: appBackend };
+    return { changed: false, active: activeBackend, prepared: prepared?.ready === true, app_backend: appBackend };
   }
   const from = activeBackend;
   const steps = [];
@@ -2544,6 +3049,9 @@ const applyBackend = async (target, reason = 'config') => {
   try {
     const prepared = await asr.prepareBackend(target);
     steps.push({ step: 'prepare_target', backend: target, ready: prepared?.ready === true });
+    if (reason === 'api' && prepared?.ready !== true) {
+      throw new Error(`${target} runtime is not ready`);
+    }
     const appBackend = await syncAppSegmentBackend(target, reason);
     steps.push({ step: 'sync_app_segment_backend', ...appBackend });
   } catch (error) {
@@ -2865,8 +3373,21 @@ const runAssistantCall = async (body = {}) => {
 
       syncChainConsumers();
       await speakerActivityTransition;
-      if (!consumers.enabled('speaker_activity') || !speakerActivity.enabled) {
-        return fail(503, 'camplus_not_ready', speakerActivity.lastError ?? null);
+      /**
+       * App executor deliberately does not enable Speech's PCM-backed
+       * `speaker_activity` consumer.  The old check only asked that legacy
+       * consumer, so the official App activity executor could be fully up
+       * and `/assistant/call` would still report `camplus_not_ready`.
+       * Readiness must follow the selected executor, not its retired fallback.
+       */
+      const providerReady = automaticProviderReady();
+      if (!providerReady) {
+        return fail(503, fireRedSelected() ? 'fireredvad_not_ready' : 'camplus_not_ready',
+          fireRedSelected()
+            ? vad?.snapshot?.()?.last_error ?? null
+            : activityExecutorMode() === 'app'
+              ? appActivity?.lastError ?? null
+              : speakerActivity.lastError ?? null);
       }
 
       // 成功进入自动模式后让重启沿用这个明确选择；Stop 按钮仍可把它改回 stopped。
@@ -3154,6 +3675,13 @@ const DOMAIN_BUILDERS = {
   // 需要时走 `/pipeline/transitions`。
   pipeline: () => pipelineWithoutHistory(),
   /**
+   * ⭐ **页面上所有 runtime 事实的唯一来处**（docs/097）。Header / Overview 三层
+   *   selector / Flow / LIVE / Settings 全部读它，⛔ 不再各自去问 `rms_gate`、`vad`、
+   *   `speaker_activity`、`lifecycle`——那四个描述的是**已经不在跑**的旧执行体。
+   * ⚠ 它进热通道：LIVE 的 RMS 峰值与 CAM/VAD 活动就在这里面。
+   */
+  app_pipeline: () => appPipelineProjection(),
+  /**
    * ⭐ **两个页面共用的那一份 ASR 文字**（概览 + 诊断）。
    *
    * ⚠ 修的是两件事：① 页面此前只看得见 **commit**，现在也显示上游的 incomplete 当前句；
@@ -3244,7 +3772,7 @@ const publicSnapshot = () => {
   return publicState.snapshot({ features });
 };
 
-const HOT_DOMAINS = ['rms_stream', 'rms_gate', 'pcm_stream', 'pcm_pool', 'vad', 'input', 'asr_live', 'public'];
+const HOT_DOMAINS = ['rms_stream', 'rms_gate', 'pcm_stream', 'pcm_pool', 'vad', 'input', 'asr_live', 'public', 'app_pipeline'];
 
 /**
  * Capability readiness is deliberately separate from package health. A model
@@ -3331,6 +3859,8 @@ const pipelineWithoutHistory = () => {
 };
 
 hub = new StateHub({ builders: DOMAIN_BUILDERS, hot: HOT_DOMAINS });
+// ⭐ 观测者出现才开始问 App；没人看时一次 HTTP 都不发（docs/056 的教训）。
+startAppTelemetry();
 
 /**
  * `/live` 保留：脚本、`verify-device` 与外部巡检仍然要一发就拿到全部事实。
@@ -3379,7 +3909,7 @@ const updateGateConfig = (body) => {
 };
 
 const updateVadConfig = (body) => {
-  const patch = Object.fromEntries(['pcm_pool_ms', 'no_output_timeout_ms']
+  const patch = Object.fromEntries(['provider', 'pcm_pool_ms', 'no_output_timeout_ms']
     .filter((key) => body[key] !== undefined)
     .map((key) => [key, body[key]]));
   try {
@@ -3388,9 +3918,30 @@ const updateVadConfig = (body) => {
     throw new UpstreamError(String(error?.message ?? error), 400);
   }
   const value = vad.configure(cfg.vad);
+  syncChainConsumers();
+  void transitionSpeakerActivity(
+    selectedVadProvider() === 'campplus'
+      && (listenEngaged() || (lifecycle?.chain === 'started' && cfg.speaker_activity?.enabled === true)),
+    'vad_provider_config',
+  );
   project();
   flush(true);
   return value;
+};
+
+/**
+ * App policy uses the historical `camplus` spelling; Speech's runtime uses
+ * `campplus`.  Keep the policy bridge and the actual selected VAD in lockstep.
+ * This is deliberately one provider, not a second VAD session or a veto layer.
+ */
+const syncPolicyVadProvider = (provider, reason = 'policy') => {
+  const raw = String(provider ?? '').trim().toLowerCase();
+  if (!['camplus', 'campplus', 'fireredvad'].includes(raw)) return false;
+  const normalized = raw === 'fireredvad' ? 'fireredvad' : 'campplus';
+  if (cfg.vad?.provider === normalized) return false;
+  updateVadConfig({ provider: normalized });
+  console.log(`[termux-speech] VAD provider synced from ${reason}: ${raw} → ${normalized}`);
+  return true;
 };
 
 const updateAsrConfig = (body) => {
@@ -3588,6 +4139,13 @@ const server = http.createServer(async (req, res) => {
       // ⭐ 页面在读状态 = 有人在看（见 noteRmsObserver 的头部）。
       noteRmsObserver();
       syncRmsObserver();
+      /**
+       * ⚠ 第一份 snapshot 必须带**当前**的 App telemetry。
+       * ⭐ 轮询器只在有 watcher 时跑，而 `/state` 是页面打开时的第一发——
+       *   不在这里先读一次，页面开头几秒会诚实地写着「读数已陈旧」，
+       *   而那是我们自己造出来的陈旧，⛔ 不是事实。
+       */
+      await pollAppTelemetry('slow').catch(() => {});
       hub.markAll();
       hub.build();
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -3600,6 +4158,9 @@ const server = http.createServer(async (req, res) => {
        */
       noteRmsObserver();
       syncRmsObserver();
+      // ⭐ watcher 出现的那一刻就有人在看了：先补一次，⛔ 不要等下一个 tick。
+      if (!hub.watching) void pollAppTelemetry('fast');
+      if (Date.now() - appRuntime.slow_at_ms >= APP_TELEMETRY_SLOW_MS) void pollAppTelemetry('slow');
       const intervalMs = normalizeWatchInterval(
         url.searchParams.get('interval_ms'),
         DEFAULT_WATCH_INTERVAL_MS,
@@ -3627,16 +4188,66 @@ const server = http.createServer(async (req, res) => {
      * 诊断历史。⚠ 从高频通道里搬出来的：64 条 transition 每条都要深拷贝，
      * 挂在每秒十几次的投影上纯属白烧，而它每分钟才变几次。
      */
+    /**
+     * ⭐ docs/096：`/pipeline` 现在是 **App 三层 Pipeline 的投影**，⛔ 不再是
+     * Speech 自己那个同名概念。
+     * ⚠ 撞车的是名字：Speech 原来的 `pipeline` 是一把 [PipelineLease]——它回答的是
+     *   「谁有资格关门」，不是「在跑什么」。那个 lease 仍然有意义，所以降到 `lease`
+     *   键下原样保留（薄兼容映射），⛔ 不删。
+     */
     if (req.method === 'GET' && route === '/pipeline/transitions') {
+      let transitions = [];
+      let upstream = null;
+      try { transitions = await appPipeline.transitions(); }
+      catch (error) { upstream = String(error?.message ?? error); }
       return send(200, {
-        ok: true,
-        schema: 'termux-os.speech-pipeline-transitions.v1',
-        transitions: pipeline.snapshot().transitions,
+        ok: upstream === null,
+        schema: 'termux-os.speech-pipeline-transitions.v2',
+        source: 'app',
+        error: upstream,
+        transitions,
       });
     }
     if (req.method === 'GET' && route === '/pipeline') {
-      // listen 挂在 pipeline 下：它改变的正是「谁有资格关门」这件事。
-      return send(200, { ok: true, value: { ...pipeline.snapshot(), listen: listenSnapshot() } });
+      const app = await appPipelineSnapshot();
+      return send(200, {
+        ok: app.ok,
+        value: {
+          schema: 'termux-os.speech-pipeline.v2',
+          desired: desiredPipeline(),
+          // ⭐ effective/state/transition/generation 全部来自 App，⛔ 不是本地推导。
+          app: app.ok ? app.value : null,
+          app_error: app.ok ? null : app.error,
+          lease: pipeline.snapshot(),
+          listen: listenSnapshot(),
+        },
+      });
+    }
+    /** ⭐ 一次 PUT 提交整套三层；⛔ 不分三次调用 App。 */
+    if (req.method === 'PUT' && route === '/pipeline') {
+      const body = await readBody(req);
+      const base = desiredPipeline();
+      const target = {
+        trigger: body.trigger ?? base.trigger,
+        segment: body.segment ?? base.segment,
+        asr: body.asr ?? base.asr,
+      };
+      let applied = null;
+      try {
+        applied = await appPipeline.put(target, 'speech-ui');
+      } catch (error) {
+        return send(400, { ok: false, error: String(error?.message ?? error) });
+      }
+      cfg = saveLifecycleConfig(CONFIG_FILE, { pipeline: target });
+      /**
+       * ⭐ 切换刚发生 ⇒ 立刻把 telemetry 拉一次，⛔ 不要让页面等下一个 1.5 秒 tick。
+       * ⚠ 这不是"加快节奏"：切换是**事实变了**的那一刻，观测本来就该跟着事实走。
+       */
+      await pollAppTelemetry('slow').catch(() => {});
+      return send(200, {
+        ok: true,
+        value: { desired: target, app: applied, lease: pipeline.snapshot() },
+      });
     }
     if (req.method === 'GET' && route === '/states') {
       return send(200, { ok: true, value: bus.snapshot() });
@@ -3757,8 +4368,22 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const reason = typeof body.reason === 'string' && body.reason.trim()
         ? body.reason.trim().slice(0, 128) : 'api';
-      const result = await startChain(reason);
-      if (result.ok) cfg = saveLifecycleConfig(CONFIG_FILE, { chain_desired: 'started' });
+      /**
+       * ⭐ docs/096 compatibility shim：`/chain/start` 不再起 Speech 自己的链，
+       * 它现在**只是「按当前 desired 三层启动 App Pipeline」**。
+       * ⚠ 若 desired 的 trigger 是 `stop`（例如上次是停的），就没有可启动的目标——
+       *   此时退回 `passthrough`，⛔ 不静默什么都不做：调用方按旧语义期待「开始收音」。
+       */
+      const base = desiredPipeline();
+      const target = { ...base, trigger: base.trigger === 'stop' ? 'passthrough' : base.trigger };
+      let result;
+      try {
+        const applied = await appPipeline.put(target, `compat:chain/start:${reason}`);
+        result = { ok: true, reason: 'app_pipeline', error: null, value: applied };
+      } catch (error) {
+        result = { ok: false, reason: 'app_pipeline_failed', error: String(error?.message ?? error), value: null };
+      }
+      if (result.ok) cfg = saveLifecycleConfig(CONFIG_FILE, { pipeline: target, chain_desired: 'started' });
       return send(result.ok ? 200 : 409, {
         ok: result.ok,
         reason: result.reason,
@@ -3770,7 +4395,21 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const reason = typeof body.reason === 'string' && body.reason.trim()
         ? body.reason.trim().slice(0, 128) : 'api';
+      /**
+       * ⭐ compatibility shim：映射到 `trigger=stop`。
+       * ⚠ **旧的 requester 保护必须原样保留**：termux-ime 等外部调用方持着听写时，
+       *   普通停链要返回 409 并列出是谁——误触不该静默掐掉别人的听写。
+       *   所以这里仍先走 `stopChain` 做 requester 判定，通过之后才落到 App。
+       */
       const result = await stopChain({ reason, force: body.force === true });
+      if (result.ok) {
+        try {
+          await appPipeline.patch({ trigger: 'stop' }, `compat:chain/stop:${reason}`);
+          cfg = saveLifecycleConfig(CONFIG_FILE, { pipeline: { ...desiredPipeline(), trigger: 'stop' } });
+        } catch (error) {
+          result.error = String(error?.message ?? error);
+        }
+      }
       // ⚠ 外部 requester（termux-ime 等）持着听写时，普通停链请求返回 409 并列出是谁——
       // 误触不该静默掐掉别人的听写。要收走它必须明确 force。
       if (!result.ok && result.reason === 'requesters_active') {
@@ -3993,6 +4632,11 @@ const server = http.createServer(async (req, res) => {
         ...(outbound === 'GET' ? {} : { body: body ?? {} }),
       });
       const value = payload?.value ?? payload?.data ?? payload;
+      try {
+        syncPolicyVadProvider(value?.vad?.provider ?? body?.vad?.provider, `policy_${req.method.toLowerCase()}`);
+      } catch (error) {
+        throw new UpstreamError(`VAD provider sync failed: ${error?.message ?? error}`, 400);
+      }
       // policy 里带着 gate.mode——PUT 之后同样要把前门对齐。
       const policyMode = value?.gate?.mode;
       if (typeof policyMode === 'string') appEvents.onGateFacts({ mode: policyMode });
@@ -4535,7 +5179,9 @@ const server = http.createServer(async (req, res) => {
                            consumers: consumers.snapshot() });
       }
       if (req.method === 'POST' && (sub === '/enroll/stop' || sub === '/test/stop')) {
-        speakerLab.stop();
+        // ⚠ 必须 await：`stop()` 现在还要把两个临时会话交回去，
+        //   不等它就会在快照里报「已停止」而那两张图还占着（其中一个是 HTP 会话）。
+        await speakerLab.stop();
         setConsumer('speaker', false);
         onStageChange();
         return send(200, { ok: true, value: speakerLab.snapshot(),
@@ -4719,14 +5365,20 @@ server.listen(PORT, BIND_HOST, () => {
       + (recovered.notes.length ? ` recovery=${recovered.notes.join(' | ')}` : ''));
     // ⭐ 先收敛唯一 backend 再启动 chain，确保启动时就完成 SenseVoice readiness。
     const bootWanted = configuredBackend();
-    await syncAppSegmentBackend(bootWanted, 'boot').catch((error) => {
-      console.log(`[termux-speech] App ASR backend boot sync failed: ${error?.message ?? error}`);
-    });
+    // ⛔ docs/096：启动时**不再**把旧 asr.model 推给 App。
+    //    App 的 effective pipeline 才是真相；Speech 启动后只读它。
+    if (LEGACY_RUNTIME_OWNERSHIP) {
+      await syncAppSegmentBackend(bootWanted, 'boot').catch((error) => {
+        console.log(`[termux-speech] App ASR backend boot sync failed: ${error?.message ?? error}`);
+      });
+    }
     // ⭐ 无条件 ensure：⛔ 不许用「选择值没变」跳过准备（docs/090 §6）。
     await ensureBackendReady('boot').catch((error) => {
       console.log(`[termux-speech] backend boot readiness failed: ${error?.message ?? error}`);
     });
-    if (cfg.chain_desired === 'started') {
+    if (LEGACY_RUNTIME_OWNERSHIP && cfg.chain_desired === 'started') {
+      // ⛔ docs/096：`chain_desired` 不再驱动 runtime。上一轮实测它此刻是 "started"，
+      //    而旧 startChain('boot') 会经 ensureRunning + admit 覆盖 App 的三层 pipeline。
       await startChain('boot');
     } else {
       // ⭐ 停链是使用者的决定，服务重启不该替他撤销它。这里**什么都不做**——
@@ -4746,11 +5398,86 @@ server.listen(PORT, BIND_HOST, () => {
   })();
 });
 flush(true);
+/**
+ * ⭐ **可执行体的对账器**（docs/103 §8.2⑥）。
+ *
+ * ⚠ 真机复现两次：speech 比模型管理器先起来时，启动那一刻解析不到伴生文件，
+ *   于是那个模型**永远**报未就绪，而**重启一次 speech 就好了**。
+ *   ⭐ **一个只在开机试一次的解析，等于把一次瞬时故障变成永久故障**（docs/101 原话）。
+ *
+ * ⭐ **同一个形状出现过三次**（docs/101 麦克风需求、docs/090 boot、本轮两处），
+ *   所以这里一次覆盖**全部**会迟到的外部事实，⛔ 不是给 SenseVoice 单独打一个补丁：
+ *   `model.sensevoice`（ASR 可执行体 + 前端伴生）与 `model.fireredvad`
+ *   （VAD 图 + cmvn，三个消费者共用同一份）。
+ *
+ * 判据是**需求与实际的差**（「该能跑」与「解析到了没有」），⛔ 不是「管理器在不在」——
+ * 后者是手段。退避 5s → 5min 有界，⛔ **没有终局放弃**：修复条件（管理器起来了）
+ * 可以在任何时刻发生，放弃就等于把故障重新变成永久的。缺口一闭合立刻归零。
+ * ⛔ 全部就绪就再也不问——这条链只服务「还没就绪」这一种状态。
+ */
+const EXECUTABLE_RECONCILE_MIN_MS = 5_000;
+const EXECUTABLE_RECONCILE_MAX_MS = 300_000;
+let executableBackoffMs = EXECUTABLE_RECONCILE_MIN_MS;
+let executableReconcileAt = Date.now() + EXECUTABLE_RECONCILE_MIN_MS;
+let executableRecoveries = 0;
+
+/** ASR：可执行体 + 前端伴生（cmvn/tokens）。 */
+const reconcileAsrExecutable = async () => {
+  if (asr?.snapshot?.().model?.ready === true) return false;
+  const model = await resolveLogicalModel('model.sensevoice').catch(() => null);
+  if (model?.available !== true) return false;
+  const root = companionRoot(model, 'model.sensevoice.frontend');
+  const files = root ? (model.companions['model.sensevoice.frontend']?.files ?? {}) : null;
+  return asr.applyLogical({
+    executablePath: model.executable?.path ?? null,
+    executableKind: model.executable?.kind ?? null,
+    frontendFiles: files,
+  });
+};
+
+/**
+ * VAD：图 + cmvn。⚠ **三个消费者共用同一份**（VadController / AcousticLab / SpeakerLab），
+ * 故一次解析喂给三个——⛔ 不许让它们各自去问，那会变成三份会各自漂移的答案。
+ */
+const reconcileVadExecutable = async () => {
+  if (vad?.modelsReady === true || (vad?.modelPath && vad?.cmvnPath)) return false;
+  const model = await resolveLogicalModel('model.fireredvad').catch(() => null);
+  if (model?.available !== true) return false;
+  const graph = executableGraphArgs(model);
+  const cmvn = companionFile(model, 'cmvn');
+  if (!graph?.path || !cmvn) return false;
+  let changed = false;
+  for (const consumer of [vad, lab, speakerLab]) {
+    if (consumer?.applyLogical?.({ graph, cmvnFile: cmvn })) changed = true;
+  }
+  return changed;
+};
+
+const reconcileExecutables = async () => {
+  if (Date.now() < executableReconcileAt) return;
+  executableReconcileAt = Date.now() + executableBackoffMs;
+  const changed = [
+    await reconcileAsrExecutable().catch(() => false),
+    await reconcileVadExecutable().catch(() => false),
+  ];
+  if (!changed.some(Boolean)) {
+    executableBackoffMs = Math.min(executableBackoffMs * 2, EXECUTABLE_RECONCILE_MAX_MS);
+    return;
+  }
+  executableBackoffMs = EXECUTABLE_RECONCILE_MIN_MS;
+  executableRecoveries += 1;
+  /** ⭐ 闭合必须说出来：一次静默的自愈与一次一直没自愈，从外面看都是「现在好了/还没好」。 */
+  console.log('[termux-speech] logical executables reconciled after boot'
+    + ` (recoveries=${executableRecoveries}, asr=${changed[0]}, vad=${changed[1]})`);
+};
+
 const refreshTimer = setInterval(() => void refresh().catch(() => {}), cfg.poll_interval_ms);
+const executableTimer = setInterval(() => void reconcileExecutables().catch(() => {}), 5_000);
 const tickTimer = setInterval(() => void tick(), cfg.rms_gate.sample_interval_ms);
 
 const bye = () => {
   clearInterval(refreshTimer);
+  clearInterval(executableTimer);
   clearInterval(tickTimer);
   // ⛔ 停服务**不是**停链：这里绝不 undeclare。服务重启、dev reload、framework 重启
   // 都不是 churn HTP 会话的理由（docs/046）。下次启动由 reconcile 认清事实。

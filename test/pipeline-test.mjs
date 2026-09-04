@@ -75,7 +75,7 @@ const commit = (groups, n, backend = 'sensevoice', text = `第${n}句。`) => {
 test('RMS 开门后只交给 VAD，不能从其他状态直接越级',
   main.includes('openProductGate(`${reason}_opened_gate`)')
     && main.includes('pipeline.owner !== PIPELINE_OWNERS.VAD'));
-test('RMS 阈值越线只建立 CAM++ 的 8 秒 USER 准入窗口，FireRedVAD 只能手动 arm',
+test('RMS 阈值越线按选定 VAD 建立唯一处理窗口（CAM++ watchdog 或自动 FireRedVAD）',
   main.includes('ensureAutomaticCamAdmission(snapshot, monotonicNowMs());')
     && main.includes('const automaticCamWatchdog = new UserWatchdog')
     && main.includes('DEFAULT_USER_WATCHDOG_TIMEOUT_MS')
@@ -85,23 +85,24 @@ test('RMS 阈值越线只建立 CAM++ 的 8 秒 USER 准入窗口，FireRedVAD �
     && main.includes('onConfirmedUser: noteAutomaticCamUser')
     && main.includes("reason: 'camplus_no_user_timeout'")
     && main.includes("criterion: 'confirmed_user'")
-    && main.includes("if (!listenEngaged()) {")
+    && main.includes("if (!listenEngaged() && !automaticFireRed) {")
     && main.includes("reason: 'manual_listen_required'")
+    && main.includes('automaticFireRedArmEpoch')
     && !main.includes('scheduleAutomaticVadArm')
     && !main.includes('let automaticVadArm = null'));
-test('App 对账会同步本地常驻镜像，SenseVoice readiness 不拿空镜像冒充已声明',
+test('App 对账会同步本地常驻镜像，runtime readiness 不拿空镜像冒充已声明',
   read('service/residents.mjs').includes('reconcileDeclared(declared)')
     && main.includes('vad?.reconcileResident(vadDeclared)')
     && main.includes('asr?.reconcileResident(asrDeclared)')
-    && !read('web/views.js').includes("selected?.id === 'audio8'")
-    && read('web/views.js').includes("['SenseVoice 资产'"));
+    && read('web/views.js').includes('const selected = asr?.model?.selected')
+    && read('web/views.js').includes('modelName'));
 test('listen 模式：进入 RMS → VAD → ASR 的处理链',
   (() => {
     const start = main.indexOf('const enterListen');
     const end = main.indexOf('const exitListen', start);
     const body = start >= 0 && end > start ? main.slice(start, end) : '';
     return body.includes('await engageProcessing(')
-      && body.includes("consumers.setEnabled('vad', true)")
+      && body.includes("consumers.setEnabled('vad', !useCamPlus)")
       && body.includes("transitionSpeakerActivity(false, 'manual_listen')")
       && body.includes('await awaitValidPcm()')
       && main.includes('const pool = vad.snapshot()?.pcm_pool')
@@ -113,11 +114,15 @@ test('manual listen 等待 VAD eligible prebuffer，避免首帧 fan-out race �
     && main.includes('pcm.ensure();')
     && main.includes("await new Promise((resolve) => { setTimeout(resolve, 100); });")
     && !/awaitValidPcm[\s\S]{0,700}return \{ ok: true, waited_ms: timeoutMs - \(deadline - Date\.now\(\)\) \};/.test(main));
-/** 唯一 ASR backend 共用同一条 WAV→文字队列。 */
-test('处理门只有一条，且只由 SenseVoice 识别',
+/** 唯一 ASR backend 共用同一条 WAV→文字队列；实际引擎由 cfg.asr.model 选择。 */
+/**
+ * ⭐ 这条真正保护的是「**处理门只有一条**，⛔ 不许按 backend 分叉出第二扇门」——
+ *   docs/075 为这件事付过代价。它与「有几个 backend」无关，故 Audio8 退役后
+ *   保留前两个判据、去掉那两个只描述 Audio8 存在的判据。
+ */
+test('处理门只有一条，⛔ 不按 backend 分叉',
   main.includes('const engageProcessing = (trigger, reason) => engagePipeline(trigger, reason);')
-    && !/engageProcessing[\s\S]{0,200}engageAudio8/.test(main)
-    && !read('service/asr/controller.mjs').includes('audio8'));
+    && !/engageProcessing[\s\S]{0,200}engageAudio8/.test(main));
 
 // ────────────────────────────────── 2. Mic 生命周期
 
@@ -127,16 +132,23 @@ test('本包永不触碰 user.persistent',
     && main.includes('termux-speech must never touch user.persistent'));
 test('切换不再 stopChain，故聚合 demand 不会归零',
   !/applyBackend[\s\S]{0,2000}stopChain/.test(main));
-test('唯一听写路径载入 FireRedVAD 与 SenseVoice',
+test('唯一听写路径载入选定 VAD 与选定 ASR',
   main.includes('required: () => true')
     && fs.readFileSync(path.join(root, 'service/lifecycle/controller.mjs'), 'utf8')
       .includes("this.dictation.required?.() === false"));
-test('Audio8 runtime branch 已退休',
-  !read('service/asr/controller.mjs').includes('audio8')
-    && !read('service/asr/controller.mjs').includes('/api/asr/audio8/'));
-test('Audio8 不再触发 App session/load 请求',
-  !main.includes('ensureAudio8ForApp') && !main.includes('/api/asr/audio8/'));
-test('常驻助手切出来的段两条 backend 都收得到',
+/**
+ * ⚠ 原本这两条一条钉「Audio8 走 App 正式端点」、一条钉「Audio8 不另开 PCM consumer」。
+ *   Audio8 退役后合并成一条：**它的每一处痕迹都必须消失**，包括那两个已从 App
+ *   删掉的端点。⭐ 第二条的本意（⛔ 不许为某个 backend 另开一路 PCM）由
+ *   `rms-pcm-separation-test` / `pcm-fanout-test` 继续守着，与 backend 数量无关。
+ */
+test('⛔ Audio8 在运行时与 PCM 分流上都不留痕迹',
+  !read('service/asr/controller.mjs').includes('/api/asr/audio8/')
+    && !main.includes('/api/asr/audio8/')
+    && !/\{ name: 'audio8'/.test(main)
+    && !main.includes('MIC_REQUESTER_AUDIO8')
+    && !main.includes('openAudio8Link'));
+test('常驻助手切出来的段进的是同一条 ASR 队列',
   main.includes('onSegment: (segment) => {')
     && main.includes('asr.enqueue(segment, { epoch: pipeline.epoch });')
     && main.includes('if (!automaticCamSegmentAllowed())'));
@@ -183,7 +195,7 @@ test('切换时 generation 先加，再重新开门——旧结果结构上不�
     && groups.snapshot().active.sentence_count === before);
 
   // live hypothesis / stale 结果根本不会到 admit——它们在 DictationLink 里就被拦下。
-
+  
   // 失败的 item 要留档，但它不是一句话。
   groups.admit({ segment_id: 'failed-1' }, { status: 'failed', error: 'boom', backend: 'sensevoice' });
   const snap = groups.snapshot();
@@ -251,9 +263,10 @@ test('切换时 generation 先加，再重新开门——旧结果结构上不�
   const viewsJs = fs.readFileSync(path.join(root, 'web/views.js'), 'utf8');
   const html = fs.readFileSync(path.join(root, 'web/index.html'), 'utf8');
 
-  test('U1 概览只有一组「正在识别」与「最近识别」事实行',
-    ['ov-current', 'ov-latest', 'tx-live-meta', 'tx-latest-meta']
+  test('U1 概览只有「正在识别」事实行，最近结果由历史第一条承担',
+    ['ov-current', 'tx-live-meta', 'tx-history-list']
       .every((id) => html.includes(`id="${id}"`))
+      && !html.includes('id="ov-latest"')
       && !html.includes('id="asr-live-text"') && !html.includes('id="asr-last-text"'));
   /**
    * ⭐ 不是「把两处改成一样」，是**只留一个写入点**。两处各写各的，迟早会在某个
@@ -267,9 +280,8 @@ test('切换时 generation 先加，再重新开门——旧结果结构上不�
      *   ⭐ 判据仍然是「只有那两个循环在写」，而且 app.js 也不许再写它们——
      *   本轮就差点在 app.js 里另开一个写入点，把刚合并好的东西重新拆开。
      */
-    (views.match(/\$\('(tx-latest|asr-last|tx-live|asr-live)-/g) ?? []).length === 0
-      && views.includes("['ov-latest', 'tx-latest-meta']")
-      && views.includes("['ov-current', 'tx-live-meta']")
+    views.includes("['ov-current', 'tx-live-meta']")
+      && !html.includes('id="ov-latest"')
       && (appJs.match(/setText\(\$\('(ov-current|ov-latest)'\)/g) ?? []).length === 0);
   test('U3 实时文字来自服务端的同一个 asr_live 域，两页共用一次渲染',
     appJs.includes("['overview-asr-live', ['asr_live']")

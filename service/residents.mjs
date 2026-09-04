@@ -9,6 +9,21 @@
  */
 
 const RESIDENTS_PATH = '/api/inference/residents';
+/**
+ * ⭐ **临时会话**：建了就用、用完就删，⛔ 不进声明态、⛔ 不被对账器补回来。
+ *
+ * docs/096 退役的是「speech 拥有**常驻**图」——两份同功能的图各占一个 HTP session
+ * 而没有界面说得出来。它**没有**退役「一次罕见的、使用者发起的动作临时借一张图」，
+ * 而声纹**登记**正是这种：它要的是一张 **CPU、动态长度** 的 CAM++
+ * （固定 `[1,148,80]` 的运行时那张吃不下 1.1–5.6 秒的整段），
+ * 而 App 的三层 pipeline 里没有、也不该有这样一张常驻图。
+ * ⚠ 退役 `declare()` 时这条路径被一起切断了，症状是登记时报
+ *   `no such resident: tsp-vad-…-spk`——一个**没有人再声明**的 id。
+ */
+const SESSIONS_PATH = '/api/inference/graph/sessions';
+
+/** ⛔ docs/096：Speech 侧的 tsp-* 常驻所有权已退役。见 `declare()` 的理由。 */
+const LEGACY_RESIDENT_OWNERSHIP = false;
 
 /**
  * 声明是对**设备期望状态**的陈述，不是对本进程寿命的陈述。
@@ -39,6 +54,11 @@ export class ResidentGraph {
     modelPath = null,
     /** Asset 装来的 EPContext（绝对路径）；不给则由 App 自编并落它的 caches/ */
     ctxPath = null,
+    /**
+     * ⭐ 临时会话（见 [SESSIONS_PATH]）。⛔ 只给「罕见 + 使用者发起 + 用完即走」的路径，
+     *   ⛔ 绝不用来绕过 docs/096：常驻仍然只有 App 能拥有。
+     */
+    ephemeral = false,
   }) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(String(id ?? ''))) {
       throw new Error(`invalid resident id: ${id}`);
@@ -49,6 +69,7 @@ export class ResidentGraph {
     this.backend = backend;
     this.modelPath = modelPath;
     this.ctxPath = ctxPath;
+    this.ephemeral = ephemeral === true;
     this.ctxKey = ctxKey;
     this.heal = heal;
     this.estMemMb = estMemMb;
@@ -56,6 +77,23 @@ export class ResidentGraph {
     this.declared = false;
     this.lastError = null;
     this.lastDeclaredAtMs = null;
+  }
+
+  /**
+   * ⭐ **只在还没声明时接受路径更新。**
+   *
+   * ⚠ 声明过之后就地改 spec 是无效的：App 的对账器看到「声明有、实际也有」会跳过，
+   *   不触发重载（docs/054 §4.4）——⛔ 于是本地字段与 HTP 上真正跑的那张图会分叉，
+   *   而两边都不会报错。要换图只能 undeclare 之后重来。
+   */
+  configure({ ctxKey, modelPath, ctxPath } = {}) {
+    if (this.declared) {
+      throw new Error(`resident ${this.id} is already declared; undeclare before changing its graph`);
+    }
+    if (ctxKey !== undefined) this.ctxKey = ctxKey;
+    if (modelPath !== undefined) this.modelPath = modelPath;
+    if (ctxPath !== undefined) this.ctxPath = ctxPath;
+    return this;
   }
 
   body() {
@@ -75,8 +113,35 @@ export class ResidentGraph {
     return body;
   }
 
-  /** 幂等声明。App 侧 `declare` 一律 force 对账，故这里不需要自己安排重试节奏。 */
+  /**
+   * ⛔ **docs/096：Speech 不再拥有任何 runtime graph。**
+   *
+   * App 的三层 Pipeline 是唯一 execution owner，它自己声明 `app-speaker-cam`
+   * （CAM++ / **htp**）、`app-asr-sensevoice` 与 `fireredvad`。
+   * ⚠ Speech 这边曾经声明的 `tsp-vad-*` / `tsp-asr-*` / `tsp-*-spk-emb` 与它们
+   *   **逐个功能重复**，各占一个 HTP session，而 `tsp-*-spk-emb` 还是 cpu 后端——
+   *   同一个 CAM++ 同时存在一个 htp 版和一个 cpu 版，没有任何界面说得出这件事。
+   * ⭐ 堵在 `declare()` 这一个咽喉，而不是逐个改调用点：
+   *   漏掉一个调用点的症状是「大部分时候没问题」，那种缺陷最难发现。
+   */
   async declare({ force = false } = {}) {
+    if (this.ephemeral) {
+      if (this.declared && !force) return null;
+      const result = await this.android.json(SESSIONS_PATH, {
+        method: 'POST',
+        body: { name: this.id, ...this.body() },
+        timeoutMs: 180_000,
+      });
+      this.declared = true;
+      this.lastDeclaredAtMs = Date.now();
+      this.lastError = null;
+      return result;
+    }
+    if (!LEGACY_RESIDENT_OWNERSHIP) {
+      this.declared = false;
+      this.lastError = null;
+      return null;
+    }
     if (this.declared && !force) return null;
     const result = await this.android.json(`${RESIDENTS_PATH}/${this.id}`, {
       method: 'PUT',
@@ -92,10 +157,10 @@ export class ResidentGraph {
   /** 撤销并卸载。只在 heal 声明需要修正时用（改 spec 必须 DELETE+PUT，见 docs/054 §4.4）。 */
   async undeclare() {
     try {
-      await this.android.json(`${RESIDENTS_PATH}/${this.id}`, {
-        method: 'DELETE',
-        timeoutMs: 60_000,
-      });
+      await this.android.json(
+        this.ephemeral ? `${SESSIONS_PATH}/${this.id}` : `${RESIDENTS_PATH}/${this.id}`,
+        { method: 'DELETE', timeoutMs: 60_000 },
+      );
     } catch (error) {
       if (Number(error?.status) !== 404) throw error;
     }
@@ -122,7 +187,8 @@ export class ResidentGraph {
   async invoke(verb, body) {
     await this.declare();
     try {
-      return await this.android.json(`${RESIDENTS_PATH}/${this.id}/${verb}`, {
+      const base = this.ephemeral ? SESSIONS_PATH : RESIDENTS_PATH;
+      return await this.android.json(`${base}/${this.id}/${verb}`, {
         method: 'POST',
         body,
         timeoutMs: 180_000,

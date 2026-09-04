@@ -104,15 +104,16 @@ const DEFAULTS = {
     sample_interval_ms: 200,
   },
   vad: {
+    /** 当前唯一 VAD 执行方：CAM++ 或 FireRedVAD；两种模式不并行。 */
+    provider: 'campplus',
     pcm_pool_ms: 6000,
     no_output_timeout_ms: 15_000,
   },
   asr: {
     enabled: true,
     /**
-     * ASR 引擎（docs/074）。当前产品唯一支持的执行体是 SenseVoice：
-     * 本包的 VAD 切段 → WAV → App HTP 图。
-     * ⛔ Audio8 与旧 Qwen 值只作为一次性迁移输入，不再是运行时选择。
+     * ASR 引擎。当前产品只有 SenseVoice 一个正式值；选择值直接决定
+     * WAV 交给哪条 App 正式转写 endpoint。
      */
     model: 'sensevoice',
     language: 'auto',
@@ -145,6 +146,11 @@ const normalizeGate = (value = {}) => {
 };
 
 const normalizeVad = (value = {}) => ({
+  provider: ['campplus', 'camplus'].includes(String(value.provider ?? '').toLowerCase())
+    ? 'campplus'
+    : String(value.provider ?? '').toLowerCase() === 'fireredvad'
+      ? 'fireredvad'
+      : DEFAULTS.vad.provider,
   pcm_pool_ms: Math.round(bounded(
     value.pcm_pool_ms,
     DEFAULTS.vad.pcm_pool_ms,
@@ -162,13 +168,18 @@ const normalizeVad = (value = {}) => ({
 });
 
 export const ASR_MODELS = ['sensevoice'];
-/** 下线的旧值：读到就迁移到默认值并**警告一次**，不静默、不崩、不偷偷跑旧后端。 */
-export const ASR_DEPRECATED_MODELS = ['audio8', 'qwen3-q4', 'qwen3-q8'];
+/**
+ * 下线的旧值：读到就迁移到默认值并**警告一次**，不静默、不崩、不偷偷跑旧后端。
+ * ⚠ `audio8` 随 App 0.25.x 退役——它那条链的 App 端点（`/api/asr/audio8/*`）**已被删除**，
+ *   所以一个还存着 `audio8` 的设备如果不迁移，会去调一个不存在的端点，
+ *   ⭐ 而那个失败看起来像「转写坏了」，不像「这个后端已经没有了」。
+ */
+export const ASR_DEPRECATED_MODELS = ['qwen3-q4', 'qwen3-q8', 'audio8'];
 /** 迁移是否已经警告过——只提醒一次，不要每次读配置都刷屏。 */
 let deprecationWarned = false;
 
 /**
- * 把配置里的 ASR 引擎收敛到当前唯一产品值。
+ * 把配置里的 ASR 引擎收敛到当前产品值。
  * @returns {{ model: string, migratedFrom: string|null }}
  */
 export function resolveAsrModel(value, fallback = DEFAULTS.asr.model) {
@@ -177,7 +188,7 @@ export function resolveAsrModel(value, fallback = DEFAULTS.asr.model) {
     if (!deprecationWarned) {
       deprecationWarned = true;
       console.warn(`[termux-speech] ASR engine "${value}" has been retired; `
-        + `falling back to "${fallback}". Audio8/Qwen3-ASR are retired.`);
+        + `falling back to "${fallback}".`);
     }
     return { model: fallback, migratedFrom: value };
   }
@@ -226,6 +237,26 @@ const normalizeConfig = (raw = {}) => ({
     10_000,
   )),
   chain_desired: raw.chain_desired === 'stopped' ? 'stopped' : DEFAULTS.chain_desired,
+  /**
+   * ⭐ docs/096：使用者想要的 App 三层 Pipeline（**desired，⛔ 不是 effective**）。
+   * ⚠ `normalizeConfig` 是**白名单**——它重建一个只含已知键的新对象。
+   *   不在这里登记的键会被**静默丢掉**：保存不报错，读回来就是没有。
+   */
+  pipeline: {
+    trigger: ['stop', 'passthrough', 'volume', 'clap'].includes(raw.pipeline?.trigger)
+      ? raw.pipeline.trigger : 'stop',
+    /**
+     * ⭐ docs/099：`camplus` 作为独立断句器已退役 ⇒ 规范化成 `fireredvad_camplus`。
+     * ⚠ **必须继续读得懂旧值**：conf 里存着的就是它，认不出会让一次重启把人挡在门外。
+     */
+    segment: (() => {
+      const raw0 = raw.pipeline?.segment;
+      const canonical = raw0 === 'camplus' ? 'fireredvad_camplus' : raw0;
+      return ['fireredvad', 'fireredvad_camplus'].includes(canonical) ? canonical : 'fireredvad';
+    })(),
+    /** ⚠ 与 [resolveAsrModel] 同一条规则：认不出的（含已退役的 `audio8`）一律回默认值。 */
+    asr: ASR_MODELS.includes(raw.pipeline?.asr) ? raw.pipeline.asr : 'sensevoice',
+  },
   graph_residency: ['service', 'chain', 'warm'].includes(raw.graph_residency)
     ? raw.graph_residency
     : DEFAULTS.graph_residency,
@@ -341,6 +372,10 @@ export function saveVadConfig(file, patch) {
   const raw = fs.existsSync(file) ? readSaved(file) : {};
   const current = normalizeVad(raw.vad);
   const candidate = { ...current, ...patch };
+  if (patch.provider !== undefined
+    && !['campplus', 'camplus', 'fireredvad'].includes(String(patch.provider).toLowerCase())) {
+    throw new RangeError('VAD provider must be campplus or fireredvad');
+  }
   for (const key of ['pcm_pool_ms', 'no_output_timeout_ms']) {
     if (patch[key] !== undefined && !Number.isFinite(Number(patch[key]))) {
       throw new RangeError(`${key} must be a finite number`);

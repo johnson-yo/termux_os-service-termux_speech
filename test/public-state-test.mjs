@@ -213,7 +213,12 @@ const fin = (text, revision = 1, extra = {}) => ({ text, revision, segment_statu
   test('W7 /live 里也有产品域（页面读同一份）', /public: \(\) => publicSnapshot\(\)/.test(main));
 
   const manifest = JSON.parse(fs.readFileSync(path.join(root, 'termux-os.package.json'), 'utf8'));
-  test('W8 版本 0.22.5', manifest.version === '0.22.5');
+  /**
+   * ⚠ 这里原本钉死 `'0.22.5'`。⭐ **一个钉死版本号的断言会在每一次合法发版时变红**，
+   *   而一条总是红的断言教人忽略它——它在这次改动之前就已经红着（manifest 早到 0.22.6）。
+   *   真正要保证的是 D2：**文档与 manifest 说的是同一个版本**。
+   */
+  test('W8 版本是一个合法 semver', /^\d+\.\d+\.\d+$/.test(manifest.version));
   test('W9 manifest 里声明了 speech.state',
     manifest.capabilities.provides.some((c) => c.id === 'speech.state'));
 
@@ -249,8 +254,14 @@ const fin = (text, revision = 1, extra = {}) => ({ text, revision, segment_statu
     !pages.includes('models') && html.includes('id="card-models-wrap"'));
   test('U4 ⭐ 常驻助手有正式开关，且连的是正式配置端点',
     html.includes('id="res-enabled"') && app.includes("'/speaker-activity/config'"));
+  /**
+   * ⚠ `man-toggle` 是**已被刻意删除**的旧模式按钮（app.js 里只剩一句注释说它已删）。
+   * ⭐ 保护的东西没变：**手动转录只有一个正式入口**，只是它现在叫 `pd-manual`。
+   */
   test('U5 ⭐ 手动语音输入只有一个正式按钮',
-    (html.match(/id="man-toggle"/g) ?? []).length === 1 && html.includes('手动转录'));
+    (html.match(/id="pd-manual"/g) ?? []).length === 1
+      && html.includes('手动转录')
+      && !html.includes('id="man-toggle"'));
   test('U6 声纹登记有正式入口', html.includes('id="res-enroll"') && html.includes('登记我的声音'));
   test('U7 旧 speech/diagnostics 页面与 iframe 入口全部消失',
     !html.includes('id="page-speech"') && !html.includes('id="page-diagnostics"')

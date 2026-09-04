@@ -13,6 +13,7 @@ scripts/consumer-fixture.mjs
 scripts/verify-device.mjs
 service/acoustic-lab.mjs
 service/app-api.mjs
+service/app-pipeline.mjs
 service/asr/boundary.mjs
 service/asr/controller.mjs
 service/asr/features.mjs
@@ -27,6 +28,7 @@ service/capture/tts-intervals.mjs
 service/config.mjs
 service/http-auth.mjs
 service/lifecycle/controller.mjs
+service/logical-models.mjs
 service/main.mjs
 service/models.mjs
 service/pcm-consumers.mjs
@@ -39,12 +41,14 @@ service/speaker-lab.mjs
 service/speaker/activity-fsm.mjs
 service/speaker/activity-shadow.mjs
 service/speaker/activity.mjs
+service/speaker/app-activity.mjs
+service/speaker/app-segments.mjs
 service/speaker/campplus.mjs
 service/speaker/gate.mjs
 service/speaker/pcm-ring.mjs
 service/speaker/profile.mjs
-service/speaker/uservad.mjs
 service/speaker/user-watchdog.mjs
+service/speaker/uservad.mjs
 service/speech-input.mjs
 service/state-hub.mjs
 service/states.mjs

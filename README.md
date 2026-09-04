@@ -1,40 +1,63 @@
 # Termux Speech
 
-Termux Speech is a local speech-input service for Termux-OS. Audio, recognition, and saved speech
-records stay on the Android device while the service provides speech activity and transcript
-capabilities to other packages.
+Speech to text on an Android phone, entirely on the device. This Termux-OS service Package keeps
+audio local and exposes speech input, activity, transcript, idle, and listen Capabilities.
 
-## What it provides
+## Pipeline
 
-- microphone input and speech-activity state;
-- local speech-to-text with SenseVoice;
-- optional speaker-activity detection with CAM++; and
-- transcript, idle, and listen capabilities for consumers.
+The App owns microphone capture and the ORT-QNN/HTP runtime. This Package owns the processing
+state and the two independent VAD paths:
 
-The Termux-OS App owns microphone capture and model execution. This Package owns speech-session
-state, segmentation, storage, and the public capability surface.
+```text
+App microphone → PCM + RMS
+                    │
+                    ├─ RMS → FireRedVAD staircase cuts → WAV → ASR
+                    │
+                    └─ CAM++VAD activity FSM → incomplete/complete segments → ASR
+                                                                  │
+                                             transcript + record store + state feeds
+```
+
+FireRedVAD uses the measured gradient/staircase pause policy: it selects a scored pause valley,
+cuts at the deep-core tail, and lets the residual continue into the next segment. CAM++VAD is a
+separate resident activity path and does not use that cut policy. Both paths share one bounded ASR
+spool and never send PCM through Framework Core or the browser.
 
 ## Models
 
-- SenseVoice — speech recognition;
-- FireRedVAD — voice activity detection; and
-- CAM++ — optional speaker activity.
+| Stage | Model |
+| --- | --- |
+| Voice activity | FireRedVAD |
+| Recognition | SenseVoiceSmall segment transcription |
+| Speaker activity | CAM++ 192-d embedding |
 
-Model assets are managed separately by the HF Model Manager and are not bundled in this source
-repository.
+Models are not bundled or downloaded during service startup. They are resolved through the asset
+Packages listed under Requirements and fetched only when needed.
 
-## Use
+## Using it
 
-Install the Package from the Termux-OS catalog and open **Termux Speech** in the administration
-interface. The WebUI exposes overview, settings, and diagnostic views.
+Install from the Termux-OS package catalog, then open **Termux Speech** in the admin panel:
+
+- **概览** — service health, current activity, and the latest recognition
+- **设置** — microphone, sensitivity, ASR model, and speaker activity
+- **诊断** — per-stage readings when something is wrong
+
+## Requirements
+
+- Framework Core `>= 0.2.27`
+- The Termux-OS App adapter (`termux-os.app.api`)
+- `github.termux-os.asset.fireredvad >= 1.0.0`
+- `github.termux-os.asset.sensevoice >= 3.0.0`
+- `github.termux-os.asset.campplus >= 1.0.0`
 
 ## Development
 
 ```sh
-for test in test/*.mjs; do node "$test"; done
-node scripts/verify-device.mjs
+for t in test/*.mjs; do node "$t"; done
+node scripts/verify-device.mjs   # on a device, with the service running
 ```
 
 ## Licence
 
-Apache-2.0. See `LICENSE`, `NOTICE.md`, and `SECURITY.md`.
+Apache-2.0. Model weights are distributed separately under their own terms by the asset Packages
+above. See `LICENSE`, `NOTICE.md`, and `SECURITY.md`.

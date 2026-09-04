@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: Apache-2.0
  * [INPUT]: PCM 分流（consumer `speaker`）+ 自己那张 FireRedVAD 常驻图 + CAM++ CPU 图
  * [OUTPUT]: 声纹登记 + **实时滑窗 USER-VAD 时间轴**（similarity / 迟滞 / USER-OTHER / episode）
- * [POS]: docs/080。⛔ 到 similarity 与 episode WAV 为止：不进 SenseVoice/Audio8、
+ * [POS]: docs/080。⛔ 到 similarity 与 episode WAV 为止：不进 SenseVoice、
  *        不 `records.admit`、不占 50 句 group。全部事件带 `debug_only=true`。
  *
  * ⭐ 本轮最重要的结构改变：**CAM++ 的窗不再由 FireRedVAD 的 segment 决定。**
@@ -53,18 +53,36 @@ const wavHeader = (bytes) => {
 };
 
 export class SpeakerLab {
-  constructor({ android, vadModelFile = null, vadCmvnFile = null, residentId, embedder, dataRoot, onChange = () => {} }) {
+  /** @param vadGraph 已经路由好的图参数（见 `executableGraphArgs`）；⛔ 不是裸路径。 */
+  constructor({ android, vadGraph = null, vadCmvnFile = null, residentId, embedder, dataRoot, onChange = () => {} }) {
     this.android = android;
-    /** 两条路径都来自 FireRedVAD logical descriptor，⛔ 类内不拼 source 文件名。 */
-    this.modelPath = vadModelFile;
+    this.executable = vadGraph ?? null;
+    /** 「文件在不在」与报错用的那一份；⛔ 不拿它去当 model_path。 */
+    this.modelPath = vadGraph?.path ?? null;
+    /** ⭐ 与 [VadController.applyLogical] 同一件事：可执行体是会迟到的事实。 */
+    this.applyLogical = ({ graph: g, cmvnFile: c } = {}) => {
+      if (this.modelPath) return false;
+      if (!g?.path) return false;
+      this.executable = g; this.modelPath = g.path;
+      if (c) this.vadCmvnFile = c;
+      return true;
+    };
     this.cmvnPath = vadCmvnFile;
     this.dataRoot = path.resolve(dataRoot);
     this.profilePath = path.join(this.dataRoot, 'profile.json');
     this.onChange = onChange;
     this.embedder = embedder;
+    /**
+     * ⭐ 登记台自己那张 VAD 是**临时会话**：只在使用者点「登记 / 测试」期间存在。
+     * ⛔ 不是常驻（docs/096 把常驻所有权收给 App 了），而退役常驻时这条路径被一起
+     *   切断——症状是登记时 `no such resident`，一个没有人再声明的 id。
+     */
     this.vad = new ResidentGraph({
       android, id: residentId, model: 'fireredvad',
-      modelPath: this.modelPath, estMemMb: VAD_EST_MEM_MB,
+      modelPath: vadGraph?.modelPath ?? null,
+      ctxPath: vadGraph?.ctxPath ?? null,
+      ctxKey: vadGraph?.ctxKey ?? null,
+      estMemMb: VAD_EST_MEM_MB, ephemeral: true,
     });
     this.cmvn = null;
 
@@ -248,10 +266,29 @@ export class SpeakerLab {
     return this.snapshot();
   }
 
-  stop() {
+  /**
+   * ⭐ **临时会话必须真的走。**
+   *
+   * ⚠ 「用完就走」是这两张图存在的**全部理由**：`tsp-*-spk` 是一个 HTP 会话，
+   *   而 docs/096 收走 speech 的常驻所有权，正是因为这种图会一直占着而没人说得出来。
+   *   建了不删 = 换了个名字的常驻。⛔ 不许只把 `mode` 置成 idle 就算收工。
+   * ⚠ 失败只记不抛：登记已经结束了，「没删掉」不该表现成「登记失败」。
+   */
+  async #releaseGraphs(reason) {
+    for (const [name, g] of [['vad', this.vad], ['campplus', this.embedder]]) {
+      try {
+        await g.release?.() ?? await g.undeclare?.();
+      } catch (error) {
+        this.lastError = `release ${name} (${reason}): ${String(error?.message ?? error)}`;
+      }
+    }
+  }
+
+  async stop() {
     if (this.segment) void this.#closeEnrollSegment('stopped');
     if (this.episode) this.#finishEpisode('stopped');
     this.mode = 'idle';
+    await this.#releaseGraphs('stopped');
     this.onChange();
     return this.snapshot();
   }
@@ -263,6 +300,8 @@ export class SpeakerLab {
     if (this.episode) this.#finishEpisode(reason);
     this.segment = null;
     this.mode = 'idle';
+    // ⛔ 同上：回 idle 也必须把那两个临时会话交回去。
+    void this.#releaseGraphs(reason);
     this.onChange();
   }
 

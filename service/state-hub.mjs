@@ -53,6 +53,8 @@ const CLOCK_ONLY_KEYS = new Set([
   'uptime_ms',
   'elapsed_ms',
   'engaged_for_ms',
+  /** docs/097：App telemetry 最近一次成功读取的时刻。它只随时钟走。 */
+  'fast_at_ms',
 ]);
 
 /**
@@ -74,6 +76,8 @@ const FREE_RUNNING_COUNTERS = new Set([
   'unknown_text_frames',
   'processed_frames',
   'pcm_frame_count',
+  /** docs/097：App telemetry 的轮询次数。轮询发生了不等于事实变了。 */
+  'polls',
 ]);
 
 /** 比较用的规范形：把纯时钟字段与自由计数器抹平，其余原样。 */
