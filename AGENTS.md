@@ -2,7 +2,7 @@
 
 ## Responsibility
 
-**Speech is the only product backend (release candidate 0.27.16).** The WebUI is Speech-only
+**Speech is the only product backend (release candidate 0.27.17).** The WebUI is Speech-only
 (three pages: Overview, History, Settings); the legacy RMS/VAD/ASR product surface is retired — its write
 routes answer `410 LEGACY_SPEECH_RETIRED`, its App pipeline telemetry and model reconciler do not
 start, and at boot the legacy App pipeline is set to `stop` so the system microphone is free for

@@ -2,7 +2,7 @@
   "schema": "termux-os.package.v1",
   "id": "github.termux-os.service.termux-speech",
   "name": "Termux Speech",
-  "version": "0.27.16",
+  "version": "0.27.17",
   "description": "Speech control plane and transcript consumer: three-page WebUI (Overview run/controls, paged History, Settings) with speaker identity, audio playback and latency details. The legacy RMS/VAD/ASR product surface is retired; speech.idle, capability feeds and a live available-memory readout remain.",
   "types": [
     "service"
@@ -155,14 +155,6 @@
   },
   "packages": {
     "requires": []
-  },
-  "integrations": {
-    "requires": [
-      {
-        "capability": "termux-os.app.api",
-        "required": true
-      }
-    ]
   },
   "release": {
     "repository": "https://github.com/johnson-yo/termux_os-service-termux_speech",

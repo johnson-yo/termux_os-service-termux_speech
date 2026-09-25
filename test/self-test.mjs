@@ -1049,7 +1049,10 @@ test(
       .every((item) => item.required === false)
     && manifest.assets.requires.filter((item) => item.id.startsWith('model.'))
       .every((item) => item.required === false)
-    && manifest.integrations.requires.some((item) => item.capability === 'termux-os.app.api' && item.required === true)
+    // ⛔ App API 只在 capabilities.requires 声明：没有任何 Package 声明 integrations.provides，
+    //    一条 required integration 永远探不到，Framework 会把本包标成 Missing integration 并卡住安装预检。
+    && manifest.capabilities.requires.some((item) => item.id === 'termux-os.app.api' && item.required === true)
+    && manifest.integrations === undefined
     && !manifest.runtime.external.some((item) => item.id.startsWith('fireredvad-'))
     && !JSON.stringify(manifest).includes('models/fireredvad'),
 );
@@ -1107,7 +1110,8 @@ test(
       && manifest.runtime.bundled.length === 0
       && manifest.runtime.external.length === 0
       && manifest.packages.requires.length === 0
-      && manifest.integrations.requires.some((item) => item.capability === 'termux-os.app.api' && item.required === true)
+      && manifest.capabilities.requires.some((item) => item.id === 'termux-os.app.api' && item.required === true)
+      && manifest.integrations === undefined
       && typeof manifest.release?.repository === 'string',
   );
   test(
