@@ -23,9 +23,15 @@ import {
   saveSpeakerActivityConfig,
   saveSpeakerGateConfig,
   saveVadConfig,
+  saveSpeech2Config,
 } from './config.mjs';
 import { systemKeyAuthorized } from './http-auth.mjs';
 import { createAndroidAppClient, UpstreamError } from './app-api.mjs';
+import {
+  createSpeech2Client, speech2Overview, isMicSource, SPEECH2_INPUT_SOURCES, SPEECH2_TRIGGERS,
+  SPEECH2_SCENES, SPEECH2_POLICY_FIELDS, SPEECH2_POLICY_SCHEMA_VERSION,
+} from './speech2.mjs';
+import { Speech2Transcripts } from './speech2-transcripts.mjs';
 import { createAppPipelineClient, TRIGGERS, SEGMENTS, ASRS, canonicalSegment } from './app-pipeline.mjs';
 import { ForegroundGate, framesToDb } from './asr/foreground.mjs';
 import { RelativeForegroundGate } from './asr/relative-foreground.mjs';
@@ -44,8 +50,6 @@ import { VadController } from './vad/controller.mjs';
 import { AsrController } from './asr/controller.mjs';
 import { PIPELINE_OWNERS, PipelineLease } from './pipeline-lease.mjs';
 import { PcmConsumers } from './pcm-consumers.mjs';
-import { AcousticLab } from './acoustic-lab.mjs';
-import { SpeakerLab } from './speaker-lab.mjs';
 import { CamPlusEmbedder } from './speaker/campplus.mjs';
 import { SpeakerGate } from './speaker/gate.mjs';
 import { TargetActivityShadow } from './speaker/activity-shadow.mjs';
@@ -59,8 +63,6 @@ import {
 } from './speaker/user-watchdog.mjs';
 import { StateBus } from './states.mjs';
 import { LifecycleController, MIC_REQUESTER } from './lifecycle/controller.mjs';
-import { resolveAssetRoot } from './assets.mjs';
-import { resolveLogicalModel, companionFile, companionRoot, executableGraphArgs } from './logical-models.mjs';
 import { AppEventsClient, CaptureWatchdog } from './capture/app-events.mjs';
 import { RecordArchive } from './storage/archive.mjs';
 import { RecordGroups } from './storage/groups.mjs';
@@ -71,16 +73,28 @@ import {
   WATCH_TIMEOUT_MS,
   normalizeWatchInterval,
 } from './state-hub.mjs';
-import { listModels, downloadModel, useModel, modelOperation } from './models.mjs';
+import { listModels, downloadModel, prepareModel, modelOperation, managerClient } from './models.mjs';
+import {
+  SpeechModelRuntime,
+  frontendFromRaw,
+  graphFromArtifact,
+} from './raw-models.mjs';
 
-/** Model absence is a capability state, not a package boot failure. */
-const resolveOptionalAssetRoot = async (id) => {
-  try { return await resolveAssetRoot(id); }
-  catch (error) {
-    console.log(`[termux-speech] optional asset ${id} unavailable: ${error?.message ?? error}`);
-    return null;
-  }
+/**
+ * The calibration/enrollment labs remain available to source-tree tests, but are
+ * deliberately absent from the production archive. Load them only when running
+ * from a development checkout that actually contains the source files.
+ */
+const loadSourceOnlyLab = async (filename, exportName) => {
+  const moduleUrl = new URL(filename, import.meta.url);
+  if (!fs.existsSync(moduleUrl)) return null;
+  const module = await import(moduleUrl.href);
+  return module[exportName] ?? null;
 };
+const [AcousticLab, SpeakerLab] = await Promise.all([
+  loadSourceOnlyLab('./acoustic-lab.mjs', 'AcousticLab'),
+  loadSourceOnlyLab('./speaker-lab.mjs', 'SpeakerLab'),
+]);
 
 /**
  * ⭐ 状态总线的**前向引用**，真正构造在本文件很靠后（`new StateHub(...)`）。
@@ -104,44 +118,19 @@ const CONFIG_FILE = process.env.CONFIG_FILE || '.runtime-dev/conf.v4.json';
 const LEGACY_CONFIG_FILE = process.env.LEGACY_CONFIG_FILE || '';
 const VAD_DATA_ROOT = process.env.VAD_DATA_ROOT || '.runtime-dev/data/termux-speech/vad';
 /**
- * CAM++ 的位置由 **Asset** 回答，⛔ 不再有裸路径。
+ * CAM++ 的 raw 文件由 Manager 返回，runtime artifact 由 App prepare 返回，⛔ 不再有裸路径。
  *
- * 两个档位刻意分开（`github.termux-os.asset.campplus`）：
- *   · `model.campplus.graph` 必需、generic、动态 T —— 登记走 CPU，每人只做一次；
- *   · `model.campplus.ctx`   可选、绑 `android-arm64-v73-qnn247`、固定 [1,148,80] —— 运行时。
- * ⛔ 没有匹配本机的 ctx 就如实报不可用，**绝不静默回落 CPU**：
- *   CPU 也能算出一个分数，而那正是这类验收最容易骗人的地方。
+ * raw card 只提供文件事实；App artifact 才能提供上下文/执行路径。任一层缺失都如实显示，
+ * 不静默降级。
  */
 /**
- * ⭐ **CAM++ 的两个文件都从 logical model 的 descriptor 取，⛔ 不再自己 resolve 资产。**
+ * ⭐ **CAM++ 只需要固定 HTP raw 文件由 Manager 返回，runtime artifact 由 App prepare 返回。**
  *
- * ⚠ 旧代码写的是 `(await resolveOptionalAssetRoot('model.campplus.graph'))?.files?.model`，
- *   而 `resolveAssetRoot` 的返回值**只有** `{root, version, package}` —— 它从来不带 `files`。
- *   于是这个表达式**恒为 undefined** ⇒ `CAMPLUS_MODEL_PATH` 永远是 null ⇒ 声纹登记
- *   永远报 `CAM++ model missing: null`。⭐ 报错里那个字面的 `null` 就是它自己的供词。
- *   （Framework 的 `/api/assets/<id>` 本来也只回角色**名**数组 `["model"]`，不回文件名，
- *   所以就算把 `files` 透传上来也拿不到路径——这条路结构上就走不通。）
- *
- * ⭐ 两个文件是**两张不同的图**，⛔ 不能互相顶替：
- *   · `companions['model.campplus.graph']` = 动态 `[1,'T',80]` → **登记**走 CPU，任意长度；
- *   · `executable`                          = 固定 `[1,148,80]` → **运行时**跑 HTP，1500 ms 窗。
- *   合成一个坑位的后果实测过：HTP 通了而登记不了。
- * ⚠ 取不到就留 null：由调用方明确拒绝，⛔ 不静默回落 CPU（CPU 也能算出一个分数，
- *   而那正是这类验收最容易骗人的地方）。
+ * ⚠ raw card 只提供文件事实；本服务不从模型名猜路径，也不把 raw card 当 runtime artifact。
+ *   App prepare 返回的 artifact 才能提供上下文/执行路径；不再有 generic/CPU 登记源。
  */
 let CAMPLUS_MODEL_PATH = null;
 let CAMPLUS_CTX_PATH = null;
-{
-  const m = await resolveLogicalModel('model.campplus');
-  if (m?.available === true) {
-    CAMPLUS_CTX_PATH = m.executable.path;
-    CAMPLUS_MODEL_PATH = companionFile(m, 'model.campplus.graph', 'model');
-    console.log(`[termux-speech] model.campplus → ${CAMPLUS_CTX_PATH} (${m.executable.kind})`);
-    console.log(`[termux-speech] model.campplus enrollment graph → ${CAMPLUS_MODEL_PATH}`);
-  } else {
-    console.log(`[termux-speech] model.campplus not usable: ${m?.reason} — ${m?.hint ?? ''}`);
-  }
-}
 const ASR_DATA_ROOT = process.env.ASR_DATA_ROOT || '.runtime-dev/data/termux-speech/asr';
 /**
  * ⭐ **全新的存储命名空间**（docs/061 §七.1）。旧的 `vad/wav/segments.v1.jsonl` 与
@@ -279,6 +268,118 @@ if (missingInjections.length > 0) {
 const android = createAndroidAppClient({
   frameworkUrl: FRAMEWORK_URL,
   systemKey: SYSTEM_KEY,
+});
+
+// Speech2 is deliberately only a transport client in this Package. Its shell/policy runtime
+// belongs to the independent App namespace; this client must not grow a second speech pipeline.
+const speech2 = createSpeech2Client(android);
+
+/**
+ * ⭐ CP-SPEECH2-WEBUI18：**Speech2 是唯一产品后端**（`SPEECH2_IS_SOLE_PRODUCT_BACKEND=true`）。
+ *   ⛔ 不再兼容旧 speech 产品面：旧 App pipeline 的遥测轮询、旧模型对账、旧后端就绪、
+ *   以及只服务旧 WebUI 的写路由（见 `LEGACY_RETIRED_ROUTES`）全部停用。
+ *   ⭐ 保留的是**通用基础设施**：RecordGroups / state-hub / records / capability 注册。
+ */
+const SPEECH2_ONLY = true;
+
+/**
+ * ⭐ 只服务旧产品 WebUI 的写路由 ⇒ 410 `LEGACY_SPEECH_RETIRED`（⛔ 不是静默 404：
+ *   一个调用方应该知道这条路**被退役了**，而不是「写错了」）。
+ *   读路由（`/status`、`/records`、`/state`…）与 capability 背后的动作不在此列。
+ */
+const LEGACY_RETIRED_EXACT = new Set([
+  '/mic/enable', '/mic/disable', '/input-device', '/chain/start', '/chain/stop',
+  '/lifecycle/config', '/policy/put', '/asr/dictation', '/asr/transcribe', '/asr/config',
+  '/asr/dictation/gate', '/pcm/consumers', '/rms/config', '/vad/config',
+]);
+const LEGACY_RETIRED_PREFIXES = ['/clap', '/speaker/', '/speaker-activity/', '/speaker-gate/',
+  '/activity-shadow/', '/activity-test/', '/acoustic-lab/', '/gate/'];
+const legacyRouteRetired = (method, route) => {
+  if (!SPEECH2_ONLY || method === 'GET' || method === 'HEAD') return false;
+  if (route === '/pipeline') return true;
+  if (LEGACY_RETIRED_EXACT.has(route)) return true;
+  return LEGACY_RETIRED_PREFIXES.some((p) => route === p || route.startsWith(p));
+};
+
+/**
+ * Speech2 输入源的最后一次失败（FGS_REQUIRED / RECORD_AUDIO_REQUIRED / AUDIO_SOURCE_BUSY…）。
+ * ⭐ 必须说出来：「Speech2 在跑但没有任何声音进来」与「没人说话」在界面上长得一模一样
+ *   （真机实测：097 之后 Speech2 `RUNNING` 而 AudioRing `active_source=null`，My Voice 超时）。
+ */
+let speech2InputError = null;
+
+const inputErrorOf = (error) => ({
+  code: String(error?.message ?? error).split(':')[0].trim() || 'INPUT_START_FAILED',
+  message: String(error?.message ?? error),
+  status: Number(error?.status) || null,
+  at_ms: Date.now(),
+});
+
+/**
+ * ⭐ 旧链让出系统麦克风：旧 App pipeline 回到 `stop`、撤掉本包遗留的 mic holder。
+ *   否则 App 会以 `AUDIO_SOURCE_BUSY: PersistentMic owns the system microphone` 拒绝 Speech2 的源。
+ *   ⛔ 不碰 `user.persistent`（那归使用者；`setMicDemand` 也会硬拒）。
+ */
+const releaseLegacyMicPath = async (reason) => {
+  const out = { legacy_pipeline_stopped: false, legacy_pipeline_error: null, revoked: [] };
+  try {
+    const now = await appPipeline.get();
+    const requested = now?.requested?.trigger ?? now?.effective?.trigger ?? null;
+    if (requested && requested !== 'stop') {
+      await appPipeline.patch({ trigger: 'stop' }, `speech2-only:${reason}`);
+      out.legacy_pipeline_stopped = true;
+    }
+  } catch (error) {
+    out.legacy_pipeline_error = String(error?.message ?? error);
+  }
+  out.revoked = await revokeOrphanMicHolders(reason).catch(() => []);
+  return out;
+};
+
+/**
+ * ⭐ Speech2 Start = **先 arm 再起源**（frontend 从 reader 当前尾部开始；先起源会漏掉开头）：
+ *   ① 旧链让出麦克风 ② App Speech2 start（模型未就绪 ⇒ 409，原样上抛）
+ *   ③ AudioRing 没有活动源 ⇒ 启动配置的麦克风源；失败**不回滚** Speech2，但如实记下原因。
+ */
+const speech2Start = async (reason = 'webui') => {
+  const legacy = await releaseLegacyMicPath(reason);
+  const started = await speech2.start();
+  let source = null;
+  let ring = await speech2.ringStatus().catch(() => null);
+  if (ring && ring.source_active !== true) {
+    try {
+      source = await speech2.startSource(cfg.speech2.input_source);
+      speech2InputError = null;
+    } catch (error) {
+      speech2InputError = inputErrorOf(error);
+    }
+    ring = await speech2.ringStatus().catch(() => ring);
+  } else if (ring?.source_active === true) {
+    speech2InputError = null;
+  }
+  return { speech2: started, source, ring, input_error: speech2InputError, legacy };
+};
+
+/** Stop：先停 Speech2，再停**麦克风类**源（测试源 WAV/WS 由测试工具自己管）。 */
+const speech2Stop = async () => {
+  const stopped = await speech2.stop();
+  let source = null;
+  const ring = await speech2.ringStatus().catch(() => null);
+  if (ring?.source_active === true && isMicSource(ring.active_source)) {
+    source = await speech2.stopSource().catch((error) => ({ error: String(error?.message ?? error) }));
+  }
+  return { speech2: stopped, source };
+};
+
+/**
+ * P0-A ownership boundary. The service may ask Manager for raw package facts,
+ * then asks App to prepare a source. It never receives an executable from
+ * Manager and never declares an App resident itself.
+ */
+const speechModelRuntime = new SpeechModelRuntime({
+  manager: managerClient(),
+  android,
+  onChange: () => { hub?.markCold(); hub?.schedule(); },
 });
 
 /**
@@ -2011,65 +2112,22 @@ const setConsumer = (name, on) => {
  * 补模型的地方。一个「东西没到位」的状态必须能被看见并就地修好，不能表现为消失。
  */
 /**
- * ⭐ **docs/093：这里只问一句「model.sensevoice 现在能不能跑」。**
- *
- * 迁移前这一段有三个 `resolveAssetRoot`：先试 `.ctx`、不行再试 `.graph`，
- * 还要各自记下失败原因。那套判断**本身是对的**，但它属于 Asset 层——
- * ⛔ speech 不该知道预制与源图的存在，更不该知道哪个更适合这台机器。
- *
- * 现在：`resolveLogicalModel` 返回一个 **executable descriptor**，
- * 里面已经是「当前可用的那一份」。⛔ 不再有 ctx / graph / v73 / QNN 这些词。
- * ⚠ 仍然**只解析不下载**：几百 MB 的东西不许出现在启动路径上，
- *   缺就缺着，如实报「模型没到位」，由模型管理器去准备。
+ * Raw and App runtime facts arrive after boot. A missing raw package therefore
+ * leaves the service healthy and the model page usable.
  */
-let senseModel = await resolveLogicalModel('model.sensevoice');
 let senseFrontend = null;
-let senseFrontendWhy = null;
-if (senseModel?.available === true) {
-  console.log(`[termux-speech] model.sensevoice → ${senseModel.executable.path}`
-    + ` (${senseModel.executable.kind})`);
-  const root = companionRoot(senseModel, 'model.sensevoice.frontend');
-  if (root) {
-    senseFrontend = {
-      root,
-      version: senseModel.version,
-      /** ⭐ 按 **role** 取文件，⛔ 不拼 `am.mvn` / `tokens.json`。 */
-      files: senseModel.companions['model.sensevoice.frontend']?.files ?? {},
-    };
-  } else {
-    senseFrontendWhy = 'frontend companion is not installed';
-  }
-} else {
-  senseFrontendWhy = senseModel?.hint ?? senseModel?.reason ?? 'model not enabled';
-  console.log(`[termux-speech] model.sensevoice not usable: ${senseModel?.reason} — ${senseFrontendWhy}`);
-}
-
-/** SenseVoice 能不能转写。缺模型不是启动失败，是一个如实报出来的未就绪状态。 */
-const senseVoiceReady = senseModel?.available === true && Boolean(senseFrontend);
-if (!senseVoiceReady) {
-  console.log('[termux-speech] SenseVoice has no model yet; the service starts and the page can fetch one.');
-}
-
-const senseTarget = await (async () => {
-  try {
-    const r = await fetch(`${process.env.TERMUX_OS_FRAMEWORK_URL}/api/system/device`, {
-      headers: { Authorization: `Bearer ${process.env.TERMUX_OS_SYSTEM_KEY}` },
-      signal: AbortSignal.timeout(5000),
-    });
-    const d = await r.json();
-    return d?.ok ? { htp: d.device.htp, qnn: d.device.qnn } : null;
-  } catch { return null; }  // 純診斷欄位，取不到就報 null，不擋啟動
-})();
+let senseFrontendWhy = 'raw_missing';
+let senseVoiceReady = false;
+let senseRuntime = null;
 
 asr = new AsrController({
   android,
   dataRoot: ASR_DATA_ROOT,
   config: cfg.asr,
-  frontendRoot: senseFrontend?.root ?? null,
-    frontendFiles: senseFrontend?.files ?? null,
-  executablePath: senseModel?.executable?.path ?? null,
-  executableKind: senseModel?.executable?.kind ?? null,
-  target: senseTarget,
+  frontendRoot: null,
+  frontendFiles: null,
+  runtimeArtifact: null,
+  target: null,
   residentId: ASR_RESIDENT_ID,
   persistConfig: (patch) => {
     cfg = saveAsrConfig(CONFIG_FILE, patch);
@@ -2262,63 +2320,37 @@ const handleVadSegment = (segment) => {
  * 用旧路径」的分支会让依赖门禁形同虚设：声明的东西没装上，服务照样跑，
  * 而问题要到别人的机器上才暴露。
  */
-/**
- * ⭐ **docs/093/当前任务：FireRedVAD 完整消费 logical descriptor。**
- *
- * descriptor 同时给出 App 要跑的 executable 与 runtime `cmvn` companion。
- * ⛔ 这里不再解析 source asset root，不自己拼 `model.onnx` / `cmvn.bin`，
- * 也不在模型缺失时让 package import 失败。
- */
-const vadModel = await resolveLogicalModel('model.fireredvad');
-/**
- * ⭐ **已经路由好的图参数**，⛔ 不是一个裸路径。
- *
- * ⚠ FireRedVAD 的 executable 在本机是一份 EPContext（`kind: "local"`）。
- *   把它当 `model_path` 送给 App，加载器会拿它去**编译一份新的 context**，
- *   而里面那个 `ep_cache_context` 相对引用再也解析不到自己的目录——
- *   App 以 `EP_CONTEXT_AS_MODEL_PATH` 明确拒绝，并直接告诉你该传 `ctx_path`。
- * ⚠ `asr/controller.mjs` 早就做对了；这三个 FireRedVAD 消费者在 docs/093 迁移时被漏下。
- */
-const VAD_GRAPH = vadModel?.available === true ? executableGraphArgs(vadModel) : null;
-const VAD_MODEL_PATH = VAD_GRAPH?.path ?? null;
-const VAD_CMVN_PATH = vadModel?.available === true ? companionFile(vadModel, 'cmvn') : null;
-const fireRedVadReady = Boolean(VAD_MODEL_PATH && VAD_CMVN_PATH);
-console.log(`[termux-speech] model.fireredvad ${fireRedVadReady ? 'ready' : 'degraded'}`
-  + ` reason=${fireRedVadReady ? 'logical_descriptor' : (vadModel?.reason ?? 'cmvn_companion_missing')}`);
+/** FireRedVAD raw files and App artifact are supplied by the runtime coordinator. */
+let VAD_GRAPH = null;
+let VAD_MODEL_PATH = null;
+let VAD_CMVN_PATH = null;
+let fireRedVadReady = false;
 
 /**
  * ⭐ 声学校准 / Endpoint Lab（docs/078）。**只是多开一个水龙头**：
  *   `lab` 是 `PcmConsumers` 里的一个名字，开它不关别人、关它不动别人。
  * ⛔ 它自带一张 FireRedVAD 常驻图——正式那张是有状态的流，两个消费者共用会互相污染。
  */
-const lab = new AcousticLab({
+const lab = AcousticLab ? new AcousticLab({
   android,
   graph: VAD_GRAPH,
   cmvnFile: VAD_CMVN_PATH,
   dataRoot: `${VAD_DATA_ROOT}/../acoustic-lab`,
   residentId: `${VAD_RESIDENT_ID}-lab`,
   onChange: () => { hub?.markCold(); hub?.schedule(); },
-});
+}) : null;
 
 /**
  * ⭐ 声纹登记 / 实时 similarity（docs/080）。与 lab 并列的**第三个水龙头**，
- *   自带一张 FireRedVAD（第三个消费者共用有状态的流会互相污染）+ 一张 CAM++ **CPU** 图。
+ *   自带一张 FireRedVAD（第三个消费者共用有状态的流会互相污染）+ App HTP CAM++ client。
  * ⛔ 到 similarity 为止：不进 SenseVoice、不写记录、不占 50 句 group。
  */
 const speakerEmbedder = new CamPlusEmbedder({
   android,
   residentId: `${VAD_RESIDENT_ID}-spk-emb`,
   modelPath: CAMPLUS_MODEL_PATH,
-  /**
-   * ⭐ 启动时那一次可能拿不到（Manager 晚起，或答了话但 `companions` 还没派生完）。
-   *   登记是个**罕见的人为动作**，到那时再问一次，⛔ 不把一次瞬时竞态变成永久故障。
-   */
-  resolveModelPath: async () => {
-    const m = await resolveLogicalModel('model.campplus');
-    return m?.available === true ? companionFile(m, 'model.campplus.graph', 'model') : null;
-  },
 });
-const speakerLab = new SpeakerLab({
+const speakerLab = SpeakerLab ? new SpeakerLab({
   android,
   vadGraph: VAD_GRAPH,
   vadCmvnFile: VAD_CMVN_PATH,
@@ -2326,17 +2358,25 @@ const speakerLab = new SpeakerLab({
   embedder: speakerEmbedder,
   dataRoot: `${VAD_DATA_ROOT}/../speaker-lab`,
   onChange: () => { hub?.markCold(); hub?.schedule(); },
-});
+}) : null;
+const speakerCalibration = () => speakerLab?.calibration?.() ?? {
+  profile: null,
+  profile_ready: false,
+  profile_fingerprint: null,
+  config: {},
+  acked_for: null,
+  status: { ok: false, reason: 'profile_missing' },
+};
 
 /**
- * ⭐ 正式声纹门（docs/081）。与 Speaker Lab **共用同一张 CAM++ CPU 图和同一份声纹**——
+ * ⭐ 正式声纹门（docs/081）。与 Speaker Lab **共用同一个 App HTP CAM++ client 和同一份声纹**——
  *   Lab 是校准台，这里是生产线。⛔ 不再开第二套登记系统，也不另存一份阈值。
  * ⚠ 它是第八个 consumer，默认关；开着时它自己把着水源（待机判断门要在 RMS 放行**之前**就知道
  *   现在说话的是不是登记用户）。
  */
 const speakerGate = new SpeakerGate({
   embedder: speakerEmbedder,
-  calibration: () => speakerLab.calibration(),
+  calibration: speakerCalibration,
   config: cfg.speaker_gate,
   onChange: () => { hub?.markCold(); hub?.schedule(); },
 });
@@ -2344,30 +2384,16 @@ const speakerGate = new SpeakerGate({
 /**
  * ⭐ 目标说话人活动状态机 **shadow**（docs/083）。⛔ 只观测不判决：
  *   不调 SenseVoice、不写 records、不占 50 句、不改 listen。默认 OFF。
- * ⛔ 与 Speaker Lab / 正式声纹门**共用同一张 CAM++ CPU 图和同一份真人声纹**——
+ * ⛔ 与 Speaker Lab / 正式声纹门**共用同一个 App HTP CAM++ client 和同一份真人声纹**——
  *   不新开麦克风、不新开 VAD、不另登记。
  */
 const activityShadow = new TargetActivityShadow({
   embedder: speakerEmbedder,
-  calibration: () => speakerLab.calibration(),
+  calibration: speakerCalibration,
   config: cfg.target_activity_shadow,
   onChange: () => { hub?.markCold(); hub?.schedule(); },
 });
 activityShadow.setEnabled(cfg.target_activity_shadow?.enabled === true);
-
-/**
- * ⭐ docs/084 CAM-only 验收模式：**第二张 CAM++ 图，backend=htp、吃 QNN 2.47 ctx**。
- * ⛔ 与上面那张 CPU 图刻意分开：CPU 那张是动态 T（登记要整段算），
- *   HTP ctx 是固定 [1,148,80]（只吃 1500 ms）——**能力不同，不能共用一个 resident**。
- */
-const camHtpEmbedder = new CamPlusEmbedder({
-  android,
-  residentId: `${VAD_RESIDENT_ID}-cam-htp`,
-  modelPath: CAMPLUS_MODEL_PATH,
-  backend: 'htp',
-  ctxPath: CAMPLUS_CTX_PATH,
-  estMemMb: 64,
-});
 
 /**
  * ⭐ 进入验收模式时**腾 HTP 位子**：设备常态 10 个 HTP 会话而上限 8，不腾必然 409。
@@ -2392,8 +2418,8 @@ const restoreHtpAfterCam = async (info) => {
 };
 
 speakerActivity = new SpeakerActivity({
-  embedder: camHtpEmbedder,
-  calibration: () => speakerLab.calibration(),
+  embedder: speakerEmbedder,
+  calibration: speakerCalibration,
   dataRoot: `${VAD_DATA_ROOT}/../speaker-activity`,
   onChange: () => { hub?.markCold(); hub?.schedule(); },
   onConfirmedUser: noteAutomaticCamUser,
@@ -2475,7 +2501,7 @@ appEvents.onPolicy = (policy) => {
 
 appActivity = new AppSpeakerActivity({
   android,
-  calibration: () => speakerLab.calibration(),
+  calibration: speakerCalibration,
   modelPath: CAMPLUS_MODEL_PATH,
   ctxPath: CAMPLUS_CTX_PATH,
   mode: activityExecutorMode(),
@@ -2569,6 +2595,7 @@ const ingestAppSegmentResult = (r) => {
     backend: r.backend,
     inference_ms: r.inference_ms,
     duration_ms: r.duration_ms,
+    fusion_source: r.fusion_source ?? null,
     blank,
     error: r.error ?? null,
     source: 'app_segment',
@@ -2613,6 +2640,76 @@ appSegments = new AppSegments({
   onResult: ingestAppSegmentResult,
   onChange: () => { hub?.markCold(); hub?.schedule(); },
 });
+
+/**
+ * CP-SPEECH2-TERMUX-SPEECH17：Speech2 的正式 transcript 消费者。
+ * ⭐ 权威是 App 的 `/api/speech2/transcripts?after_seq=`；AppEvents 只叫醒它。
+ * ⭐ final 进 history **恰好一次**（键含 boot_id），provisional 只进 live。
+ * ⭐ 游标落在**数据目录**（⛔ 不在包版本目录）⇒ 重启/升级后 final 不丢不重。
+ */
+const SPEECH2_CURSOR_FILE = path.join(SPEECH_DATA_ROOT, 'speech2', 'transcript-cursor.v1.json');
+const admitSpeech2Final = (e, key) => {
+  const normalized = normalizeTranscript(e.text);
+  if (normalized.isBlank) return { admitted: false, reason: 'blank' };
+  const existing = records?.find?.(key) ?? null;
+  const outcome = {
+    status: 'succeeded',
+    text: normalized.text,
+    revision: e.revision,
+    segment_status: 'complete',
+    backend: 'speech2',
+    duration_ms: e.logical_ms ?? null,
+    source: 'speech2',
+    source_kind: 'speech2',
+    model: { id: 'sensevoice-t267', runtime: 'app-speech2' },
+    meta: {
+      speaker_role: e.speaker_role ?? null,
+      enrollment_id: e.matched === true ? e.enrollment_id ?? null : null,
+      voice_name: e.matched === true && e.voice_name ? String(e.voice_name) : 'Other',
+      cosine: e.cosine !== null && e.cosine !== undefined && Number.isFinite(Number(e.cosine))
+        ? Number(e.cosine) : null,
+      matched: e.matched === true,
+      scene_policy_id: e.scene_policy_id ?? null,
+      boot_id: e.boot_id ?? null,
+      generation: e.generation ?? null,
+      segment_id: e.segment_id ?? null,
+      revision: e.revision ?? null,
+      // RECOVERY19D：per-final 指标由 App 在同一时钟上量好（⛔ 本包不重算）。
+      metrics: e.metrics ?? null,
+    },
+  };
+  if (existing) {
+    // ⛔ 不新建第二行：同一句更高的 final 就地更新。
+    records.retranscribe(key, outcome);
+    return { admitted: false, reason: 'updated_in_place' };
+  }
+  // ⚠ 刻意**不传** start_ms/end_ms：Speech2 的 logical ms 每个 generation 从 0 起，
+  //   `RecordGroups` 的「同一音频窗已提交」判据会把新一代的句子误判成重复。
+  /**
+   * RECOVERY19D：App 已把**实际送进 ASR 的 PCM** 写进它既有的 SegmentArchive，
+   * 归档 id = 本记录的 key。⭐ 沿用旧 App 段落的契约（`source_kind: 'app_segment'` +
+   * `audio_ref {source:'app', segment_id}`）⇒ RecordGroups 与 `/records/audio` 代理一行不改。
+   * 没有 audio_ref（归档关掉/失败）⇒ 仍按纯文字 Speech2 记录，⛔ 不画一个必然 404 的播放器。
+   */
+  const appAudio = e.audio_ref?.source === 'app' && e.audio_ref?.segment_id === key;
+  return records?.admit({
+    segment_id: key,
+    source: 'speech2',
+    source_kind: appAudio ? 'app_segment' : 'speech2',
+    audio_available: appAudio,
+    audio_ref: appAudio ? { source: 'app', segment_id: key } : null,
+    wav_path: null,
+    duration_ms: e.metrics?.audio_duration_ms ?? e.logical_ms ?? null,
+  }, outcome) ?? { admitted: false, reason: 'records_unavailable' };
+};
+const speech2Transcripts = new Speech2Transcripts({
+  fetchSince: (after, limit) => android.json(`/api/speech2/transcripts?after_seq=${after}&limit=${limit}`),
+  onFinal: admitSpeech2Final,
+  hasFinal: (key) => Boolean(records?.find?.(key)),
+  onChange: () => { hub?.markHot(); hub?.markCold(); hub?.schedule(); },
+  cursorFile: SPEECH2_CURSOR_FILE,
+});
+appEvents.onTranscript = (fact, bootId) => speech2Transcripts.observe(fact, bootId);
 
 /** 正式状态域的 CAM++ 投影：模型 resident、RMS live 与当前 VAD 模式必须同时可见。 */
 const speakerActivityProjection = () => {
@@ -2695,6 +2792,57 @@ vad = new VadController({
     return hit ? { reason: 'tts_overlap', playback_id: hit.playback_id ?? null } : null;
   },
 });
+
+/**
+ * Apply Manager raw paths and App runtime facts to the low-frequency legacy
+ * tools that still exist for lab/enrollment. App automatic Pipeline remains
+ * the resident owner; these objects only consume its returned artifact.
+ */
+const applyPreparedModelRuntime = (modelId) => {
+  const facts = speechModelRuntime.snapshot().models?.[modelId];
+  if (!facts) return { ok: false, reason: 'runtime_unknown' };
+  if (modelId === 'model.sensevoice') {
+    const frontend = frontendFromRaw(facts.raw);
+    senseFrontend = { files: frontend };
+    senseFrontendWhy = facts.raw?.reason ?? facts.runtime?.reason ?? null;
+    senseRuntime = facts.runtime?.artifact ?? null;
+    senseVoiceReady = facts.usable === true;
+    if (facts.runtime?.artifact) {
+      asr.applyRuntime({ artifact: facts.runtime.artifact, frontendFiles: frontend });
+    }
+  } else if (modelId === 'model.fireredvad') {
+    VAD_CMVN_PATH = facts.raw?.files?.find((file) => file.role === 'cmvn')?.path ?? null;
+    VAD_GRAPH = graphFromArtifact(facts.runtime?.artifact);
+    VAD_MODEL_PATH = VAD_GRAPH?.path ?? null;
+    fireRedVadReady = facts.usable === true;
+    if (VAD_GRAPH && VAD_CMVN_PATH) {
+      for (const consumer of [vad, lab, speakerLab]) {
+        consumer?.applyRuntime?.({ graph: VAD_GRAPH, cmvnFile: VAD_CMVN_PATH });
+      }
+    }
+  } else if (modelId === 'model.campplus') {
+    CAMPLUS_MODEL_PATH = facts.raw?.files?.find((file) => file.role === 'model')?.path ?? null;
+    CAMPLUS_CTX_PATH = facts.runtime?.artifact?.path ?? null;
+    speakerEmbedder?.setRuntime({ sourcePath: CAMPLUS_MODEL_PATH, artifact: facts.runtime?.artifact });
+    appActivity?.setRuntime({ artifact: facts.runtime?.artifact });
+  }
+  onStageChange();
+  return {
+    ok: facts.usable === true,
+    reason: facts.usable === true ? null : (facts.raw?.reason ?? facts.runtime?.reason ?? 'runtime_not_ready'),
+    facts,
+  };
+};
+
+const ensureModelRuntime = async (modelId, { prepare = true } = {}) => {
+  const result = prepare
+    ? await speechModelRuntime.prepare(modelId)
+    : await speechModelRuntime.inspect(modelId, { refresh: true });
+  await speechModelRuntime.residents().catch(() => {});
+  const applied = applyPreparedModelRuntime(modelId);
+  if (!result.ok) return { ...result, ...applied, ok: false, reason: result.reason ?? applied.reason };
+  return { ...result, ...applied, ok: applied.ok === true };
+};
 
 const applyOwnerTimeout = (nowMs = Date.now()) => {
   // 模式期间没有任何超时有资格关门：使用者在想措辞，不是走开了。
@@ -2794,8 +2942,8 @@ const ingestPcmFrame = (frame, meta) => {
     : null;
   if (consumers.enabled('vad')) vad.ingestPcm(frame, meta);
   // ⛔ lab 与正式链**并列**，互不知道对方存在。
-  if (consumers.enabled('lab')) lab.ingest(frame);
-  if (consumers.enabled('speaker')) speakerLab.ingest(frame);
+  if (consumers.enabled('lab')) lab?.ingest(frame);
+  if (consumers.enabled('speaker')) speakerLab?.ingest(frame);
   /**
    * ⭐ 正式声纹门吃的是**连续 PCM**，与 FireRedVAD 的段边界无关（任务书 §十五）。
    *   即使背景谈话节目让 VAD 连续几十秒判 speech，这条时间轴仍可以 OTHER→USER→OTHER。
@@ -3024,6 +3172,10 @@ const backendOwns = (backend, generation) => {
 const applyBackend = async (target, reason = 'config') => {
   if (target === activeBackend) {
     // 同档位再次保存配置也要能修复 worker 重生后的冷 session。
+    const modelRuntime = await ensureModelRuntime('model.sensevoice');
+    if (reason === 'api' && modelRuntime.ok !== true) {
+      throw new Error(`sensevoice runtime is not ready: ${modelRuntime.reason}`);
+    }
     const prepared = await asr.prepareBackend(target);
     if (reason === 'api' && prepared?.ready !== true) {
       throw new Error(`${target} runtime is not ready`);
@@ -3047,6 +3199,12 @@ const applyBackend = async (target, reason = 'config') => {
   }
   /** 先让目标 backend 自己证明能用，再切代次。 */
   try {
+    const modelRuntime = await ensureModelRuntime('model.sensevoice');
+    steps.push({ step: 'prepare_app_runtime', model: 'sensevoice', ready: modelRuntime.ok === true,
+      reason: modelRuntime.reason ?? null });
+    if (reason === 'api' && modelRuntime.ok !== true) {
+      throw new Error(`sensevoice runtime is not ready: ${modelRuntime.reason}`);
+    }
     const prepared = await asr.prepareBackend(target);
     steps.push({ step: 'prepare_target', backend: target, ready: prepared?.ready === true });
     if (reason === 'api' && prepared?.ready !== true) {
@@ -3518,6 +3676,7 @@ async function refresh() {
 
       appEvents.configure(descriptor);
       appEvents.start();
+      speech2Transcripts.start();
       syncPcmDemand();
       // 只在**我们正声称有东西载着**时才去核对——没载东西就没有什么可核对的。
       // 10 秒一次是为了发现 App 重装/声明被清这类罕见事实，不是状态的主来源。
@@ -3624,8 +3783,8 @@ const DOMAIN_BUILDERS = {
   assistant: () => assistantCallProjection(),
   records: () => records.snapshot(),
   pcm_consumers: () => consumers.snapshot(),
-  acoustic_lab: () => lab.snapshot(),
-  speaker_lab: () => speakerLab.snapshot(),
+  acoustic_lab: () => lab?.snapshot() ?? null,
+  speaker_lab: () => speakerLab?.snapshot() ?? null,
   /** ⛔ 刻意不含 sliding timeline（任务书 §十七）：完整时间轴留在 Speaker Lab。 */
   speaker_gate: () => speakerGate.snapshot(),
   /** ⛔ 不含长时间轴：完整 event 列表走 `/activity-shadow/history`。 */
@@ -3641,6 +3800,8 @@ const DOMAIN_BUILDERS = {
   speaker_activity: () => speakerActivityProjection(),
   /** docs/088 P4：App 的 segment 结果消费面（⛔ 不含音频，只有元数据与计数）。 */
   app_segments: () => appSegments?.snapshot?.() ?? null,
+  /** SPEECH17：Speech2 live transcript（provisional 可替换）+ 消费计数。⛔ 不含历史全文。 */
+  speech2: () => speech2Transcripts.snapshot(),
   foreground: () => ({
     /** ⭐ 此刻谁在判段。页面照抄这一个值，⛔ 不许自己从三个开关里再推一遍。 */
     authority: foregroundAuthority(),
@@ -3772,7 +3933,7 @@ const publicSnapshot = () => {
   return publicState.snapshot({ features });
 };
 
-const HOT_DOMAINS = ['rms_stream', 'rms_gate', 'pcm_stream', 'pcm_pool', 'vad', 'input', 'asr_live', 'public', 'app_pipeline'];
+const HOT_DOMAINS = ['rms_stream', 'rms_gate', 'pcm_stream', 'pcm_pool', 'vad', 'input', 'asr_live', 'public', 'app_pipeline', 'speech2'];
 
 /**
  * Capability readiness is deliberately separate from package health. A model
@@ -3780,26 +3941,15 @@ const HOT_DOMAINS = ['rms_stream', 'rms_gate', 'pcm_stream', 'pcm_pool', 'vad', 
  * healthy; boot must expose that fact instead of becoming `dependencies_not_ready`.
  */
 const modelCapabilitySnapshot = () => ({
-  fireredvad: {
-    available: fireRedVadReady,
-    reason: fireRedVadReady ? null : (vadModel?.reason ?? 'runtime_companion_missing'),
-    executable: VAD_MODEL_PATH,
-    companions: { cmvn: VAD_CMVN_PATH },
-    files_present: vad?.snapshot?.().model?.files_present ?? false,
-    resident: vad?.snapshot?.().model?.residency ?? null,
-  },
-  sensevoice: {
-    available: senseVoiceReady,
-    reason: senseVoiceReady ? null : (senseModel?.reason ?? senseFrontendWhy ?? 'model_not_enabled'),
-    executable: senseModel?.executable?.path ?? null,
-    companions: { frontend: senseFrontend?.root ?? null },
-    resident: asr?.snapshot?.().resident ?? null,
-  },
-  campplus: {
-    available: Boolean(CAMPLUS_MODEL_PATH && CAMPLUS_CTX_PATH),
-    reason: CAMPLUS_MODEL_PATH && CAMPLUS_CTX_PATH ? null : 'model_not_enabled',
-    executable: CAMPLUS_CTX_PATH,
-    source: CAMPLUS_MODEL_PATH,
+  ...speechModelRuntime.snapshot(),
+  // Keep controller telemetry beside, not inside, the four model layers.
+  controllers: {
+    fireredvad: {
+      files_present: vad?.snapshot?.().model?.files_present ?? false,
+      resident: vad?.snapshot?.().model?.residency ?? null,
+    },
+    sensevoice: { resident: asr?.snapshot?.().resident ?? null },
+    campplus: { htp: speakerEmbedder?.snapshot?.() ?? null },
   },
 });
 
@@ -3860,7 +4010,8 @@ const pipelineWithoutHistory = () => {
 
 hub = new StateHub({ builders: DOMAIN_BUILDERS, hot: HOT_DOMAINS });
 // ⭐ 观测者出现才开始问 App；没人看时一次 HTTP 都不发（docs/056 的教训）。
-startAppTelemetry();
+// ⭐ WEBUI18：旧 App pipeline 遥测（每 300 ms / 1.5 s 八个旧端点）只服务旧 WebUI ⇒ Speech2-only 下不启动。
+if (!SPEECH2_ONLY) startAppTelemetry();
 
 /**
  * `/live` 保留：脚本、`verify-device` 与外部巡检仍然要一发就拿到全部事实。
@@ -4071,6 +4222,19 @@ const server = http.createServer(async (req, res) => {
    * `{action_id:"assistant.primary"}` and has no Package system key; loopback
    * plus the exact route is the authentication boundary, not a general auth bypass.
    */
+  if (req.method === 'POST' && route === '/assistant/call' && isLoopbackRequest(req) && SPEECH2_ONLY) {
+    // ⭐ App 的 primary action 现在的含义是「开始 Speech2」（旧 CAM++ 链已退出产品面）。
+    try {
+      await readBody(req).catch(() => ({}));
+      const value = await speech2Start('assistant_call');
+      return send(200, { ok: true, schema: 'termux-os.speech-assistant-call.v1',
+        result: 'speech2_started', value });
+    } catch (error) {
+      const status = Number(error?.status ?? error?.statusCode) || 500;
+      return send(status, { ok: false, schema: 'termux-os.speech-assistant-call.v1',
+        reason: 'speech2_start_failed', error: String(error?.message ?? error) });
+    }
+  }
   if (req.method === 'POST' && route === '/assistant/call' && isLoopbackRequest(req)) {
     try {
       const body = await readBody(req);
@@ -4085,6 +4249,10 @@ const server = http.createServer(async (req, res) => {
   if (!systemKeyAuthorized(req.headers.authorization, SYSTEM_KEY)) {
     return send(401, { ok: false, error: 'unauthorized' });
   }
+  if (legacyRouteRetired(req.method, route)) {
+    return send(410, { ok: false, error: 'LEGACY_SPEECH_RETIRED',
+      detail: 'termux-speech is Speech2-only; use /speech2/* (CP-SPEECH2-WEBUI18)' });
+  }
 
   try {
     if (req.method === 'GET' && route === '/status') {
@@ -4095,7 +4263,9 @@ const server = http.createServer(async (req, res) => {
      * Framework 自己的 Package 页面上，因为一份模型权重属于需要它的那个包。
      */
     if (req.method === 'GET' && route === '/models') {
-      return send(200, { ok: true, ...(await listModels(PACKAGE_ROOT, { config: cfg })) });
+      return send(200, { ok: true, ...(await listModels(PACKAGE_ROOT, {
+        config: cfg, runtime: speechModelRuntime,
+      })) });
     }
     /**
      * ⚠ 取回/安装现在是**作业**：立刻回 202 + operation_id，⛔ 不再挂着等几百 MB 下完。
@@ -4103,12 +4273,14 @@ const server = http.createServer(async (req, res) => {
      */
     if (req.method === 'POST' && route === '/models/download') {
       const body = await readBody(req);
-      const r = await downloadModel(String(body?.model_id ?? ''), { choice: body?.choice ?? null });
+      const r = await downloadModel(String(body?.model_id ?? ''), { manager: managerClient() });
       return send(r.ok ? 202 : r.degraded ? 503 : 502, r);
     }
-    if (req.method === 'POST' && route === '/models/use') {
+    if (req.method === 'POST' && route === '/models/prepare') {
       const body = await readBody(req);
-      const r = await useModel(String(body?.model_id ?? ''));
+      const r = await prepareModel(String(body?.model_id ?? ''), {
+        runtime: speechModelRuntime, manager: managerClient(), android,
+      });
       return send(r.ok ? 202 : r.degraded ? 503 : 409, r);
     }
     if (req.method === 'GET' && route === '/models/operation') {
@@ -4604,6 +4776,166 @@ const server = http.createServer(async (req, res) => {
       return send(200, { ok: true, ...inputPayload(await readInputs()) });
     }
     /**
+     * CP-SPEECH2-SHELL-POLICY5: formal Package client surface for the independent App shell.
+     * These calls carry only status/policy metadata; no realtime audio or model data crosses it.
+     */
+    if (req.method === 'GET' && route === '/speech2/status') {
+      return send(200, { ok: true, value: await speech2.status() });
+    }
+    if (req.method === 'GET' && route === '/speech2/policy') {
+      return send(200, { ok: true, value: await speech2.policy() });
+    }
+    if (req.method === 'PUT' && route === '/speech2/policy') {
+      return send(200, { ok: true, value: await speech2.applyPolicy(await readBody(req)) });
+    }
+    if (req.method === 'POST' && route === '/speech2/start') {
+      return send(200, { ok: true, value: await speech2Start('webui') });
+    }
+    if (req.method === 'POST' && route === '/speech2/stop') {
+      return send(200, { ok: true, value: await speech2Stop() });
+    }
+    /**
+     * ⭐ Speech2 输入源（WEBUI18）：配置存本包 conf；可选项来自 App 的**真实**源清单。
+     *   正在跑且当前源是麦克风类 ⇒ 立刻换源（停旧起新）。
+     */
+    if (req.method === 'GET' && route === '/speech2/input') {
+      const [ring, sources] = await Promise.all([
+        speech2.ringStatus().catch((e) => ({ error: String(e?.message ?? e) })),
+        speech2.ringSources().catch((e) => ({ error: String(e?.message ?? e) })),
+      ]);
+      const list = (sources?.sources ?? []).filter((it) => SPEECH2_INPUT_SOURCES.includes(it?.type ?? it?.source_type));
+      return send(200, { ok: true, value: {
+        configured: cfg.speech2.input_source, product_sources: SPEECH2_INPUT_SOURCES,
+        sources: list, ring, last_error: speech2InputError } });
+    }
+    if (req.method === 'POST' && route === '/speech2/input') {
+      const body = await readBody(req);
+      cfg = saveSpeech2Config(CONFIG_FILE, { input_source: String(body?.input_source ?? '') });
+      let switched = null;
+      const ring = await speech2.ringStatus().catch(() => null);
+      if (ring?.source_active === true && isMicSource(ring.active_source)
+        && ring.active_source !== cfg.speech2.input_source) {
+        await speech2.stopSource().catch(() => null);
+        try {
+          switched = await speech2.startSource(cfg.speech2.input_source);
+          speech2InputError = null;
+        } catch (error) {
+          speech2InputError = inputErrorOf(error);
+        }
+      }
+      return send(200, { ok: true, value: { configured: cfg.speech2.input_source, switched,
+        last_error: speech2InputError } });
+    }
+    // ── SPEECH17：正式 transcript / history / My Voice / model readiness ──────────
+    if (req.method === 'GET' && route === '/speech2/transcripts/live') {
+      return send(200, { ok: true, value: speech2Transcripts.snapshot() });
+    }
+    if (req.method === 'POST' && route === '/speech2/transcripts/sync') {
+      await speech2Transcripts.sync('manual');
+      return send(200, { ok: true, value: speech2Transcripts.snapshot() });
+    }
+    if (req.method === 'GET' && route === '/speech2/history') {
+      const limit = Math.max(1, Math.min(100, Number(url.searchParams.get('limit')) || 50));
+      const beforeAt = url.searchParams.get('before_at') || null;
+      const beforeId = url.searchParams.get('before_id') || null;
+      const beforeMs = beforeAt ? Date.parse(beforeAt) : Infinity;
+      const beforeOk = (item) => {
+        if (!beforeAt) return true;
+        const at = Number(item.observed_ms) || Date.parse(item.completed_at ?? item.created_at ?? '') || 0;
+        return at < beforeMs || (at === beforeMs && String(item.segment_id) < String(beforeId ?? ''));
+      };
+      const liveItems = records.liveGroups().flatMap((group) => records.readItems(group.group_id))
+        .filter((it) => it.source === 'speech2' || it.source_kind === 'speech2'
+          || it.model?.id === 'sensevoice-t267')
+        .map((it) => ({
+          ...it,
+          audio_ref: it.audio_ref ?? (it.source_kind === 'app_segment'
+            ? { source: 'app', segment_id: it.segment_id } : null),
+          observed_ms: Number(it.observed_ms) || Date.parse(it.completed_at ?? it.created_at ?? '') || null,
+        }))
+        .filter(beforeOk);
+      await archive.open();
+      const archived = archive.query({ limit: Math.min(200, limit + 1), beforeAt, beforeId, source: 'speech2' });
+      const merged = new Map();
+      for (const item of [...archived.items, ...liveItems]) {
+        const key = String(item.segment_id ?? '');
+        if (!key) continue;
+        merged.set(key, {
+          ...item,
+          audio_ref: item.audio_ref ?? (item.source_kind === 'app_segment'
+            ? { source: 'app', segment_id: key } : null),
+        });
+      }
+      const items = [...merged.values()].sort((a, b) =>
+        (Number(b.observed_ms) || 0) - (Number(a.observed_ms) || 0)
+        || String(b.segment_id).localeCompare(String(a.segment_id))).slice(0, limit + 1);
+      const hasMore = items.length > limit || archived.items.length >= Math.min(200, limit + 1);
+      const page = items.slice(0, limit);
+      const last = page.at(-1);
+      const cursorAt = last?.completed_at ?? last?.created_at
+        ?? (Number(last?.observed_ms) > 0 ? new Date(Number(last.observed_ms)).toISOString() : null);
+      return send(200, { ok: true, value: {
+        items: page,
+        has_more: hasMore,
+        next_cursor: cursorAt ? { before_at: cursorAt, before_id: last.segment_id } : null,
+        archive_available: archived.available === true,
+      } });
+    }
+    if (req.method === 'GET' && route === '/speech2/my-voice') {
+      return send(200, { ok: true, value: await speech2.myVoice() });
+    }
+    if (req.method === 'POST' && route === '/speech2/my-voice') {
+      return send(200, { ok: true, value: await speech2.registerMyVoice(await readBody(req)) });
+    }
+    if (req.method === 'DELETE' && route === '/speech2/my-voice') {
+      return send(200, { ok: true, value: await speech2.deleteMyVoice() });
+    }
+    // RECOVERY19E：Framework 0.3.9 的 package router 只匹配固定 path；此层把 id 转发到 App 的 collection URI。
+    if (req.method === 'GET' && route === '/speech2/voices') {
+      return send(200, { ok: true, value: await speech2.voices() });
+    }
+    if (req.method === 'POST' && route === '/speech2/voices') {
+      return send(200, { ok: true, value: await speech2.addVoice(await readBody(req)) });
+    }
+    if (req.method === 'POST' && route === '/speech2/voices/test') {
+      const body = await readBody(req);
+      const id = typeof body.enrollment_id === 'string' ? body.enrollment_id : '';
+      if (!id) return send(400, { ok: false, error: 'VOICE_ID_INVALID' });
+      return send(200, { ok: true, value: await speech2.testVoice(id) });
+    }
+    if (req.method === 'POST' && route === '/speech2/voices/record') {
+      const body = await readBody(req);
+      return send(200, { ok: true, value: await speech2.rerecordVoice(body.enrollment_id, {
+        duration_ms: body.duration_ms,
+      }) });
+    }
+    if (req.method === 'PATCH' && route === '/speech2/voices/item') {
+      const body = await readBody(req);
+      return send(200, { ok: true, value: await speech2.renameVoice(body.enrollment_id, body.label) });
+    }
+    if (req.method === 'DELETE' && route === '/speech2/voices/item') {
+      const body = await readBody(req);
+      return send(200, { ok: true, value: await speech2.removeVoice(body.enrollment_id) });
+    }
+    /**
+     * ⭐ 模型就绪只**转述** App 的判定（§27）——⛔ 本包不看文件在不在。
+     *   分层回答：installed（包/服务在）/ app_reachable / models / running / analysis_active。
+     */
+    if (req.method === 'GET' && route === '/speech2/overview') {
+      let status = null; let error = null;
+      try { status = await speech2.status(); } catch (e) { error = String(e?.message ?? e); }
+      const [ring, policyDoc] = await Promise.all([
+        speech2.ringStatus().catch(() => null),
+        speech2.policy().catch(() => null),
+      ]);
+      return send(200, { ok: true, value: {
+        ...speech2Overview(status, error, { ring, policy: policyDoc?.policy ?? null,
+          inputSource: cfg.speech2.input_source, inputError: speech2InputError }),
+        product: { triggers: SPEECH2_TRIGGERS, scenes: SPEECH2_SCENES,
+          policy_schema_version: SPEECH2_POLICY_SCHEMA_VERSION, policy_fields: SPEECH2_POLICY_FIELDS },
+      } });
+    }
+    /**
      * 拍手手势（App 的 Feature Gate）。
      * ⭐ **本包只是一层薄转发**：判定、模板、DSP 全在 App 内——高频音频不出 App。
      *   放在这里的理由只有一个：录入与调参是**低频操作**，属于 WebUI 该管的事，
@@ -4725,9 +5057,9 @@ const server = http.createServer(async (req, res) => {
       if (operation === 'disable') {
         // ⛔ Mic 总开关关掉 ⇒ 实验也必须停，而且**不会**在麦克风回来时偷偷自己恢复：
         //    `mode` 归 idle，只有使用者再点一次「开始测试」才会重新开。
-        lab.mode = 'idle';
+        if (lab) lab.mode = 'idle';
         // ⛔ 声纹页同理：回 idle、停掉 CAM++ 推理，**麦克风回来也不自行恢复**。
-        speakerLab.forceIdle('mic_off');
+        speakerLab?.forceIdle('mic_off');
         /**
          * ⛔ 正式声纹门同样清空：时间轴、环、迟滞状态全部丢掉。
          * ⚠ 留着旧时间轴的后果很具体——麦克风回来后第一个 segment 会拿**关机之前**
@@ -4889,6 +5221,9 @@ const server = http.createServer(async (req, res) => {
      * ⭐ 开机时它们已经被扫进 `orphans/`，所以**登记目录里 glob 不到它们**——
      *   这条端点只是让使用者能看见、能清掉。⛔ 服务自己绝不删使用者的录音。
      */
+    if ((route === '/speaker' || route.startsWith('/speaker/')) && !speakerLab) {
+      return send(410, { ok: false, error: 'LEGACY_SPEECH_RETIRED' });
+    }
     if (req.method === 'GET' && route === '/speaker/enroll/orphans') {
       return send(200, { ok: true, orphans: speakerLab.orphanEnrollWavs(),
                          swept_at_boot: speakerLab.sweptOrphans ?? null });
@@ -4939,7 +5274,7 @@ const server = http.createServer(async (req, res) => {
        */
       if (req.method === 'POST' && sub === '/profile/sync') {
         const r = await appActivity?.syncProfile?.() ?? { ok: false, reason: 'no_executor' };
-        const cal = speakerLab.calibration();
+        const cal = speakerCalibration();
         /**
          * ⚠ `ok` 是**传输层**的判据，不是这次同步成不成功的判据。
          *   Framework 的代理看到 `ok:false` 就把整个 body 换成一句
@@ -5042,63 +5377,43 @@ const server = http.createServer(async (req, res) => {
           note: 'progress: GET /speaker-activity/state',
         });
       }
-      /**
-       * ⭐ **窄测**（任务书 §1）：同一段音频、**同一个 feature tensor**，
-       *   分别喂 CPU CAM++ 与 HTP CAM++，再各自与**生产实际加载的那份 centroid** 打分。
-       *
-       * 它要分开的是两件一直被混在一起的事：
-       *   · Lab 的 0.76–0.92 是「**整段**登记音频 vs 由这些整段算出来的质心」——
-       *     那是构造上就该高的数（质心正是它们的平均）。
-       *   · 生产的 0.12–0.22 是「**1500 ms 滑窗** vs 同一个质心」。
-       * ⛔ 拿这两个数直接相减，得到的结论必然是错的。
-       * 所以这里同时给出：整段(CPU) / 同一窗(CPU) / 同一窗(HTP) 三个分数，
-       * 以及 cos(cpu_win, htp_win) —— 只有最后这个能回答「后端是不是分叉了」。
-       */
+      /** ⭐ 窄测：只走与登记、正式识别相同的固定 HTP embedding 路径。 */
       if (req.method === 'POST' && sub === '/probe') {
         const body = await readBody(req).catch(() => ({}));
         const wav = String(body?.wav_path ?? '');
         if (!wav) throw new UpstreamError('wav_path is required', 400);
-        const windowMs = Math.max(500, Number(body?.window_ms) || 1500);
         let samples;
         try { samples = readWavMono16(wav); } catch (error) {
           throw new UpstreamError(`cannot read ${wav}: ${String(error?.message ?? error)}`, 400);
         }
-        const cal = speakerLab.calibration?.() ?? {};
-        if (cal.profile_ready !== true) throw new UpstreamError('no speaker profile', 409);
-
         const toI16 = (f32) => Int16Array.from(f32, (v) => Math.max(-32768, Math.min(32767, Math.round(v))));
-        const need = Math.round(windowMs / 1000 * 16000);
+        const need = 24_000;
+        if (samples.length < need) throw new UpstreamError('wav is shorter than the fixed 1500 ms CAM++ window', 400);
         /** ⚠ 取**中间**那一窗：开头结尾多半是静音，拿静音去比声纹毫无意义。 */
         const start = Math.max(0, Math.floor((samples.length - need) / 2));
         const win = samples.subarray(start, start + need);
-
-        const cos = (a, b) => {
-          let d = 0; let na = 0; let nb = 0;
-          for (let i = 0; i < a.length; i += 1) { d += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
-          return d / (Math.sqrt(na) * Math.sqrt(nb) || 1);
-        };
-        const out = { wav_path: wav, samples: samples.length, window_ms: windowMs,
+        const cal = speakerCalibration();
+        const out = { wav_path: wav, samples: samples.length, window_ms: 1500,
                       window_samples: win.length, window_start_sample: start };
         try {
           await speakerEmbedder.ensure();
-          const full = await speakerEmbedder.embed(toI16(samples));
-          out.cpu_full = { frames: full.frames, score: cal.profile.score(full.embedding) };
-          const cpuWin = await speakerEmbedder.embed(toI16(win));
-          out.cpu_window = { frames: cpuWin.frames, score: cal.profile.score(cpuWin.embedding) };
-          out.cpu_full_vs_cpu_window = cos(full.embedding, cpuWin.embedding);
-          try {
-            await camHtpEmbedder.ensure();
-            const htpWin = await camHtpEmbedder.embed(toI16(win));
-            out.htp_window = { frames: htpWin.frames, score: cal.profile.score(htpWin.embedding),
-                               compute_unit: htpWin.compute_unit };
-            /** ⭐ 这一个数才回答「CPU 与 HTP 是不是同一个嵌入空间」。 */
-            out.cpu_vs_htp_window = cos(cpuWin.embedding, htpWin.embedding);
-          } catch (error) { out.htp_error = String(error?.message ?? error); }
-        } catch (error) { out.cpu_error = String(error?.message ?? error); }
+          const e = await speakerEmbedder.embed(toI16(win));
+          out.embedding = {
+            frames: e.frames,
+            score: cal.profile_ready === true ? cal.profile.score(e.embedding) : null,
+            inference_ms: e.inference_ms,
+            compute_unit: e.compute_unit,
+            backend: e.backend,
+            model_id: e.model_id,
+            model_version: e.model_version,
+            embedding_contract: e.embedding_contract,
+            feature_protocol: e.feature_protocol,
+          };
+        } catch (error) { out.error = String(error?.message ?? error); }
         /** ⚠ `fingerprint` 是 getter 不是方法——调用它会抛，而那时前面所有测量都白做了。 */
         out.profile = { fingerprint: cal.profile?.fingerprint ?? null,
                         enrollments: cal.profile?.enrollments?.length ?? null };
-        return send(200, { ok: true, value: out });
+        return send(200, { ok: !out.error, value: out });
       }
       throw new UpstreamError(`unknown speaker-activity route: ${route}`, 404);
     }
@@ -5167,6 +5482,13 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'POST' && (sub === '/enroll/start' || sub === '/test/start')) {
         const mode = sub.startsWith('/enroll') ? 'enrolling' : 'testing';
         try {
+          // Prepare both late-bound App facts before the consumer starts.  In
+          // particular, FireRedVAD's graph and CMVN must arrive as one handoff;
+          // CAM++ is the fixed HTP source only.
+          const vadReady = await ensureModelRuntime('model.fireredvad');
+          const camReady = await ensureModelRuntime('model.campplus');
+          if (!vadReady.ok) throw new Error(`FireRedVAD runtime unavailable: ${vadReady.reason}`);
+          if (!camReady.ok) throw new Error(`CAM++ HTP runtime unavailable: ${camReady.reason}`);
           await speakerLab.start(mode);
         } catch (error) {
           // ⛔ 模型缺失就明说，不要静默进入一个什么都不会发生的模式。
@@ -5187,6 +5509,13 @@ const server = http.createServer(async (req, res) => {
         return send(200, { ok: true, value: speakerLab.snapshot(),
                            consumers: consumers.snapshot() });
       }
+      if (req.method === 'POST' && (sub === '/enroll/cancel' || sub === '/test/cancel')) {
+        await speakerLab.cancel();
+        setConsumer('speaker', false);
+        onStageChange();
+        return send(200, { ok: true, value: speakerLab.snapshot(),
+                           consumers: consumers.snapshot() });
+      }
       if (req.method === 'POST' && sub === '/profile/build') {
         const built = speakerLab.buildProfile();
         /**
@@ -5194,8 +5523,10 @@ const server = http.createServer(async (req, res) => {
          * ⚠ 同步失败不改这条请求的结果：登记本身成功了，而 App 侧 fail closed
          *   （没有声纹就不判决）——把它变成 500 会让使用者以为登记没成。
          */
-        const synced = await appActivity?.syncProfile?.() ?? { ok: false, reason: 'no_executor' };
-        return send(200, { ok: true, ...built, app_profile: synced,
+        const synced = built.ok
+          ? await appActivity?.syncProfile?.() ?? { ok: false, reason: 'no_executor' }
+          : { ok: false, reason: 'profile_not_built' };
+        return send(200, { ok: built.ok, ...built, app_profile: synced,
                            value: speakerLab.snapshot() });
       }
       if (req.method === 'POST' && sub === '/profile/clear') {
@@ -5248,6 +5579,7 @@ const server = http.createServer(async (req, res) => {
  * SenseVoice / records —— 到 WAV 为止。
      */
     if (route.startsWith('/acoustic-lab')) {
+      if (!lab) return send(410, { ok: false, error: 'LEGACY_SPEECH_RETIRED' });
       const sub = route.slice('/acoustic-lab'.length);
       if (req.method === 'GET' && (sub === '' || sub === '/state')) {
         return send(200, { ok: true, value: lab.snapshot(), timeline: lab.timelineSlice(400),
@@ -5335,7 +5667,8 @@ const server = http.createServer(async (req, res) => {
     flush(true);
     return send(
       Number(error?.status ?? error?.statusCode) || 500,
-      { ok: false, error: state.last_error },
+      { ok: false, error: state.last_error,
+        ...(Array.isArray(error?.details) ? { details: error.details } : {}) },
     );
   }
 });
@@ -5363,6 +5696,15 @@ server.listen(PORT, BIND_HOST, () => {
     console.log(`[termux-speech] records archive=${archiveOk ? 'ready' : archive.lastError}`
       + ` groups_on_disk=${recovered.snapshot.groups_on_disk}`
       + (recovered.notes.length ? ` recovery=${recovered.notes.join(' | ')}` : ''));
+    if (SPEECH2_ONLY) {
+      // ⭐ Speech2-only：旧后端不再就绪、旧链不再起；只确保旧 App pipeline 让出麦克风。
+      const released = await releaseLegacyMicPath('boot');
+      console.log('[termux-speech] Speech2-only boot: legacy backend disabled'
+        + ` legacy_pipeline_stopped=${released.legacy_pipeline_stopped}`
+        + (released.legacy_pipeline_error ? ` legacy_error=${released.legacy_pipeline_error}` : ''));
+      onStageChange();
+      return;
+    }
     // ⭐ 先收敛唯一 backend 再启动 chain，确保启动时就完成 SenseVoice readiness。
     const bootWanted = configuredBackend();
     // ⛔ docs/096：启动时**不再**把旧 asr.model 推给 App。
@@ -5399,90 +5741,45 @@ server.listen(PORT, BIND_HOST, () => {
 });
 flush(true);
 /**
- * ⭐ **可执行体的对账器**（docs/103 §8.2⑥）。
- *
- * ⚠ 真机复现两次：speech 比模型管理器先起来时，启动那一刻解析不到伴生文件，
- *   于是那个模型**永远**报未就绪，而**重启一次 speech 就好了**。
- *   ⭐ **一个只在开机试一次的解析，等于把一次瞬时故障变成永久故障**（docs/101 原话）。
- *
- * ⭐ **同一个形状出现过三次**（docs/101 麦克风需求、docs/090 boot、本轮两处），
- *   所以这里一次覆盖**全部**会迟到的外部事实，⛔ 不是给 SenseVoice 单独打一个补丁：
- *   `model.sensevoice`（ASR 可执行体 + 前端伴生）与 `model.fireredvad`
- *   （VAD 图 + cmvn，三个消费者共用同一份）。
- *
- * 判据是**需求与实际的差**（「该能跑」与「解析到了没有」），⛔ 不是「管理器在不在」——
- * 后者是手段。退避 5s → 5min 有界，⛔ **没有终局放弃**：修复条件（管理器起来了）
- * 可以在任何时刻发生，放弃就等于把故障重新变成永久的。缺口一闭合立刻归零。
- * ⛔ 全部就绪就再也不问——这条链只服务「还没就绪」这一种状态。
+ * Eventual raw/App convergence. It is deliberately the same path for cold
+ * boot, a Manager appearing late, and an App worker restart.
  */
-const EXECUTABLE_RECONCILE_MIN_MS = 5_000;
-const EXECUTABLE_RECONCILE_MAX_MS = 300_000;
-let executableBackoffMs = EXECUTABLE_RECONCILE_MIN_MS;
-let executableReconcileAt = Date.now() + EXECUTABLE_RECONCILE_MIN_MS;
-let executableRecoveries = 0;
+const MODEL_RECONCILE_MIN_MS = 5_000;
+const MODEL_RECONCILE_MAX_MS = 300_000;
+let modelReconcileBackoffMs = MODEL_RECONCILE_MIN_MS;
+let modelReconcileAt = Date.now() + MODEL_RECONCILE_MIN_MS;
 
-/** ASR：可执行体 + 前端伴生（cmvn/tokens）。 */
-const reconcileAsrExecutable = async () => {
-  if (asr?.snapshot?.().model?.ready === true) return false;
-  const model = await resolveLogicalModel('model.sensevoice').catch(() => null);
-  if (model?.available !== true) return false;
-  const root = companionRoot(model, 'model.sensevoice.frontend');
-  const files = root ? (model.companions['model.sensevoice.frontend']?.files ?? {}) : null;
-  return asr.applyLogical({
-    executablePath: model.executable?.path ?? null,
-    executableKind: model.executable?.kind ?? null,
-    frontendFiles: files,
-  });
-};
-
-/**
- * VAD：图 + cmvn。⚠ **三个消费者共用同一份**（VadController / AcousticLab / SpeakerLab），
- * 故一次解析喂给三个——⛔ 不许让它们各自去问，那会变成三份会各自漂移的答案。
- */
-const reconcileVadExecutable = async () => {
-  if (vad?.modelsReady === true || (vad?.modelPath && vad?.cmvnPath)) return false;
-  const model = await resolveLogicalModel('model.fireredvad').catch(() => null);
-  if (model?.available !== true) return false;
-  const graph = executableGraphArgs(model);
-  const cmvn = companionFile(model, 'cmvn');
-  if (!graph?.path || !cmvn) return false;
-  let changed = false;
-  for (const consumer of [vad, lab, speakerLab]) {
-    if (consumer?.applyLogical?.({ graph, cmvnFile: cmvn })) changed = true;
-  }
-  return changed;
-};
-
-const reconcileExecutables = async () => {
-  if (Date.now() < executableReconcileAt) return;
-  executableReconcileAt = Date.now() + executableBackoffMs;
-  const changed = [
-    await reconcileAsrExecutable().catch(() => false),
-    await reconcileVadExecutable().catch(() => false),
-  ];
-  if (!changed.some(Boolean)) {
-    executableBackoffMs = Math.min(executableBackoffMs * 2, EXECUTABLE_RECONCILE_MAX_MS);
+const reconcileModelRuntime = async () => {
+  if (Date.now() < modelReconcileAt) return;
+  modelReconcileAt = Date.now() + modelReconcileBackoffMs;
+  const rows = await Promise.all([
+    ensureModelRuntime('model.sensevoice').catch((error) => ({ ok: false, reason: String(error?.message ?? error) })),
+    ensureModelRuntime('model.fireredvad').catch((error) => ({ ok: false, reason: String(error?.message ?? error) })),
+    ensureModelRuntime('model.campplus').catch((error) => ({ ok: false, reason: String(error?.message ?? error) })),
+  ]);
+  if (!rows.some((row) => row.ok === true)) {
+    modelReconcileBackoffMs = Math.min(modelReconcileBackoffMs * 2, MODEL_RECONCILE_MAX_MS);
     return;
   }
-  executableBackoffMs = EXECUTABLE_RECONCILE_MIN_MS;
-  executableRecoveries += 1;
-  /** ⭐ 闭合必须说出来：一次静默的自愈与一次一直没自愈，从外面看都是「现在好了/还没好」。 */
-  console.log('[termux-speech] logical executables reconciled after boot'
-    + ` (recoveries=${executableRecoveries}, asr=${changed[0]}, vad=${changed[1]})`);
+  modelReconcileBackoffMs = MODEL_RECONCILE_MIN_MS;
+  console.log(`[termux-speech] raw/App model runtime reconciled (ready=${rows.filter((row) => row.ok).length}/3)`);
 };
 
 const refreshTimer = setInterval(() => void refresh().catch(() => {}), cfg.poll_interval_ms);
-const executableTimer = setInterval(() => void reconcileExecutables().catch(() => {}), 5_000);
+// ⭐ WEBUI18：旧模型对账只服务旧后端 ⇒ Speech2-only 下不跑（模型就绪的唯一权威是 App）。
+const modelRuntimeTimer = SPEECH2_ONLY ? null
+  : setInterval(() => void reconcileModelRuntime().catch(() => {}), 5_000);
 const tickTimer = setInterval(() => void tick(), cfg.rms_gate.sample_interval_ms);
 
 const bye = () => {
   clearInterval(refreshTimer);
-  clearInterval(executableTimer);
+  if (modelRuntimeTimer) clearInterval(modelRuntimeTimer);
   clearInterval(tickTimer);
   // ⛔ 停服务**不是**停链：这里绝不 undeclare。服务重启、dev reload、framework 重启
   // 都不是 churn HTP 会话的理由（docs/046）。下次启动由 reconcile 认清事实。
   lifecycle.cancelWarm();
   appEvents.close();
+  speech2Transcripts.close();
   archive.close();
   pcm.close();
   vad.close();

@@ -1,35 +1,19 @@
 /**
  * SPDX-License-Identifier: Apache-2.0
- * [INPUT]: `cfg.asr.model` / speech policy projection + Manager logical-model capability
- * [OUTPUT]: Logical model requirements and thin download/use/operation proxies for Settings
- * [POS]: Termux Speech model requirements boundary. The UI never sees asset artifacts.
- * [PROTOCOL]: 只使用 `model.*` logical ids；不复制 Manager 状态机、不读 Framework asset registry。
+ * [INPUT]: Raw package cards and App-owned runtime facts.
+ * [OUTPUT]: The public four-layer model page plus raw download/prepare/operation proxies.
+ * [POS]: Termux Speech model UI boundary. Logical ids are internal feature ids only.
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
-import { resolveLogicalModel } from './logical-models.mjs';
 import { AssetManagerClient, unavailableText } from './asset-manager.mjs';
-
-const MODEL_IDS = Object.freeze([
-  'model.sensevoice',
-  'model.fireredvad',
-  'model.campplus',
-]);
-
-/**
- * The selector is the only ASR choice. Requirements are derived from the
- * current config, not from the Manager's artifact list or an old backend key.
- */
-export const REQUIREMENTS = Object.freeze({
-  'model.sensevoice': {
-    name: 'SenseVoice', feature: 'asr', description: '语音转文字。',
-  },
-  'model.fireredvad': {
-    name: 'FireRedVAD', feature: 'vad', description: '语音活动检测。',
-  },
-  'model.campplus': {
-    name: 'CAM++', feature: 'vad', description: '语音活动检测与说话人判断。',
-  },
-});
+import {
+  MANAGER_WEB_PATH,
+  MODEL_IDS,
+  MODEL_REQUIREMENTS,
+  SpeechModelRuntime,
+  modelRequirements,
+} from './raw-models.mjs';
 
 let client = null;
 export const managerClient = (override = null) => {
@@ -39,232 +23,147 @@ export const managerClient = (override = null) => {
 };
 export const __resetManagerClient = () => { client = null; };
 
-const managerFailure = (status) => ({
-  available: false,
-  reason: status.reason ?? 'manager_unavailable',
-  message: status.message ?? unavailableText(status.reason),
-});
-
-/** ⭐ 只剩一个 ASR。⛔ 不留一个只有一个分支的三元表达式假装还有选择。 */
-const selectedAsr = () => 'model.sensevoice';
-
-/**
- * ⭐ docs/099：**断句器永远是 FireRedVAD**，CAM++ 是可选的本人过滤。
- * ⛔ 不再有「选了 CAM++ 就不需要 FR」这回事 —— 那是退役的二选一语义。
- */
-const selectedVad = () => 'model.fireredvad';
-
-/** CAM++ 只在 `segment = fireredvad_camplus` 时被需要。 */
-const camFilterOn = (config) => {
-  const seg = config?.pipeline?.segment;
-  return seg === 'fireredvad_camplus' || seg === 'camplus';
-};
-
-const requirementRows = (config) => {
-  const asr = selectedAsr(config);
-  const vad = selectedVad();
-  const vadRequired = config?.asr?.enabled !== false;
-  // ⭐ 判据换成「本人过滤开没开」，⛔ 不再是那个退役的 speaker_activity 开关。
-  const speakerRequired = camFilterOn(config);
-  return MODEL_IDS.map((modelId) => {
-    const meta = REQUIREMENTS[modelId];
-    const isSelectedVad = meta.feature === 'vad' && modelId === vad;
-    const isSpeakerDependency = modelId === 'model.campplus' && speakerRequired;
-    const requirement = meta.feature === 'asr'
-      ? (modelId === asr ? 'required' : 'alternative')
-      : isSelectedVad
-        ? (vadRequired ? 'required' : 'optional')
-        : isSpeakerDependency
-          ? 'required'
-          : (vadRequired ? 'alternative' : 'optional');
-    const selected = modelId === asr || isSelectedVad;
-    return {
-      model_id: modelId,
-      name: meta.name,
-      feature: meta.feature,
-      description: meta.description,
-      requirement,
-      selected,
-      /**
-       * ⚠ 文案按三层 Pipeline 重写（docs/097 §十八）：⛔ 不再出现「自动转录」「VAD」
-       *   这两个已经退役的概念——同一个句子里说两套模型，读的人分不清哪套是现在的。
-       */
-      reason: requirement === 'required'
-        ? (meta.feature === 'asr' ? '当前 Pipeline 的转录层用它。'
-          : isSpeakerDependency && !isSelectedVad ? '当前 Pipeline 的断句层依赖它。'
-            : '当前 Pipeline 的断句层用它。')
-        : requirement === 'alternative'
-          ? '当前 Pipeline 不用它；切换到它那一层时才需要。'
-          : '当前 Pipeline 未使用这项功能。',
-    };
-  });
-};
-
-const cleanOperation = (operation) => {
-  if (!operation || typeof operation !== 'object') return null;
+const operation = (value) => {
+  const item = value?.operation ?? value;
+  if (!item || typeof item !== 'object') return null;
   return {
-    operation_id: operation.operation_id ?? null,
-    action: operation.action ?? null,
-    state: operation.state ?? null,
-    stage: operation.stage ?? null,
-    stages: Array.isArray(operation.stages) ? operation.stages : [],
-    progress_precision: operation.progress_precision ?? 'stage',
-    bytes_done: Number.isFinite(operation.bytes_done) ? operation.bytes_done : null,
-    bytes_total: Number.isFinite(operation.bytes_total) ? operation.bytes_total : null,
-    progress: Number.isFinite(operation.progress) ? operation.progress : null,
-    error: operation.error ?? null,
+    operation_id: item.operation_id ?? item.id ?? null,
+    action: item.action ?? null,
+    package_key: item.package_key ?? item.model_key ?? null,
+    state: item.state ?? null,
+    stage: item.stage ?? null,
+    stages: Array.isArray(item.stages) ? item.stages : [],
+    progress_precision: item.progress_precision ?? 'stage',
+    bytes_done: Number.isFinite(Number(item.bytes_done)) ? Number(item.bytes_done) : null,
+    bytes_total: Number.isFinite(Number(item.bytes_total)) ? Number(item.bytes_total) : null,
+    progress: Number.isFinite(Number(item.progress)) ? Number(item.progress) : null,
+    error: item.error ?? null,
   };
 };
 
-const cleanManagerModel = (model) => model ? {
-  state: model.state ?? null,
-  user_status: model.user_status ?? null,
-  usable: model.usable === true,
-  can_use: model.can_use === true,
-  version: model.version ?? null,
-  operation: cleanOperation(model.operation),
-  diagnostics: model.diagnostics?.last_failure_stage || model.diagnostics?.last_error
-    ? {
-      last_failure_stage: model.diagnostics.last_failure_stage ?? null,
-      last_error: model.diagnostics.last_error ?? null,
-    } : null,
-} : null;
-
-const cleanRuntime = (descriptor) => ({
-  ready: descriptor?.available === true,
-  reason: descriptor?.available === true ? null : (descriptor?.reason ?? 'model_not_enabled'),
+const failure = (result) => ({
+  ok: false,
+  error: result.error ?? 'manager_contract_error',
+  detail: result.detail ?? null,
+  degraded: result.unavailable === 'manager_unreachable',
+  reason: result.unavailable === 'manager_unreachable' ? 'manager_unreachable' : 'manager_contract_error',
+  message: result.detail ?? unavailableText(result.unavailable),
 });
 
-const normalizeOperation = (result, modelId) => {
-  if (!result.ok) return {
-    ok: false, model_id: modelId, error: result.error, detail: result.detail ?? null,
-    degraded: Boolean(result.unavailable),
-  };
+const normalizeOperation = (result, modelId, packageKey) => {
+  if (!result.ok) return { ...failure(result), model_id: modelId, package_key: packageKey };
   const value = result.value ?? {};
   if (value.ok !== true) return {
-    ok: false, model_id: modelId, error: value.error ?? 'manager_refused',
-    detail: value.detail ?? null,
+    ok: false, model_id: modelId, package_key: packageKey,
+    error: value.error ?? 'manager_refused', detail: value.detail ?? null,
   };
+  const op = operation(value);
   return {
     ok: true,
     model_id: modelId,
-    operation_id: value.operation?.operation_id ?? null,
-    state: value.operation?.state ?? null,
-    stage: value.operation?.stage ?? null,
-    stages: value.operation?.stages ?? null,
-    progress_precision: value.operation?.progress_precision ?? 'stage',
+    package_key: packageKey,
+    operation_id: op?.operation_id ?? value.operation_id ?? null,
+    operation: op,
     deduplicated: value.deduplicated === true,
   };
 };
 
-/**
- * One Manager logical snapshot plus runtime resolver facts. The response is
- * intentionally a new public shape: no asset id, target, path, graph, ctx,
- * encoder, decoder, frontend, package, or QNN detail crosses this boundary.
- */
+const runtimeFor = (snapshot, modelId) => snapshot?.models?.[modelId] ?? {
+  raw: { state: 'unknown', complete: false, reason: 'manager_unreachable', files: [] },
+  runtime: { state: 'not_prepared', prepared: false, reason: 'app_not_prepared' },
+  resident: { state: 'unknown', loaded: false, reason: 'resident_unknown' },
+  usable: false,
+  running: false,
+};
+
+const managerView = (snapshot) => ({
+  available: snapshot?.manager?.available === true,
+  reason: snapshot?.manager?.reason ?? null,
+  message: snapshot?.manager?.message ?? null,
+});
+
+/** Build the new UI view; raw/runtime/resident are intentionally separate. */
 export async function listModels(_packageRoot = null, {
   manager = managerClient(),
   config = {},
-  resolveModel = resolveLogicalModel,
+  runtime = null,
 } = {}) {
-  const rows = requirementRows(config);
-  const managerStatus = await manager.status();
-  let managerValue = null;
-  let managerError = null;
-  if (managerStatus.available) {
-    const response = await manager.models();
-    if (response.ok) managerValue = response.value ?? null;
-    else managerError = response;
-  }
-  const byId = new Map((managerValue?.models ?? []).map((model) => [model.model_id, model]));
-  const runtime = new Map();
-  await Promise.all(rows.map(async (row) => {
-    try { runtime.set(row.model_id, cleanRuntime(await resolveModel(row.model_id))); }
-    catch (error) { runtime.set(row.model_id, { ready: false, reason: String(error?.message ?? error) }); }
-  }));
-
-  const managerView = managerStatus.available && !managerError
-    ? { available: true, reason: null, message: null }
-    : managerFailure(managerError?.unavailable
-      ? {
-        reason: managerError.unavailable,
-        message: managerError.detail ?? unavailableText(managerError.unavailable),
-      }
-      : managerStatus);
-  const requirements = rows.map((row) => {
-    const m = cleanManagerModel(byId.get(row.model_id));
-    const r = runtime.get(row.model_id) ?? { ready: false, reason: 'runtime_unknown' };
-    const ready = r.ready === true;
-    const failed = m?.state === 'failed';
+  const owner = runtime ?? new SpeechModelRuntime({ manager });
+  await owner.refresh().catch(() => {});
+  // L4 is an App fact, not a projection of raw completeness or local declarations.
+  // Read it beside the Manager card so the page can distinguish usable from running.
+  if (typeof owner.residents === 'function') await owner.residents().catch(() => {});
+  const snapshot = owner.snapshot();
+  const managerStatus = managerView(snapshot);
+  const rows = modelRequirements(config).map((row) => {
+    const facts = runtimeFor(snapshot, row.model_id);
+    const rawComplete = facts.raw?.complete === true;
+    const prepared = facts.runtime?.prepared === true;
+    const residentLoaded = facts.resident?.loaded === true;
+    const reason = facts.raw?.reason
+      ?? facts.runtime?.reason
+      ?? facts.resident?.reason
+      ?? null;
     return {
       ...row,
-      ready,
-      ready_reason: ready ? null : r.reason,
-      manager_known: Boolean(m),
-      manager: m,
+      package_key: MODEL_REQUIREMENTS[row.model_id].packageKey,
+      package_version: facts.raw?.package_version ?? null,
+      raw: facts.raw,
+      runtime: facts.runtime,
+      resident: facts.resident,
+      usable: rawComplete && prepared,
+      running: rawComplete && prepared && residentLoaded,
+      model_reason: reason,
       actions: {
-        download: managerView.available && !ready,
-        use: managerView.available && !ready && m?.can_use === true,
-        retry: managerView.available && failed,
+        download: managerStatus.available && !rawComplete,
+        prepare: rawComplete && !prepared,
+        retry: facts.runtime?.state === 'failed' || facts.resident?.state === 'failed',
       },
     };
   });
-  const required = requirements.filter((r) => r.requirement === 'required');
-  const complete = required.every((r) => r.ready);
-  const sources = managerValue?.sources ?? null;
+  const required = rows.filter((row) => row.requirement === 'required');
+  const usableCount = required.filter((row) => row.usable).length;
   return {
-    schema: 'termux-os.speech-model-requirements.v1',
-    manager: managerView,
-    manager_catalog: {
-      known: sources?.catalog?.known === true,
-      stale: sources?.catalog?.stale !== false,
-      age_ms: sources?.catalog?.age_ms ?? null,
-      updated_at_ms: sources?.catalog?.updated_at_ms ?? null,
-      refreshing: sources?.catalog?.refreshing === true,
-    },
-    management_path: managerValue?.management_path ?? null,
-    config: {
-      asr_model: config?.asr?.model ?? 'sensevoice',
-      asr_enabled: config?.asr?.enabled !== false,
-      vad_provider: config?.vad?.provider ?? 'campplus',
-      speaker_activity_enabled: config?.speaker_activity?.enabled === true,
-    },
-    requirements,
+    schema: 'termux-os.speech-model-layers.v1',
+    manager: managerStatus,
+    management_path: MANAGER_WEB_PATH,
+    requirements: rows,
     features: {
-      asr: requirements.filter((r) => r.feature === 'asr').find((r) => r.selected)?.ready === true,
-      vad: requirements.find((r) => r.feature === 'vad' && r.selected)?.ready === true,
-      speaker_activity: requirements.find((r) => r.model_id === 'model.campplus')?.ready === true,
+      asr: rows.find((row) => row.model_id === 'model.sensevoice')?.usable === true,
+      vad: rows.find((row) => row.model_id === 'model.fireredvad')?.usable === true,
+      speaker_activity: rows.find((row) => row.model_id === 'model.campplus')?.usable === true,
     },
     summary: {
-      ready: complete,
+      all_required_usable: required.every((row) => row.usable),
       required_count: required.length,
-      ready_count: required.filter((r) => r.ready).length,
+      usable_count: usableCount,
+      raw_complete_count: required.filter((row) => row.raw?.complete === true).length,
+      prepared_count: required.filter((row) => row.runtime?.prepared === true).length,
+      running_count: required.filter((row) => row.resident?.loaded === true).length,
     },
-    change_seq: managerValue?.change_seq ?? null,
+    manager_catalog: { known: managerStatus.available, stale: false, age_ms: null },
+    change_seq: null,
   };
 }
 
 const known = (id) => MODEL_IDS.includes(id);
 
-export async function downloadModel(modelId, { manager = managerClient(), choice = null } = {}) {
+export async function downloadModel(modelId, { manager = managerClient() } = {}) {
   if (!known(modelId)) return { ok: false, error: 'unknown_model' };
-  const status = await manager.status();
-  if (!status.available) return { ok: false, ...managerFailure(status), error: status.reason, degraded: true };
-  return normalizeOperation(await manager.downloadModel(modelId, choice), modelId);
+  const key = MODEL_REQUIREMENTS[modelId].packageKey;
+  return normalizeOperation(await manager.downloadPackage(key), modelId, key);
 }
 
-export async function useModel(modelId, { manager = managerClient() } = {}) {
+export async function prepareModel(modelId, { runtime = null, manager = managerClient(), android } = {}) {
   if (!known(modelId)) return { ok: false, error: 'unknown_model' };
-  const status = await manager.status();
-  if (!status.available) return { ok: false, ...managerFailure(status), error: status.reason, degraded: true };
-  return normalizeOperation(await manager.useModel(modelId), modelId);
+  const owner = runtime ?? new SpeechModelRuntime({ manager, android });
+  const result = await owner.prepare(modelId);
+  return result.ok ? result : { ...result, degraded: result.reason === 'manager_unreachable' };
 }
 
 export async function modelOperation(operationId, { manager = managerClient() } = {}) {
-  const status = await manager.status();
-  if (!status.available) return { ok: false, ...managerFailure(status), error: status.reason, degraded: true };
+  if (!operationId) return { ok: false, error: 'operation_id required' };
   const result = await manager.operation(operationId);
-  if (!result.ok) return { ok: false, error: result.error, detail: result.detail ?? null,
-    degraded: Boolean(result.unavailable) };
-  return { ok: true, operation: cleanOperation(result.value?.operation ?? result.value) };
+  if (!result.ok) return failure(result);
+  return { ok: true, operation: operation(result.value) };
 }

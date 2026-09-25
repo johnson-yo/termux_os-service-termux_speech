@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: Apache-2.0
  * [INPUT]: App 的 `segment` 低频事实（AppEvents）+ `/api/audio/segment/results` 回填
  * [OUTPUT]: 对外提供 AppSegments —— 把 App 的 provisional/final **upsert** 成产品句子
- * [POS]: docs/088 P4。⭐ 一句话：**App 决定「这一句到哪为止、文字是什么」，
+ * [POS]: docs/140（承接 docs/088 P4）。⭐ 一句话：**App 决定「这一句到哪为止、文字是什么」，
  *        本包决定「它在产品里怎么呈现、进哪一组」。**
  *
  * ⭐ **upsert 不是 append。** A（revision 1，未完成）与 B（revision 2，最终）是
@@ -115,6 +115,11 @@ export class AppSegments {
         asr_calls: Number(row.asr_calls) || 0,
         archive_wav: row.archive_wav ?? null,
         error: row.error ?? null,
+        error_kind: row.error_kind ?? null,
+        vad_provider: row.vad_provider ?? null,
+        // Diagnostic only: CAM++ owns the start; the fused end may be sourced
+        // by CAM++, FireRedVAD, or both. Older App releases omit this field.
+        fusion_source: row.fusion_source ?? null,
         seq: Number(row.seq) || 0,
         executor: 'app',
       });

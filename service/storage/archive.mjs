@@ -12,7 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export const ARCHIVE_SCHEMA_VERSION = 1;
+export const ARCHIVE_SCHEMA_VERSION = 2;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS archived_items (
   created_at       TEXT,
   completed_at     TEXT,
   error            TEXT,
+  source           TEXT,
+  source_kind      TEXT,
+  meta_json        TEXT,
+  audio_ref_json   TEXT,
   -- 归档即意味着 WAV 已经（或即将）被删除。这一列是**事实**不是意图：
   -- 「文字还在但音频没了」必须能被查询方直接读出来，而不是靠猜。
   wav_available    INTEGER NOT NULL DEFAULT 0,
@@ -100,8 +104,22 @@ export class RecordArchive {
       if (!this.compat.ok) throw new Error(`node:sqlite self-test failed: ${this.compat.reason}`);
       const stored = db.prepare('SELECT value FROM schema_meta WHERE key = ?').get('schema_version');
       if (!stored) {
+        this.ensureSpeech2Columns(db);
         db.prepare('INSERT INTO schema_meta (key, value) VALUES (?, ?)')
           .run('schema_version', String(ARCHIVE_SCHEMA_VERSION));
+      } else if (Number(stored.value) === 1) {
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          this.ensureSpeech2Columns(db);
+          db.prepare('UPDATE schema_meta SET value = ? WHERE key = ?')
+            .run(String(ARCHIVE_SCHEMA_VERSION), 'schema_version');
+          db.exec('UPDATE archived_items SET source = \'speech2\', source_kind = \'speech2\' '
+            + 'WHERE source IS NULL AND model_id = \'sensevoice-t267\'');
+          db.exec('COMMIT');
+        } catch (error) {
+          try { db.exec('ROLLBACK'); } catch { /* transaction already ended */ }
+          throw error;
+        }
       } else if (Number(stored.value) !== ARCHIVE_SCHEMA_VERSION) {
         // ⚠ 认不出的 schema 明确报错，绝不当成空库继续写——那会让两个版本的行混在一起。
         throw new Error(`archive schema ${stored.value} != ${ARCHIVE_SCHEMA_VERSION}`);
@@ -116,6 +134,15 @@ export class RecordArchive {
       this.lastError = String(error?.message ?? error);
       this.available = false;
       return false;
+    }
+  }
+
+  /** Additive migration only: archived user rows and the existing 50-sentence rotation are untouched. */
+  ensureSpeech2Columns(db) {
+    const columns = new Set(db.prepare('PRAGMA table_info(archived_items)').all().map((row) => row.name));
+    for (const [name, type] of [['source', 'TEXT'], ['source_kind', 'TEXT'], ['meta_json', 'TEXT'],
+      ['audio_ref_json', 'TEXT']]) {
+      if (!columns.has(name)) db.exec(`ALTER TABLE archived_items ADD COLUMN ${name} ${type}`);
     }
   }
 
@@ -156,12 +183,15 @@ export class RecordArchive {
         INSERT INTO archived_items (
           segment_id, group_id, item_seq, status, text, model_id, model_runtime, inference_ms,
           segment_start_ms, segment_end_ms, duration_ms, created_at, completed_at, error,
+          source, source_kind, meta_json, audio_ref_json,
           wav_available, archived_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(segment_id) DO UPDATE SET
           status = excluded.status, text = excluded.text, model_id = excluded.model_id,
           model_runtime = excluded.model_runtime, inference_ms = excluded.inference_ms,
           completed_at = excluded.completed_at, error = excluded.error,
+          source = excluded.source, source_kind = excluded.source_kind, meta_json = excluded.meta_json,
+          audio_ref_json = excluded.audio_ref_json,
           wav_available = excluded.wav_available, archived_at = excluded.archived_at
       `);
       for (const item of items) {
@@ -180,6 +210,10 @@ export class RecordArchive {
           item.created_at ?? null,
           item.completed_at ?? null,
           item.error ?? null,
+          item.source ?? null,
+          item.source_kind ?? null,
+          item.meta == null ? null : JSON.stringify(item.meta),
+          item.audio_ref == null ? null : JSON.stringify(item.audio_ref),
           0,
           archivedAt,
         );
@@ -210,20 +244,46 @@ export class RecordArchive {
   }
 
   /** 最小内部查询：用来验证归档内容确实落了库（§七.6）。 */
-  query({ limit = 20, groupId = null } = {}) {
+  query({ limit = 20, groupId = null, beforeAt = null, beforeId = null,
+    source = null, sourceKind = null } = {}) {
     if (!this.available) return { available: false, error: this.lastError, items: [] };
     const bounded = Math.max(1, Math.min(200, Number(limit) || 20));
     try {
-      const rows = groupId
-        ? this.db.prepare(
+      let rows;
+      if (groupId) {
+        rows = this.db.prepare(
           'SELECT * FROM archived_items WHERE group_id = ? ORDER BY item_seq DESC LIMIT ?',
-        ).all(String(groupId), bounded)
-        : this.db.prepare(
-          'SELECT * FROM archived_items ORDER BY archived_at DESC, item_seq DESC LIMIT ?',
-        ).all(bounded);
+        ).all(String(groupId), bounded);
+      } else {
+        const filters = [];
+        const args = [];
+        if (source !== null && source !== undefined) { filters.push('source = ?'); args.push(String(source)); }
+        if (sourceKind !== null && sourceKind !== undefined) {
+          filters.push('source_kind = ?'); args.push(String(sourceKind));
+        }
+        if (beforeAt) {
+          const atExpr = 'COALESCE(completed_at, created_at, archived_at)';
+          filters.push(`(${atExpr} < ? OR (${atExpr} = ? AND segment_id < ?))`);
+          args.push(String(beforeAt), String(beforeAt), String(beforeId ?? ''));
+        }
+        const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+        rows = this.db.prepare(`SELECT * FROM archived_items ${where}
+          ORDER BY COALESCE(completed_at, created_at, archived_at) DESC, segment_id DESC LIMIT ?`)
+          .all(...args, bounded);
+      }
       return {
         available: true,
-        items: rows.map((row) => ({ ...row, wav_available: row.wav_available === 1 })),
+        items: rows.map((row) => ({
+          ...row,
+          source: row.source ?? null,
+          source_kind: row.source_kind ?? null,
+          meta: row.meta_json ? readMeta(row.meta_json) : null,
+          audio_ref: row.audio_ref_json ? readMeta(row.audio_ref_json) : null,
+          audio_available: false,
+          audio_source: null,
+          wav_available: row.wav_available === 1,
+          observed_ms: Date.parse(row.completed_at ?? row.created_at ?? row.archived_at ?? '') || null,
+        })),
       };
     } catch (error) {
       return { available: true, error: String(error?.message ?? error), items: [] };
@@ -260,3 +320,7 @@ export class RecordArchive {
     this.available = false;
   }
 }
+
+const readMeta = (value) => {
+  try { return JSON.parse(value); } catch { return null; }
+};

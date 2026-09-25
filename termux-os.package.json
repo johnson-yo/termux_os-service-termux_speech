@@ -2,13 +2,13 @@
   "schema": "termux-os.package.v1",
   "id": "github.termux-os.service.termux-speech",
   "name": "Termux Speech",
-  "version": "0.24.1",
-  "description": "Runs a last-owner RMS/VAD/ASR pipeline with App-HTP FireRedVAD, SenseVoice WAV transcription, a dictation listen mode, speech.idle, live transcript feeds, and a live available-memory readout.",
+  "version": "0.27.16",
+  "description": "Speech control plane and transcript consumer: three-page WebUI (Overview run/controls, paged History, Settings) with speaker identity, audio playback and latency details. The legacy RMS/VAD/ASR product surface is retired; speech.idle, capability feeds and a live available-memory readout remain.",
   "types": [
     "service"
   ],
   "compatibility": {
-    "framework": ">=0.2.27"
+    "framework": ">=0.3.0"
   },
   "entrypoints": {
     "backend": "package.mjs",
@@ -154,23 +154,7 @@
     "external": []
   },
   "packages": {
-    "requires": [
-      {
-        "id": "github.termux-os.asset.fireredvad",
-        "version": ">=1.0.0",
-        "required": false
-      },
-      {
-        "id": "github.termux-os.asset.sensevoice",
-        "version": ">=3.0.0",
-        "required": false
-      },
-      {
-        "id": "github.termux-os.asset.campplus",
-        "version": ">=1.0.0",
-        "required": false
-      }
-    ]
+    "requires": []
   },
   "integrations": {
     "requires": [
@@ -180,37 +164,18 @@
       }
     ]
   },
-  "assets": {
-    "requires": [
-      {
-        "id": "model.fireredvad",
-        "required": false
-      },
-      {
-        "id": "model.sensevoice.frontend",
-        "required": false
-      },
-      {
-        "id": "model.sensevoice.ctx",
-        "required": false
-      },
-      {
-        "id": "model.sensevoice.graph",
-        "required": false
-      },
-      {
-        "id": "model.campplus.graph",
-        "required": false
-      },
-      {
-        "id": "model.campplus.ctx",
-        "required": false
-      }
-    ]
-  },
   "release": {
     "repository": "https://github.com/johnson-yo/termux_os-service-termux_speech",
     "license": "Apache-2.0",
     "homepage": "https://github.com/johnson-yo/termux_os-service-termux_speech"
+  },
+  "assets": {
+    "requires": [
+      {
+        "id": "model.sensevoice16.ctx",
+        "required": false,
+        "target": "current"
+      }
+    ]
   }
 }

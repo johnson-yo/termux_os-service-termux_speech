@@ -189,11 +189,11 @@ test('W11 先补参考再判段，且判完不回写',
  * ⭐ 生产**不能**要求使用者先录一段背景。Lab 那个 `/acoustic-lab/calibration/*`
  *   是实验台的，正式链上不该有对应物——两个锚点全部由工作流自动取得。
  */
-test('W12 生产不要求使用者先录背景（对外只有 Lab 有 calibration 端点）',
+// ⭐ WEBUI18：Acoustic Lab 随旧 speech 产品面退役 ⇒ 对外**没有任何** calibration 端点。
+test('W12 生产不要求使用者先录背景（对外没有 calibration 端点）',
   (() => {
     const pkg = fs.readFileSync(path.join(root, 'package.mjs'), 'utf8');
-    const routes = [...pkg.matchAll(/'(\/[\w/-]*calibration[\w/-]*)'/g)].map((m) => m[1]);
-    return routes.length > 0 && routes.every((r) => r.startsWith('/acoustic-lab/'));
+    return [...pkg.matchAll(/'(\/[\w/-]*calibration[\w/-]*)'/g)].length === 0;
   })());
 
 console.log(`\n${count - failures}/${count} passed`);

@@ -93,9 +93,7 @@ test('RMS 阈值越线按选定 VAD 建立唯一处理窗口（CAM++ watchdog �
 test('App 对账会同步本地常驻镜像，runtime readiness 不拿空镜像冒充已声明',
   read('service/residents.mjs').includes('reconcileDeclared(declared)')
     && main.includes('vad?.reconcileResident(vadDeclared)')
-    && main.includes('asr?.reconcileResident(asrDeclared)')
-    && read('web/views.js').includes('const selected = asr?.model?.selected')
-    && read('web/views.js').includes('modelName'));
+    && main.includes('asr?.reconcileResident(asrDeclared)'));
 test('listen 模式：进入 RMS → VAD → ASR 的处理链',
   (() => {
     const start = main.indexOf('const enterListen');
@@ -255,73 +253,29 @@ test('切换时 generation 先加，再重新开门——旧结果结构上不�
     items.map((item) => item.feed_seq).every((seq, i, all) => i === 0 || seq > all[i - 1]));
 }
 
-// ────────────────────────────────── 7. 两个页面的 ASR 文字
-
+// ────────────────────────────────── 7. 产品页的转写文字（CP-SPEECH2-WEBUI18）
+/**
+ * ⭐ **按新意图改写**：旧 U1–U7 钉的是旧页面的 `asr_live` 域、`renderAsrLive` 双写入点、
+ *   `copy-latest` 按钮与 SenseVoice(T167) 段式链——它们随旧 speech 产品面一起退役。
+ *   不变的判据：**只有一个写入点**、实时与定稿分两行、历史只读 Speech2 final。
+ */
 {
-  const views = fs.readFileSync(path.join(root, 'web/views.js'), 'utf8');
   const appJs = fs.readFileSync(path.join(root, 'web/app.js'), 'utf8');
-  const viewsJs = fs.readFileSync(path.join(root, 'web/views.js'), 'utf8');
   const html = fs.readFileSync(path.join(root, 'web/index.html'), 'utf8');
-
-  test('U1 概览只有「正在识别」事实行，最近结果由历史第一条承担',
-    ['ov-current', 'tx-live-meta', 'tx-history-list']
-      .every((id) => html.includes(`id="${id}"`))
-      && !html.includes('id="ov-latest"')
-      && !html.includes('id="asr-live-text"') && !html.includes('id="asr-last-text"'));
-  /**
-   * ⭐ 不是「把两处改成一样」，是**只留一个写入点**。两处各写各的，迟早会在某个
-   *   分支上再次分岔——docs/075 之前就是这么分岔的（概览读记录组、诊断读
-   *   SenseVoice 控制器自己的最后一条）。
-   */
-  test('U2 四个位置只有 renderAsrLive 一个写入点',
-    /**
-     * ⛔ 一次直接 `$('...')` 赋值都不许有：唯一的写入发生在下面那两个 id 对的循环里。
-     * ⚠ 0.21.4 概览那两个 id 改成 `ov-current` / `ov-latest`（旧的 `tx-*` 卡整块退役），
-     *   ⭐ 判据仍然是「只有那两个循环在写」，而且 app.js 也不许再写它们——
-     *   本轮就差点在 app.js 里另开一个写入点，把刚合并好的东西重新拆开。
-     */
-    views.includes("['ov-current', 'tx-live-meta']")
-      && !html.includes('id="ov-latest"')
-      && (appJs.match(/setText\(\$\('(ov-current|ov-latest)'\)/g) ?? []).length === 0);
-  test('U3 实时文字来自服务端的同一个 asr_live 域，两页共用一次渲染',
-    appJs.includes("['overview-asr-live', ['asr_live']")
-      && !appJs.includes("['diag-asr-live'")
-      && main.includes('asr_live: () =>')
-      /**
-       * ⚠ 判据是「`asr_live` 在热域**里**」，⛔ 不是「它是数组的最后一个」。
-       *   原来写成 `'asr_live'];` 精确匹配了行尾，于是 0.21.3 往热域里加一个
-       *   `public` 就把它判红了——而 asr_live 一直好好地在那儿。
-       */
-      && /HOT_DOMAINS = \[[^\]]*'asr_live'/.test(main));
-  /**
-   * ⚠ 0.21.5：**两条 backend 都是段式的**——Audio8 那条 live hypothesis 链已删除。
-   *   所以 `live_supported` 恒为 false，而那是实话，⛔ 不是退化。
-   */
-  test('U4 按 shutter contract 区分 incomplete 当前句与 complete 最新句',
-    main.includes('live_supported: false')
-      && main.includes('current_status: current.status ?? null')
-      && views.includes("current?.status === 'incomplete'")
-      && !views.includes('SenseVoice 逐段识别，没有中间结果'));
-  test('U5 已定稿那一句两条门共用 RecordGroups 的同一条记录',
-    main.includes('committed: records?.lastSentence ?? null')
-      && fs.readFileSync(path.join(root, 'service/storage/groups.mjs'), 'utf8')
-        .includes('this.lastSentence = this.sentenceView(item)'));
-  /**
-   * ⚠ 0.21.4 概览只剩一个复制按钮（`copy-latest`），旧的 `tx-copy-latest` 已删。
-   * ⭐ 判据加了一条：⛔ **不许从 DOM 抠文本**——`ov-latest` 里可能是占位文案，
-   *   而按钮把「尚未产生转写」六个字复制走，和什么都不做一样是在骗人。
-   */
-  test('U6 复制按钮复制的是**页面上显示的那一句**',
-    appJs.includes('void reportCopy(V.latestText())')
-      && !/copy-latest'\)\?\.addEventListener[\s\S]{0,200}textContent/.test(appJs)
-      && viewsJs.includes("for (const id of ['tx-copy-latest', 'copy-latest'])"));
-  test('U7 处理门开着时状态流加快，关着回到 1 秒',
-    appJs.includes('live: 400') && appJs.includes('liveDoorOpen()'));
-  /**
-   * ⚠ 0.21.5：没有 hypothesis 了（那是 live 链的东西）。
-   * ⭐ 同一条契约仍在，只是触发点变成「一句话定稿」：转写落地立刻标脏，
-   *   ⛔ 不等下一次 PCM tick。
-   */
+  test('U1 概览有「正在识别」一行 + LIVE 行 + 历史列表',
+    ['tx-current', 'live-rows', 'tx-history-list'].every((id) => html.includes(`id="${id}"`)));
+  test('U2 「正在识别」只有 renderLive 一个写入点',
+    (appJs.match(/\$\('tx-current'\)/g) ?? []).length === 1
+      && /function renderLive\(s\)[\s\S]*?\$\('tx-current'\)/.test(appJs));
+  test('U3 实时文字来自服务端的 speech2 热域（同一次推送）',
+    appJs.includes("if ('speech2' in frame.domains) renderLive(frame.domains.speech2);")
+      && /HOT_DOMAINS = \[[^\]]*'speech2'/.test(main));
+  test('U4 provisional 与 final 分两种样式，同一句只占一行',
+    appJs.includes("it.complete ? 's2-final' : 's2-provisional'")
+      && appJs.includes('row.dataset.key = it.key'));
+  test('U5 历史只读 /speech2/history（Speech2 final）',
+    appJs.includes("request('/speech2/history?limit=10')")
+      && main.includes("it.source_kind === 'speech2'"));
   test('U8 一句话定稿即标脏热域，不等下一次 PCM tick',
     main.includes('hub?.markHot()') && main.includes('hub?.schedule()'));
 }

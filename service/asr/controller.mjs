@@ -23,8 +23,17 @@ import {
   tensorSpec,
 } from './features.mjs';
 import { ResidentGraph } from '../residents.mjs';
-import { executableGraphArgs } from '../logical-models.mjs';
 import { BlankStats, normalizeTranscript } from '../storage/text.mjs';
+
+const graphFromRuntime = (artifact) => {
+  if (!artifact?.path) return null;
+  const context = ['local', 'prebuilt', 'ctx'].includes(String(artifact.kind ?? ''));
+  return {
+    modelPath: context ? null : artifact.path,
+    ctxPath: context ? artifact.path : null,
+    ctxKey: artifact.ctx_key ?? path.basename(artifact.path).replace(/\.onnx$/, '').replace(/\.ctx$/, ''),
+  };
+};
 
 /**
  * ⭐ 兩個檔位的檔案位置都由 **Asset map** 解析，這條鏈上沒有任何裸路徑。
@@ -122,9 +131,8 @@ export class AsrController {
      * `require(ctxUsable || 源圖存在)`，有 ctx 時源圖一次都不會被打開。
      */
     frontendRoot,
-    /** ⭐ 模型管理器给出的当前可执行体（绝对路径）。⛔ 不再收 graphRoot / ctxRoot。 */
-    executablePath = null,
-    executableKind = null,
+    /** App `/model/prepare` 返回的 runtime artifact；Manager 不参与此接口。 */
+    runtimeArtifact = null,
     /** 伴随文件的 role → 绝对路径映射（`cmvn` / `tokens`）。 */
     frontendFiles = null,
     /** 本機的 htp/qnn。⚠ 曾經寫死成 v73/2.47，在 S25 上會如實地報一個錯的值。 */
@@ -143,17 +151,8 @@ export class AsrController {
     onResult = () => {},
     /** 读取当前 backend 代次；每个 job 开始时冻结，防止切换后迟到结果串线。 */
     getBackendGeneration = () => null,
-    /**
-     * Asset map 的解析器。注入而非 import：本檔不該知道 Framework 在哪、憑證是什麼，
-     * 那是 `service/assets.mjs` 的事。單測也因此不需要一個 Framework 就能驅動它。
-     */
-    resolveAsset = async (id) => { throw new Error(`no asset resolver injected for ${id}`); },
-    /** logical model 的解析器（注入而非 import：本档不该知道 Manager 在哪）。 */
-    resolveLogical = null,
   }) {
     this.android = android;
-    this.resolveAsset = resolveAsset;
-    this.resolveLogical = resolveLogical;
     this.dataRoot = dataRoot;
     /**
      * ⛔ 旧的 `transcripts/transcripts.v1.jsonl` 与它的 256 条内存水库都已删除
@@ -175,34 +174,24 @@ export class AsrController {
     /**
      * ⭐ **docs/093：只认一个「可执行体」，⛔ 不再分 ctx 与 graph。**
      *
-     * `executablePath` 由模型管理器给出——它已经是**当前这台机器上能跑的那一份**，
+     * `runtimeArtifact` 由 App 的 prepare 接口给出——它是**当前这台机器上能跑的那一份**，
      * 是预制还是本机编的都一样。⛔ 本类不再拼 `model.onnx`、不再判断优先级、
      * 也不再知道 v73 / QNN 是什么。
      * ⚠ 伴随文件按 **role** 取（`cmvn` / `tokens`），⛔ 不拼 `am.mvn` / `tokens.json`：
      *   文件名是 asset 的性质，写死它在换一份 asset 时不会报错，只会打开错的文件。
      */
-    this.executablePath = executablePath ?? null;
-    this.executableKind = executableKind ?? null;
+    this.runtimeArtifact = runtimeArtifact ?? null;
+    this.runtimeArtifactPath = runtimeArtifact?.path ?? null;
     this.frontendRoot = frontendRoot;
     this.cmvnPath = frontendFiles?.cmvn ?? null;
     this.tokensPath = frontendFiles?.tokens ?? null;
     this.target = target;
-    this.modelReady = Boolean(this.executablePath && this.cmvnPath && this.tokensPath);
+    this.modelReady = Boolean(this.runtimeArtifactPath && this.cmvnPath && this.tokensPath);
     /**
-     * ⭐ **路由规则只有一处**：`executableGraphArgs`（`logical-models.mjs`）。
-     *
-     * ⚠ 这里以前是手写的 `ctxPath = executablePath; modelPath = null` —— 结论**是对的**，
-     *   但它是这个文件自己得出的。同一条结论在另外三个 FireRedVAD 消费者里就没有被得出，
-     *   而那正是 `EP_CONTEXT_AS_MODEL_PATH` 的来源。
-     * ⭐ **一条正确但只写在一个文件里的规则，和一条没有写下来的规则，寿命一样长。**
-     * ⚠ `ctxKey` 也由它给（绑版本），⛔ 不再是裸的 `'sensevoice'`：
-     *   旧版本编出来的 ctx 不许被当成新版本的可执行体。
+     * ⭐ `graphFromRuntime` 只把 App artifact 的 kind/path 投影成 graph 参数：
+     *   context 只能进 `ctx_path`，source 只能进 `model_path`；ctx key 随 artifact 版本绑定。
      */
-    const routed = executableGraphArgs({
-      executable: this.executablePath
-        ? { path: this.executablePath, kind: this.executableKind }
-        : null,
-    });
+    const routed = graphFromRuntime(this.runtimeArtifact);
     this.ctxPath = routed?.ctxPath ?? null;
     this.modelPath = routed?.modelPath ?? null;
     this.graph = new ResidentGraph({
@@ -445,19 +434,17 @@ export class AsrController {
    *   那正是这个缺口存在的全部场景。
    * @returns 有没有真的换过（供调用方决定要不要说出来）
    */
-  applyLogical({ executablePath, executableKind, frontendFiles, target } = {}) {
+  applyRuntime({ artifact, frontendFiles, target } = {}) {
     if (this.modelReady) return false;
     const cmvn = frontendFiles?.cmvn ?? null;
     const tokens = frontendFiles?.tokens ?? null;
-    if (!executablePath || !cmvn || !tokens) return false;
-    this.executablePath = executablePath;
-    this.executableKind = executableKind ?? null;
+    if (!artifact?.path || !cmvn || !tokens) return false;
+    this.runtimeArtifact = artifact;
+    this.runtimeArtifactPath = artifact.path;
     this.cmvnPath = cmvn;
     this.tokensPath = tokens;
     if (target) this.target = target;
-    const routed = executableGraphArgs({
-      executable: { path: this.executablePath, kind: this.executableKind },
-    });
+    const routed = graphFromRuntime(artifact);
     this.ctxPath = routed?.ctxPath ?? null;
     this.modelPath = routed?.modelPath ?? null;
     this.graph.configure({
@@ -857,7 +844,7 @@ export class AsrController {
     /**
      * ⚠ **「没有文件要检查」⛔ 不等于「文件都在」。**
      *
-     * 真机上撞到过：模型管理器还没起来时 `executablePath` 是 null ⇒ `senseFiles()` 返回空数组
+     * 真机上撞到过：raw/prepare 还没完成时 runtime artifact 是 null ⇒ `senseFiles()` 返回空数组
      * ⇒ `missing.length === 0` ⇒ `files_present: true` ⇒ 整条链报 **ready，而它一个模型都没有**。
      * ⭐ 一个空集合让「全部满足」与「什么都没问」变成同一个答案 —— 这两件事必须分开。
      */

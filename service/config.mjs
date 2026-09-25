@@ -11,10 +11,16 @@ import path from 'node:path';
 import { normalizeSpeakerGate } from './speaker/gate.mjs';
 import { normalizeActivityConfig } from './speaker/activity-fsm.mjs';
 
+import { SPEECH2_INPUT_SOURCES } from './speech2.mjs';
 const DEFAULTS = {
   schema: 'termux-os-framework.termux-speech.conf.v4',
   enabled: true,
   poll_interval_ms: 2000,
+  /**
+   * ⭐ CP-SPEECH2-WEBUI18：Speech2 是唯一产品后端。Start 时由本包启动的 App AudioRing 输入源。
+   *   ⛔ 不是旧 PersistentMic 的 input_device（那条链已退出产品面）。
+   */
+  speech2: { input_source: 'SYSTEM_BUILTIN_MIC' },
   /**
    * 停链是使用者的决定，服务重启不该替他撤销它（docs/061 §三.1）。
    * ⚠ 但重启**绝不**因此 undeclare：启动时按 App 的真实常驻列表对账，不 churn 会话。
@@ -237,13 +243,18 @@ const normalizeConfig = (raw = {}) => ({
     10_000,
   )),
   chain_desired: raw.chain_desired === 'stopped' ? 'stopped' : DEFAULTS.chain_desired,
+  speech2: {
+    input_source: SPEECH2_INPUT_SOURCES.includes(raw.speech2?.input_source)
+      ? raw.speech2.input_source : DEFAULTS.speech2.input_source,
+  },
   /**
    * ⭐ docs/096：使用者想要的 App 三层 Pipeline（**desired，⛔ 不是 effective**）。
    * ⚠ `normalizeConfig` 是**白名单**——它重建一个只含已知键的新对象。
    *   不在这里登记的键会被**静默丢掉**：保存不报错，读回来就是没有。
    */
   pipeline: {
-    trigger: ['stop', 'passthrough', 'volume', 'clap'].includes(raw.pipeline?.trigger)
+    // ⭐ WEBUI18：旧 App pipeline 已退出产品面；存盘值只剩三项（旧的第四项读回即归 stop）。
+    trigger: ['stop', 'passthrough', 'volume'].includes(raw.pipeline?.trigger)
       ? raw.pipeline.trigger : 'stop',
     /**
      * ⭐ docs/099：`camplus` 作为独立断句器已退役 ⇒ 规范化成 `fireredvad_camplus`。
@@ -500,5 +511,15 @@ export function saveActivityShadowConfig(file, patch) {
   }
   const saved = normalizeConfig({ ...raw, target_activity_shadow: next });
   atomicWrite(file, saved);
+  return loadConfig(file);
+}
+
+/** Speech2 输入源（WEBUI18）。⛔ 认不出的源显式拒绝，不静默回落。 */
+export function saveSpeech2Config(file, patch) {
+  const raw = fs.existsSync(file) ? readSaved(file) : {};
+  if (patch.input_source !== undefined && !SPEECH2_INPUT_SOURCES.includes(patch.input_source)) {
+    throw new RangeError(`input_source must be one of ${SPEECH2_INPUT_SOURCES.join(', ')}`);
+  }
+  atomicWrite(file, normalizeConfig({ ...raw, speech2: { ...(raw.speech2 ?? {}), ...patch } }));
   return loadConfig(file);
 }

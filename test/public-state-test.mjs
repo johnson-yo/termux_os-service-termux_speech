@@ -242,46 +242,33 @@ const fin = (text, revision = 1, extra = {}) => ({ text, revision, segment_statu
 {
   const html = fs.readFileSync(path.join(root, 'web/index.html'), 'utf8');
   const app = fs.readFileSync(path.join(root, 'web/app.js'), 'utf8');
-  const pages = [...html.matchAll(/data-page="([a-z-]+)"/g)].map((m) => m[1]);
+  // ⚠ 正则必须认数字：旧的 `[a-z-]+` 匹配不了 `speech2`，于是新增的 tab 在这里**不可见**，
+  //   U1 会安静地继续通过——一个看不见新东西的断言，和不存在的断言一样。
+  const pages = [...html.matchAll(/data-page="([a-z0-9-]+)"/g)].map((m) => m[1]);
+  const appPages = (app.match(/PAGES = Object\.freeze\(\[([^\]]*)\]\)/)?.[1] ?? '')
+    .split(',').map((x) => x.trim().replace(/^'|'$/g, '')).filter(Boolean);
 
-  /** 三个产品 tab 是唯一公开信息架构；Speaker Lab 不从产品导航进入。 */
-  test('U1 ⭐ 主导航正好三个：Overview / Settings / My Voice',
-    JSON.stringify(pages) === JSON.stringify(['overview', 'settings', 'voice']),
-    pages.join(','));
-  test('U2 PAGES 与导航一致（少一个 ⇒ 那个标签点了没反应）',
-    /PAGES = Object\.freeze\(\['overview', 'settings', 'voice'\]\)/.test(app));
-  test('U3 ⛔ 模型不再是一级导航，但入口还在（收进设置）',
-    !pages.includes('models') && html.includes('id="card-models-wrap"'));
-  test('U4 ⭐ 常驻助手有正式开关，且连的是正式配置端点',
-    html.includes('id="res-enabled"') && app.includes("'/speaker-activity/config'"));
   /**
-   * ⚠ `man-toggle` 是**已被刻意删除**的旧模式按钮（app.js 里只剩一句注释说它已删）。
-   * ⭐ 保护的东西没变：**手动转录只有一个正式入口**，只是它现在叫 `pd-manual`。
+   * ⭐ Current Speech2-only structure has three pages: Overview / History / Settings.
+   *   The saved transcript archive is a first-class page; My Voices remains inside Settings.
    */
-  test('U5 ⭐ 手动语音输入只有一个正式按钮',
-    (html.match(/id="pd-manual"/g) ?? []).length === 1
-      && html.includes('手动转录')
-      && !html.includes('id="man-toggle"'));
-  test('U6 声纹登记有正式入口', html.includes('id="res-enroll"') && html.includes('登记我的声音'));
+  test('U1 ⭐ 主导航正好三个：Overview / History / Settings',
+    JSON.stringify(pages) === JSON.stringify(['overview', 'history', 'settings']), pages.join(','));
+  test('U2 PAGES 与导航一致（少一个 ⇒ 那个标签点了没反应）',
+    JSON.stringify(appPages) === JSON.stringify(pages), appPages.join(','));
+  test('U3 模型不是一级导航，入口在 Settings',
+    !pages.includes('models') && html.includes('id="card-models"'));
+  test('U6 My Voice 登记在 Settings（⛔ 不是一级页）',
+    html.slice(html.indexOf('id="page-settings"')).includes('id="card-voice"') && !pages.includes('voice'));
   test('U7 旧 speech/diagnostics 页面与 iframe 入口全部消失',
     !html.includes('id="page-speech"') && !html.includes('id="page-diagnostics"')
       && !html.includes('data-page="speech"') && !html.includes('data-page="diagnostics"')
       && !html.includes('<iframe') && !html.includes('speaker.html'));
   test('U8 ⛔ 产品页不出现声学阈值 / 拼音 / 声纹分数字样', (() => {
-    /**
-     * ⚠ 先去掉 HTML 注释再扫：这条禁令的注释里必然写着被禁的那些词
-     * （「⛔ 这里不出现 HTML/QNN/声纹分数」），不去注释就会把**警告本身**判成违规，
-     * 而最省事的「修法」是删掉那句警告。同一个坑本轮之前踩过一次。
-     */
     const seg = html.slice(html.indexOf('id="page-overview"'), html.indexOf('id="page-settings"'))
       .replace(/<!--[\s\S]*?-->/g, '');
     return !/[Pp]inyin|拼音|score_threshold|声纹分数|HTP|QNN/.test(seg);
   })());
-  test('U9 ⭐ 产品渲染只订 `public` 一个域',
-    /\['product', \['public'\]/.test(app));
-  test('U10 ⚠ 人话映射在前端做（公共状态里没有中文）',
-    app.includes('USER_STATE_TEXT') && app.includes('检测到你的声音')
-      && !fs.readFileSync(path.join(root, 'service/public-state.mjs'), 'utf8').includes('检测到'));
 }
 
 

@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: Apache-2.0
-// [INPUT]: Framework URL/System Key, running Termux Speech instance, App cue/graph runtime, and external VAD/ASR files.
-// [OUTPUT]: `pass` / `fail` / `blocked` (exit 0/1/2). Checks cover live input, last-owner authority,
-//           the SenseVoice WAV spool, transcript feeds and speech.idle.
-//           `blocked` means a prerequisite
-//           is missing, so nothing was asserted — one cause, not fourteen downstream symptoms.
+// [INPUT]: Framework URL/System Key, running Termux Speech instance, the App Speech2 surface.
+// [OUTPUT]: `pass` / `fail` / `blocked` (exit 0/1/2). Recovery20B: checks cover the Speech2-only
+//           product surface — layered overview, App-reported model readiness, the versioned policy
+//           (Trigger/Scene), transcript live/history, My Voice, the input source, the three-page WebUI
+//           and retirement of legacy write routes. `blocked` means a prerequisite is missing,
+//           so nothing was asserted — one cause, not ten downstream symptoms.
 // [POS]: Installed/Dev-compatible verification; it never prints credentials or audio and does not require a new physical input event.
 // [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
 const BASE = process.env.TERMUX_OS_FRAMEWORK_URL ?? 'http://127.0.0.1:8980';
@@ -181,354 +182,78 @@ if (blocked.length) {
   process.exit(2);
 }
 
-const transcribeExistingRecord = async (item) => {
-  await request('/asr/transcribe', {
-    method: 'POST',
-    body: { segment_id: item.segment_id },
-    timeoutMs: 15_000,
+const TRIGGERS = ['stop', 'passthrough', 'volume'];
+const SCENES = ['VOICE_INPUT', 'CONVERSATION', 'MEDIA_STREAM', 'AI_BARGE_IN', 'MEDIA_FILE'];
+
+await check('speech2_overview_layered', async () => {
+  const o = (await request('/speech2/overview', { timeoutMs: 15_000 })).value;
+  for (const k of ['installed', 'app_reachable', 'running', 'models_ready', 'trigger', 'input', 'state']) {
+    if (!(k in o)) throw new Error(`overview is missing ${k}`);
+  }
+  if (o.app_reachable !== true) throw new Error(`App Speech2 unreachable: ${o.error}`);
+  if (!TRIGGERS.includes(o.trigger)) throw new Error(`trigger=${o.trigger} is not a product trigger`);
+  return `state=${o.state} trigger=${o.trigger} scene=${o.scene} input=${o.input?.active_source ?? 'none'}`;
+});
+
+await check('speech2_models_ready_app_authority', async () => {
+  const m = (await request('/speech2/overview', { timeoutMs: 15_000 })).value.models;
+  if (m?.authority !== 'app') throw new Error(`readiness authority=${m?.authority}`);
+  const missing = ['campplus', 'fireredvad', 'sensevoice_t267'].filter((k) => m?.[k]?.installed !== true);
+  if (missing.length) throw new Error(`not installed: ${missing.join(', ')}`);
+  return ['campplus', 'fireredvad', 'sensevoice_t267'].map((k) => `${k}=${m[k].ready ? 'ready' : 'installed'}`).join(' ');
+});
+
+await check('speech2_policy_trigger_scene', async () => {
+  const doc = (await request('/speech2/policy')).value;
+  const p = doc?.policy;
+  if (p?.schema_version !== 4) throw new Error(`schema_version=${p?.schema_version}`);
+  if (!['passthrough', 'volume'].includes(p?.trigger?.mode)) throw new Error(`trigger.mode=${p?.trigger?.mode}`);
+  if (p?.segmentation?.scene !== null && !SCENES.includes(p?.segmentation?.scene)) {
+    throw new Error(`scene=${p?.segmentation?.scene}`);
+  }
+  return `revision=${doc.revision} trigger.mode=${p.trigger.mode} scene=${p.segmentation.scene}`;
+});
+
+await check('speech2_transcript_live_and_history', async () => {
+  const live = (await request('/speech2/transcripts/live')).value;
+  if (live?.schema !== 'termux-os.speech2-transcript.v1') throw new Error(`live schema=${live?.schema}`);
+  if (live.available !== true) throw new Error(`transcript read surface unavailable: ${live.last_error}`);
+  const hist = (await request('/speech2/history?limit=5')).value;
+  if (!Array.isArray(hist?.items)) throw new Error('history items missing');
+  if (hist.items.some((it) => it.source_kind !== 'speech2')) throw new Error('history mixes non-Speech2 rows');
+  return `boot=${String(live.boot_id).slice(0, 8)} after_seq=${live.after_seq} history=${hist.items.length}`;
+});
+
+await check('speech2_my_voice_route', async () => {
+  const v = (await request('/speech2/my-voice')).value;
+  if (typeof v?.registered !== 'boolean') throw new Error('registered is not a boolean');
+  return `registered=${v.registered} job=${v.job?.state ?? 'idle'}`;
+});
+
+await check('speech2_input_source', async () => {
+  const v = (await request('/speech2/input')).value;
+  if (!v?.product_sources?.includes(v?.configured)) throw new Error(`configured=${v?.configured}`);
+  return `configured=${v.configured} active=${v.ring?.active_source ?? 'none'}`;
+});
+
+await check('webui_three_pages_no_legacy', async () => {
+  const id = await resolvePackageId();
+  const response = await fetch(`${BASE}/packages/${id}/index.html`, { headers, signal: AbortSignal.timeout(8000) });
+  const html = await response.text();
+  if (!response.ok) throw new Error(`HTTP ${response.status} index.html`);
+  const tabs = [...html.matchAll(/role="tab"[^>]*>([^<]*)</g)].map((m) => m[1].trim());
+  if (JSON.stringify(tabs) !== JSON.stringify(['Overview', 'History', 'Settings'])) throw new Error(`tabs=${JSON.stringify(tabs)}`);
+  if (/clap|拍掌/i.test(html)) throw new Error('clap reference in the product page');
+  return `tabs=${tabs.join('|')}`;
+});
+
+await check('legacy_write_routes_retired', async () => {
+  const id = await resolvePackageId();
+  const response = await fetch(`${BASE}/api/packages/${id}/mic/enable`, {
+    method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(8000),
   });
-  const result = await waitFor(async () => {
-    const [asrPayload, recordsPayload] = await Promise.all([
-      request('/asr'),
-      request('/records?limit=50'),
-    ]);
-    return {
-      asr: asrPayload.value,
-      item: recordsPayload.recent?.find((row) => row.segment_id === item.segment_id) ?? null,
-    };
-  }, (value) => value?.item?.backend === 'sensevoice'
-    && value?.asr?.transcripts?.last?.model?.id === 'sensevoice'
-    && value?.asr?.queue?.in_flight === null, 180_000);
-  if (result?.item?.backend !== 'sensevoice') {
-    throw new Error('SenseVoice spool result did not update the record backend');
-  }
-  if (result.asr?.transcripts?.last?.model?.id !== 'sensevoice') {
-    throw new Error('SenseVoice spool result did not report its model id');
-  }
-  if (result.asr?.model?.session_loaded !== true) {
-    throw new Error('SenseVoice spool path did not leave its resident loaded');
-  }
-  return result;
-};
-
-await check('input_device_route', async () => {
-  const payload = await request('/devices');
-  if (!Array.isArray(payload.inputs) || payload.inputs.length === 0) throw new Error('no input devices');
-  const route = payload.microphone?.routed_input_device;
-  if (!route) throw new Error('no actual routed input device');
-  return `${payload.inputs.length} devices; configured=${payload.configured.input_device}; routed=${route.product_name ?? route.type_name}`;
-});
-
-await check('authenticated_pcm_and_rms_live', async () => {
-  const before = await request('/live');
-  await new Promise((resolve) => setTimeout(resolve, 650));
-  const after = await request('/live');
-  const stream = after.pcm_stream;
-  const gate = after.rms_gate;
-  if (stream?.connected !== true || Number(stream.last_frame_age_ms) > 1000) {
-    throw new Error(stream?.last_error ?? 'authenticated PCM WS is not live');
-  }
-  if (Number(stream.frame_seq) <= Number(before.pcm_stream?.frame_seq)) {
-    throw new Error('PCM frame counter did not advance');
-  }
-  if (gate?.available !== true || !Number.isFinite(Number(gate.current))) {
-    throw new Error('live RMS unavailable');
-  }
-  return `frames +${Number(stream.frame_seq) - Number(before.pcm_stream?.frame_seq)}; rms=${Number(gate.current).toFixed(4)}; admission=${gate.pcm_admission}`;
-});
-
-await check('speech_input_pipeline_contract', async () => {
-  const value = (await request('/speech-input')).value;
-  if (value?.schema !== 'termux-os.speech-input.v1') throw new Error('wrong speech.input schema');
-  if (value.rms_gate?.schema !== 'termux-os.rms-gate.v2') throw new Error('RMS Gate missing');
-  if (value.rms_gate?.close_control !== 'current_pipeline_lease_owner') {
-    throw new Error('RMS Gate does not delegate close control to the Pipeline lease');
-  }
-  if (value.pipeline?.schema !== 'termux-os.speech-pipeline-lease.v1'
-    || value.pipeline?.close_policy !== 'last_downstream_owner') {
-    throw new Error('last-owner Pipeline lease missing');
-  }
-  if (value.pcm_pool?.owner !== 'termux-speech-vad') {
-    throw new Error('VAD Pool ownership is wrong');
-  }
-  const serialized = JSON.stringify(value);
-  if (serialized.includes('pcm_s16le_b64') || serialized.includes('Authorization')) {
-    throw new Error('speech.input leaked PCM or credentials');
-  }
-  if (value.downstream?.stages?.find((item) => item.id === 'asr')?.connected !== true
-    || value.downstream?.idle_capability !== 'speech.idle') {
-    throw new Error('SenseVoice/speech.idle downstream contract missing');
-  }
-  return `ready=${value.ready}; owner=${value.pipeline.owner}; gate=${value.rms_gate.state}; pool=${value.pcm_pool.duration_ms}/${value.pcm_pool.configured_ms}ms`;
-});
-
-await check('vad_model_pool_and_wav_contract', async () => {
-  const value = (await request('/vad')).value;
-  if (value?.schema !== 'termux-os.speech-vad.v1') throw new Error('wrong VAD schema');
-  if (value.model?.files_present !== true) throw new Error('FireRedVAD model/cmvn missing');
-  if (value.model.runtime !== 'android-app-ort-qnn-htp') throw new Error('wrong VAD runtime');
-  if (Number(value.pcm_pool?.configured_ms) > 6000) {
-    throw new Error('VAD Pool limit/ownership wrong');
-  }
-  if (Number(value.countdown?.timeout_ms) < 1000 || value.countdown?.resets_on !== 'wav_output') {
-    throw new Error('VAD no-WAV countdown unavailable');
-  }
-  if (value.wav?.format !== 'wav_pcm_s16le_16khz_mono'
-    || value.wav?.downstream !== 'speech.asr'
-    || value.wav?.downstream_connected !== true) {
-    throw new Error('WAV→ASR handoff contract missing');
-  }
-  return `model=${value.model.id}; pool<=${value.pcm_pool.configured_ms}ms; timeout=${value.countdown.timeout_ms}ms; published=${value.wav.segments_published}`;
-});
-
-await check('single_current_close_owner', async () => {
-  const [pipelinePayload, vadPayload, asrPayload] = await Promise.all([
-    request('/pipeline'),
-    request('/vad'),
-    request('/asr'),
-  ]);
-  const pipeline = pipelinePayload.value;
-  const actual = [
-    vadPayload.value?.countdown?.authoritative === true ? 'speech.vad' : null,
-    asrPayload.value?.authority?.active === true ? 'speech.asr' : null,
-  ].filter(Boolean);
-  const expected = pipeline.owner === 'speech.rms' ? [] : [pipeline.owner];
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    throw new Error(`authority mismatch owner=${pipeline.owner} authoritative=${actual.join(',')}`);
-  }
-  return `epoch=${pipeline.epoch}; owner=${pipeline.owner}; authoritative=${actual[0] ?? 'RMS only'}`;
-});
-
-await check('resident_graphs_declared_and_loaded', async () => {
-  const current = (await request('/asr')).value;
-  if (current?.model?.id !== 'sensevoice' || current.ready !== true) {
-    throw new Error(current?.last_error ?? 'SenseVoice is not the ready current ASR model');
-  }
-  const descriptor = await discoverApp();
-  const [vad, asr] = await Promise.all([request('/vad'), request('/asr')]);
-  const wanted = [vad.value?.model?.session, asr.value?.model?.session];
-  if (wanted.some((id) => !id)) throw new Error('service does not report its resident ids');
-  const snapshot = await appRequest(descriptor, '/api/inference/residents', { timeoutMs: 20_000 });
-  const found = wanted.map((id) => (snapshot?.residents ?? []).find((item) => item?.id === id));
-  const missing = wanted.filter((id, index) => !found[index]);
-  if (missing.length) throw new Error(`resident not declared: ${missing.join(',')}`);
-  const notLoaded = found.filter((item) => item.state !== 'loaded').map((item) => `${item.id}=${item.state}`);
-  if (notLoaded.length) throw new Error(`resident not loaded: ${notLoaded.join(',')}`);
-  // `spec.toJson()` 是平铺进每条 item 的，不是嵌在 `spec` 下。
-  const foreign = found.filter((item) => item.created_by !== 'termux-speech');
-  if (foreign.length) throw new Error('resident declarations are not owned by termux-speech');
-  if (!found[1]?.heal?.check_output) throw new Error('SenseVoice resident carries no heal check_output');
-  const io = found[1]?.io?.outputs ?? [];
-  return `${wanted.join(' + ')}; loaded; heal=${found[1].heal.check_output}; asr_io=${io.join('/') || 'none'}`;
-});
-
-await check('fireredvad_htp_runtime', async () => {
-  // 走常驻路由，不再自己 create/delete —— 那正是 docs/046 标记的 QNN churn 风险，
-  // 而验收脚本以前每次运行都做两次。
-  const descriptor = await discoverApp();
-  const resident = (await request('/vad')).value?.model?.session;
-  if (!resident) throw new Error('VAD resident id unavailable');
-  const result = await appRequest(
-    descriptor,
-    `/api/inference/residents/${resident}/stream`,
-    {
-      method: 'POST',
-      body: {
-        reset: true,
-        state_links: { caches_packed: 'new_caches_packed' },
-        outputs: ['probs'],
-        steps: [{
-          inputs: {
-            feat: {
-              dtype: 'float32',
-              shape: [1, 1, 80],
-              data_b64: Buffer.alloc(80 * 4).toString('base64'),
-            },
-          },
-        }],
-      },
-      timeoutMs: 60_000,
-    },
-  );
-  const probs = result?.values?.probs ?? result?.probs;
-  if (!Array.isArray(probs) || probs.length !== 1 || !Number.isFinite(Number(probs[0]))) {
-    throw new Error('FireRedVAD HTP stream returned no finite probability');
-  }
-  return `resident=${resident}; frames=${probs.length}; probability=${Number(probs[0]).toFixed(4)}`;
-});
-
-await check('sensevoice_contract_and_htp_runtime', async () => {
-  const asr = (await request('/asr')).value;
-  if (asr?.schema !== 'termux-os.speech-asr.v1' || asr.model?.files_present !== true) {
-    throw new Error(asr?.last_error ?? 'SenseVoice model/adjuncts unavailable');
-  }
-  /**
-   * ⚠ 这里曾把 `v73` 与 `2.47` **写死**。那两个值描述的是**这台机器**，
-   *   ⛔ 不是产品契约：S25 是 v79/2.49，于是这条验收在它上面**永远不可能通过**；
-   *   而 QAIRT 升到 2.49 之后，连原本作为基准的参考机也不通过了。
-   * ⭐ **一个永远失败的验收脚本比没有脚本更糟：它训练人去忽略红灯。**
-   *
-   * 判据改成两条**真正的契约**：
-   *   ① runtime/precision 必须是 ORT-QNN 的 HTP 上下文（⛔ 不许悄悄退到 CPU）；
-   *   ② htp/qnn 必须**报得出来，且与 App 自报的 target 逐字相同**——
-   *      ⭐ 判的是「它说的和它跑的是不是同一台机器」，⛔ 不是「它是不是某台机器」。
-   *      这条抓的是真实事故形状：speech 侧曾把这两个值写死成 `'v73'`/`'2.47'`，
-   *      在 S25 上如实地报了一个**错的**值而没有任何东西发现（docs/060 同一形状）。
-   */
-  if (asr.model.runtime !== 'android-app-ort-qnn-htp'
-    || asr.model.precision !== 'qnn-context') {
-    throw new Error('SenseVoice runtime is not an ORT-QNN HTP context'
-      + ` (runtime=${asr.model.runtime} precision=${asr.model.precision})`);
-  }
-  if (!asr.model.htp || !asr.model.qnn) {
-    throw new Error('SenseVoice runtime does not report its HTP/QNN target'
-      + ' — a field named "what it runs on" must never be blank');
-  }
-  {
-    const app = await discoverApp();
-    const prepare = await fetch(`${app.baseUrl}/api/inference/model/prepare`, {
-      headers: { Authorization: app.authorization },
-      signal: AbortSignal.timeout(8000),
-    }).then((r) => r.json()).catch(() => null);
-    const target = prepare?.data?.target;
-    if (!target?.htp || !target?.qnn) {
-      throw new Error('App did not report its own HTP/QNN target');
-    }
-    if (asr.model.htp !== target.htp || asr.model.qnn !== target.qnn) {
-      throw new Error('SenseVoice reports a different machine than the App runs on:'
-        + ` speech=${asr.model.htp}/${asr.model.qnn} app=${target.htp}/${target.qnn}`);
-    }
-  }
-  if (asr.transcripts?.http_feed !== '/asr/transcripts'
-    || asr.transcripts?.websocket !== '/asr/transcripts/ws') {
-    throw new Error('SenseVoice transcript feed routes missing');
-  }
-  const resident = asr.model.session;
-  if (!resident) throw new Error('ASR resident id unavailable');
-  const descriptor = await discoverApp();
-  const int32 = (value) => {
-    const data = Buffer.alloc(4);
-    data.writeInt32LE(value);
-    return data.toString('base64');
-  };
-  const result = await appRequest(
-    descriptor,
-    `/api/inference/residents/${resident}/run`,
-    {
-      method: 'POST',
-      body: {
-        iters: 1,
-        warmup: 0,
-        return_outputs: false,
-        output_mode: 'argmax',
-        inputs: {
-          speech: {
-            dtype: 'float32',
-            shape: [1, 167, 560],
-            data_b64: Buffer.alloc(167 * 560 * 4).toString('base64'),
-          },
-          speech_lengths: { dtype: 'int32', shape: [1], data_b64: int32(1) },
-          language: { dtype: 'int32', shape: [1], data_b64: int32(0) },
-          textnorm: { dtype: 'int32', shape: [1], data_b64: int32(15) },
-        },
-      },
-      timeoutMs: 180_000,
-    },
-  );
-  const output = (result?.outputs ?? []).find((item) => item?.name === asr.model.output_name)
-    ?? result?.outputs?.[0];
-  if (output?.reduction !== 'argmax_last' || !Array.isArray(output.data)) {
-    throw new Error('SenseVoice HTP run returned no server-side argmax');
-  }
-  return `resident=${resident}; precision=qnn-context; output=${output.name}; argmax=${output.data.length}`;
-});
-
-await check('sensevoice_selection_and_wav_spool', async () => {
-  const recordsPayload = await request('/records?limit=50');
-  const item = recordsPayload.recent?.find((row) => row.status === 'succeeded' && row.wav_path);
-  if (!item) throw new Error('no existing succeeded record with WAV for SenseVoice spool verification');
-  const result = await transcribeExistingRecord(item);
-  return `sensevoice: selected_ready=true; session_loaded=${result.asr.model.session_loaded}; `
-    + `record_backend=${result.item.backend}`;
-});
-
-await check('rolling_pool_and_bounded_record_store', async () => {
-  const live = await request('/live');
-  const pool = live.pcm_pool;
-  const gate = live.rms_gate;
-  const records = live.records;
-  // Pool 必须在门关着时也在滚：门前的 RMS decision window 也可能让 OPEN 晚，
-  // 门后才开始缓冲等于从 timeline 头部丢掉语音起始。
-  if (pool?.rolling !== 'always') throw new Error('Pool is not rolling unconditionally');
-  if (gate?.state === 'closed' && pool?.writing !== true) {
-    throw new Error('Pool stopped writing while the Gate is closed');
-  }
-  if (!Array.isArray(gate?.open_keys) || !gate.open_keys.includes('explicit_listen')) {
-    throw new Error('the Gate does not advertise the explicit listen opening key');
-  }
-  // 保留量的判据换成了记录组：⛔ 稳定态盘上最多两组，更旧的先归档进 SQLite 再删 WAV。
-  // 允许短暂出现三组——最旧那组还有 item 没转写完时不许归档（把不知道的结论写进库）。
-  const onDisk = Number(records?.groups_on_disk);
-  if (!Number.isFinite(onDisk)) throw new Error('record store did not report groups_on_disk');
-  if (onDisk > 3) throw new Error(`record store keeps ${onDisk} groups on disk (>3)`);
-  if (Number(records?.group_size) !== 50) {
-    throw new Error(`record group size is ${records?.group_size}, expected 50`);
-  }
-  return `pool=${pool.duration_ms}/${pool.configured_ms}ms rolling; keys=${gate.open_keys.join('+')}; `
-    + `groups=${onDisk} active=${records?.active?.progress ?? '—'} archived=${
-      records?.archive?.groups ?? 0}g/${records?.archive?.items ?? 0}i`;
-});
-
-/**
- * 状态流。⭐ 这一轮的核心：页面不再每 250ms 拉一份完整状态。
- * ⚠ 判据必须是「状态不变时它真的不返回」——否则「间隔更长的轮询」也能通过。
- */
-await check('state_stream_pushes_only_on_change', async () => {
-  const snapshot = await request('/state');
-  if (snapshot.schema !== 'termux-os.speech-state.v1' || snapshot.full !== true) {
-    throw new Error('state snapshot contract missing');
-  }
-  if (!snapshot.domains?.lifecycle || !snapshot.domains?.records || !snapshot.domains?.service) {
-    throw new Error('state snapshot is missing required domains');
-  }
-  const bytes = JSON.stringify(snapshot).length;
-  const stats = (await request('/state/stats')).value;
-  return `domains=${Object.keys(snapshot.domains).length}; version=${snapshot.version}; `
-    + `snapshot_bytes=${bytes}; builds=${stats.builds}`;
-});
-
-await check('speech_activity_and_transcript_feeds', async () => {
-  const [activity, transcripts] = await Promise.all([
-    request('/vad/activity?after=0'),
-    request('/asr/transcripts?after=0&limit=10'),
-  ]);
-  if (activity.schema !== 'termux-os.speech-activity-feed.v1'
-    || !Array.isArray(activity.observations)) {
-    throw new Error('speech.activity feed contract missing');
-  }
-  if (transcripts.schema !== 'termux-os.speech-transcript-feed.v1'
-    || !Array.isArray(transcripts.observations)) {
-    throw new Error('speech.transcript feed contract missing');
-  }
-  return `activity=${activity.observations.length}; transcripts=${transcripts.observations.length}`;
-});
-
-await check('developer_speech_idle_reset', async () => {
-  const beforeFrames = Number((await request('/live')).pcm_stream?.frame_seq) || 0;
-  const reset = await request('/idle', {
-    method: 'POST',
-    body: { reason: 'device_verify', requested_by: 'verify-device' },
-  });
-  if (reset.value?.snapshot?.owner !== 'speech.rms') {
-    throw new Error(`speech.idle left owner=${reset.value?.snapshot?.owner}`);
-  }
-  await new Promise((resolve) => setTimeout(resolve, 300));
-  const after = await request('/live');
-  if (after.pcm_stream?.connected !== true
-    || Number(after.pcm_stream?.frame_seq) <= beforeFrames) {
-    throw new Error('speech.idle stopped or stalled Persistent Mic');
-  }
-  return `owner=${reset.value.snapshot.owner}; Mic frames +${Number(after.pcm_stream.frame_seq) - beforeFrames}`;
+  if (response.status === 200) throw new Error('legacy /mic/enable still accepted');
+  return `POST /mic/enable -> ${response.status}`;
 });
 
 const result = checks.some((item) => item.result === 'fail') ? 'fail' : 'pass';

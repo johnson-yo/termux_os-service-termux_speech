@@ -600,9 +600,9 @@ const asr = new AsrController({
   frontendRoot: senseFrontendRoot,
   frontendFiles: { cmvn: path.join(senseFrontendRoot, 'am.mvn'),
     tokens: path.join(senseFrontendRoot, 'tokens.json') },
-  // ⭐ docs/093：只给一个「可执行体」，⛔ 不再分 ctx / graph。
-  executablePath: path.join(senseGraphRoot, 'model.onnx'),
-  executableKind: 'local',
+  // App prepare hands the controller one runtime artifact; Manager raw files
+  // are intentionally not passed as an executable descriptor.
+  runtimeArtifact: { kind: 'local', path: path.join(senseGraphRoot, 'model.onnx') },
   residentId: 'fixture-asr',
   persistConfig: (patch) => { asrPersisted = patch; },
   config: {
@@ -667,8 +667,7 @@ asrDeclares.length = 0;
     frontendRoot: senseFrontendRoot,
     frontendFiles: { cmvn: path.join(senseFrontendRoot, 'am.mvn'),
       tokens: path.join(senseFrontendRoot, 'tokens.json') },
-    executablePath: path.join(senseCtxRoot, 'model.onnx'),
-    executableKind: 'prebuilt',
+    runtimeArtifact: { kind: 'prebuilt', path: path.join(senseCtxRoot, 'model.onnx') },
     residentId: 'fixture-asr-ctx',
     config: { enabled: true, language: 'auto', text_normalization: true },
   });
@@ -684,7 +683,7 @@ asrDeclares.length = 0;
    */
   test(
     'the controller uses exactly the executable it was handed, and nothing else',
-    ctxOnly.executablePath === path.join(senseCtxRoot, 'model.onnx')
+    ctxOnly.runtimeArtifactPath === path.join(senseCtxRoot, 'model.onnx')
       && ctxOnly.senseFiles().includes(path.join(senseCtxRoot, 'model.onnx'))
       // ⛔ 源图不在清单里——因为 speech 根本不知道有源图这回事
       && !ctxOnly.senseFiles().includes(path.join(senseGraphRoot, 'model.onnx'))
@@ -696,10 +695,10 @@ asrDeclares.length = 0;
   );
   test(
     'a locally-built executable is used the same way as a prebuilt one',
-    asr.executablePath === path.join(senseGraphRoot, 'model.onnx')
+    asr.runtimeArtifactPath === path.join(senseGraphRoot, 'model.onnx')
       && asr.senseFiles().includes(path.join(senseGraphRoot, 'model.onnx'))
       // ⭐ kind 只进诊断：两种来源产出的是同一个可执行体
-      && asr.executableKind === 'local' && ctxOnly.executableKind === 'prebuilt',
+      && asr.runtimeArtifact.kind === 'local' && ctxOnly.runtimeArtifact.kind === 'prebuilt',
   );
   /**
    * ⭐ 没有模型时**服务照常起来**，转写才拒绝。
@@ -730,9 +729,7 @@ const asrWarm = new AsrController({
   frontendRoot: senseFrontendRoot,
   frontendFiles: { cmvn: path.join(senseFrontendRoot, 'am.mvn'),
     tokens: path.join(senseFrontendRoot, 'tokens.json') },
-  // ⭐ docs/093：只给一个「可执行体」，⛔ 不再分 ctx / graph。
-  executablePath: path.join(senseGraphRoot, 'model.onnx'),
-  executableKind: 'local',
+  runtimeArtifact: { kind: 'local', path: path.join(senseGraphRoot, 'model.onnx') },
   residentId: 'fixture-asr-warm',
   config: {
     enabled: true,
@@ -863,7 +860,7 @@ const indexHtml = fs.readFileSync(path.join(root, 'web/index.html'), 'utf8');
 // ⚠ 页面的行为现在分在 app.js（I/O）与 views.js（渲染）两个文件里。
 // 断言要问的是「这个页面做不做某件事」，不是「这一个文件里有没有那一行」——
 // 按文件断言会在下一次拆分时假红，而拆分本身并没有改变任何行为。
-const appJs = ['web/app.js', 'web/views.js']
+const appJs = ['web/app.js']
   .map((file) => fs.readFileSync(path.join(root, file), 'utf8'))
   .join('\n');
 const styleCss = fs.readFileSync(path.join(root, 'web/style.css'), 'utf8');
@@ -885,6 +882,9 @@ const styleCss = fs.readFileSync(path.join(root, 'web/style.css'), 'utf8');
 }
 
 
+/* The pre-0.25 logical-asset assertions are retained below as history, but are
+ * not executable: the raw-only Manager/App boundary intentionally removes them. */
+if (false) {
 test(
   'Manifest declares every speech Capability and locates SenseVoice through assets, not paths',
   /**
@@ -994,8 +994,7 @@ test(
       && !appJsModels.includes('models/delete')
       && !appJsModels.includes('models/install-provider')
       && !indexHtmlModels.includes('data-page="models"')
-      && indexHtmlModels.includes('id="models-manager-link"')
-      && indexHtmlModels.includes('id="models-freshness"')
+      // WEBUI18：模型卡只转述 App 的就绪（旧 Manager 链接/新鲜度随旧 Model requirements 卡退役）
       && indexHtmlModels.includes('id="models-list"')
       && appJsModels.includes('renderModels'),
   );
@@ -1083,20 +1082,103 @@ test(
       && assetsSource.includes("asset.ready !== true"),
   );
 }
+}
+{
+  const declarationRoot = path.join(root, '.models', 'johnson-yo');
+  const declarationFiles = fs.readdirSync(declarationRoot);
+  const rawModelSource = fs.readFileSync(path.join(root, 'service/raw-models.mjs'), 'utf8');
+  const managerSource = fs.readFileSync(path.join(root, 'service/asset-manager.mjs'), 'utf8');
+  const modelsSource = fs.readFileSync(path.join(root, 'service/models.mjs'), 'utf8');
+  const mainSource = fs.readFileSync(path.join(root, 'service/main.mjs'), 'utf8');
+  const mainCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const modelsCode = modelsSource.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const indexHtmlModels = fs.readFileSync(path.join(root, 'web/index.html'), 'utf8');
+  const appJsModels = fs.readFileSync(path.join(root, 'web/app.js'), 'utf8');
+
+  test(
+    'Manifest declares speech capabilities and the raw-only Manager dependency',
+    /^\d+\.\d+\.\d+$/.test(manifest.version)
+      && manifest.id === 'github.termux-os.service.termux-speech'
+      && manifest.capabilities.requires.some((item) => item.id === 'termux-os.app.api' && item.required)
+      && manifest.capabilities.requires.some((item) => item.id === 'termux-os.assets.manager' && item.required === false)
+      && manifest.capabilities.provides.some((item) => item.id === 'speech.input')
+      && manifest.capabilities.provides.some((item) => item.id === 'speech.activity')
+      && manifest.capabilities.provides.some((item) => item.id === 'speech.transcript')
+      && manifest.runtime.bundled.length === 0
+      && manifest.runtime.external.length === 0
+      && manifest.packages.requires.length === 0
+      && manifest.integrations.requires.some((item) => item.capability === 'termux-os.app.api' && item.required === true)
+      && typeof manifest.release?.repository === 'string',
+  );
+  test(
+    'The package carries exactly the three Manager consumer declarations',
+    declarationFiles.length === 3
+      && declarationFiles.every((file) => file.endsWith('sensevoice-htp-onnx')
+        || file.endsWith('campplus-htp-onnx')
+        || file.endsWith('fireredvad-htp-onnx'))
+      && declarationFiles.every((file) => fs.readFileSync(path.join(declarationRoot, file), 'utf8')
+        .includes('raw-package-consumer: termux-speech')),
+  );
+  test(
+    'Raw model mappings contain only SenseVoice, CAM++, and FireRedVAD',
+    ['model.sensevoice', 'model.campplus', 'model.fireredvad'].every((id) => rawModelSource.includes(id))
+      && !rawModelSource.includes('model.audio8')
+      && rawModelSource.includes('huggingface:johnson-yo/termux_os-asset-sensevoice-htp-onnx')
+      && rawModelSource.includes('huggingface:johnson-yo/termux_os-asset-campplus-htp-onnx')
+      && rawModelSource.includes('huggingface:johnson-yo/termux_os-asset-fireredvad-htp-onnx')
+      && rawModelSource.includes('htp-t148/campplus.onnx')
+      && !rawModelSource.includes('generic/campplus.onnx'),
+  );
+  test(
+    'Manager exposes raw package operations only; App owns prepare and runtime',
+    managerSource.includes('async packages()')
+      && managerSource.includes('async downloadPackage')
+      && managerSource.includes('async verifyPackage')
+      && !managerSource.includes('useModel')
+      && !managerSource.includes('/model/resolve')
+      && !managerSource.includes('/models/use')
+      && !modelsCode.includes('export async function useModel')
+      && /export async function prepareModel/.test(modelsSource)
+      && /route === '\/models\/prepare'/.test(mainCode)
+      && !/route === '\/models\/use'/.test(mainCode)
+      && !appJsModels.includes('/models/use')
+      // WEBUI18：模型卡只转述 App 的就绪（旧 Manager 链接 / 新鲜度随旧 Model requirements 卡退役）
+      && indexHtmlModels.includes('id="models-list"')
+      && appJsModels.includes('renderModels'),
+  );
+  test(
+    'Missing Manager/raw/App facts are visible without taking down the service',
+    mainCode.includes('SpeechModelRuntime')
+      && mainCode.includes("senseFrontendWhy = 'raw_missing'")
+      && rawModelSource.includes("'manager_unreachable'")
+      && rawModelSource.includes("'app_prepare_failed'")
+      && rawModelSource.includes("'resident_failed'")
+      && mainCode.includes('ensureModelRuntime'),
+  );
+  test(
+    'Model output keeps raw, runtime, and resident layers separate',
+    modelsCode.includes('raw: facts.raw')
+      && modelsCode.includes('runtime: facts.runtime')
+      && modelsCode.includes('resident: facts.resident')
+      && modelsCode.includes('usable: rawComplete && prepared')
+      && modelsCode.includes('running: rawComplete && prepared && residentLoaded')
+      && !modelsCode.includes('ready: rawComplete && prepared'),
+  );
+  test(
+    'FireRedVAD receives raw CMVN and the App-prepared artifact',
+    mainCode.includes("modelId === 'model.fireredvad'")
+      && mainCode.includes('graphFromArtifact')
+      && mainCode.includes('consumer?.applyRuntime?.({ graph: VAD_GRAPH, cmvnFile: VAD_CMVN_PATH })')
+      && !mainCode.includes("resolveLogicalModel('model.fireredvad')")
+      && !mainCode.includes("resolveAssetRoot('model.fireredvad')"),
+  );
+}
 // 转写配置 + 顶部实时可用内存；内存只是显示值，不参与任何自动决策。
 const asrControllerSource = fs.readFileSync(new URL('../service/asr/controller.mjs', import.meta.url), 'utf8');
 const configSource = fs.readFileSync(new URL('../service/config.mjs', import.meta.url), 'utf8');
 const appJsSource = appJs;
 const indexHtmlSource = indexHtml;
 // docs/074：产品面只剩两条 pipeline，各自持有已验证成熟的 VAD。
-/** ⚠ selector 曾有 SenseVoice 与 Audio8 两项；Audio8 随 App 0.25.x 退役，只剩一项。 */
-test(
-  'the ASR selector offers exactly one real engine',
-  configSource.includes("ASR_MODELS = ['sensevoice']")
-    && configSource.includes("model: 'sensevoice'")
-    && indexHtmlSource.includes('id="asr-model"')
-    && appJsSource.includes("$('asr-model').value"),
-);
 /**
  * ⭐ 下线不是「藏起来」：旧值必须**迁移**，⛔ 不许留一个选了就调不存在端点的分支。
  * ⚠ Audio8 现在与两个 Qwen 旧值同类——它那条链的 App 端点已被删除。
@@ -1265,20 +1347,6 @@ test(
     && groupsSource.includes('segment_id: segmentId')
     && groupsSource.includes('item_seq: items.length + 1'),
 );
-test(
-  /**
-   * OLD TEST → 记录组卡必须出现在概览（`rec-group`/`rec-progress`/`rec-groups`）。
-   * WHY OBSOLETE → 0.21.5 把「转写结果」整张开发者卡移出概览产品路径：
-   *   组号、组进度、`segment=` 这类内部编号不是使用者要在首页看的东西。
-   * NEW ASSERTION → 旧记录组 renderer 不再是产品入口；ASR live renderer 仍然由
-   *   Overview 唯一调用并保留最近识别事实。
-   */
-  'the records renderer survives the overview rebuild and still tells the truth about rotation',
-  appJs.includes('renderAsrLive')
-    && appJs.includes('overview-asr-live')
-    && !indexHtml.includes('id="ov-latest"')
-    && !indexHtml.includes('id="rec-groups"'),
-);
 
 test(
   'the three HTP graphs stay mounted for the life of the service by default',
@@ -1311,23 +1379,6 @@ test(
     && !/requester:\s*'user\.persistent'/.test(mainSource)
     && !/'user\.persistent'/.test(lifecycleSource.replace(/\/\*[\s\S]*?\*\//g, ''))
     && lifecycleSource.includes("export const MIC_REQUESTER = 'termux-speech'"),
-);
-test(
-  'the page can name who is holding the microphone, and the permanent switch says what it does',
-  /**
-   * ⭐ 真机上麦克风被 `user.persistent` 一个人吊着录了 1.8 GB，而界面只显示「采集中」——
-   * 「在采集」回答不了「凭什么在采集」。持有者必须列得出来。
-   * 那两个按钮也从「开启输入」改名了：它写的是一份跨停链、跨重启的需求，
-   * 叫「开启输入」会让人以为它只管这一次。
-   */
-  mainSource.includes('const USER_MIC_REQUESTER = ')
-    && mainSource.includes('holders: mic?.demand?.holders ?? []')
-    && appJsSource.includes('renderMicHolders')
-    && indexHtmlSource.includes('id="mic-holders"')
-    && indexHtmlSource.includes('永久收音')
-    && !indexHtmlSource.includes('>开启输入<')
-    // 开启是一次明确的选择，不是一个看起来像「开始听」的普通按钮。
-    && /window\.confirm\([\s\S]{0,400}永久收音/.test(appJsSource),
 );
 test(
   'a blank transcript is judged in exactly one place',
@@ -1429,7 +1480,7 @@ test(
    * 修它的人多半会去加一条重复注册，而不是发现这条判据自己不完整。
    */
   const registered = new Set(
-    [...packageSource.matchAll(/proxy\('(?:GET|POST)',\s*'([^']+)'/g)].map((m) => m[1]),
+    [...packageSource.matchAll(/proxy\('(?:GET|POST|PUT|DELETE)',\s*'([^']+)'/g)].map((m) => m[1]),
   );
   for (const loop of packageSource.matchAll(/for \(const r of \[([^\]]+)\]\)\s*\{?\s*\n?\s*proxy\('(?:GET|POST)'/g)) {
     for (const m of loop[1].matchAll(/'([^']+)'/g)) registered.add(m[1]);
@@ -1437,35 +1488,12 @@ test(
   const missing = [...called].filter((route) => !registered.has(route)).sort();
   test(
     `every service path the pages call is registered in package.mjs (missing: ${missing.join(', ') || 'none'})`,
-    missing.length === 0 && called.size >= 12,
+    // WEBUI18：Speech2-only 页面只调用 /speech2/* 的 7 条产品路由。
+    missing.length === 0 && called.size >= 7
+      && [...called].every((route) => route.startsWith('/speech2/')),
   );
 }
 
-test(
-  'the manual entry uses one control and the chain has one opening path',
-  /**
-   * ⚠ `man-toggle` 是**已被刻意删除**的旧模式按钮（app.js 里只剩一句注释说它已删）。
-   * ⭐ 这条真正保护的是「**手动入口只有一个、语音链只有一条开门路径**」——
-   *   那件事与那个按钮叫什么无关，故判据换成「⛔ 旧的三个模式按钮一个都不许回来」。
-   */
-  indexHtml.includes('id="ac-chain"')
-    && !indexHtml.includes('id="chain-toggle"')
-    && !indexHtml.includes('id="man-toggle"')
-    && !indexHtml.includes('id="btn-mode-auto"')
-    && appJs.includes("request(started ? '/chain/stop' : '/chain/start'")
-    && appJs.includes('停止语音链会强行收走它们的听写')
-    && appJs.includes('force = true;')
-    && appJs.includes("lifecycle.dictation === 'warm'"),
-);
-test(
-  'dropped segments are visible, and only for this run',
-  // 被丢的段没有 WAV、没有进 ASR、也没有转写——不说出来它就彻底不可见。
-  indexHtml.includes('id="vad-drops"')
-    && appJs.includes('DROP_REASONS')
-    && vadSource.includes('drops: {')
-    // 不建立新的永久累计历史（docs/061 §四.3）。
-    && !vadSource.includes('drops_total_all_time'),
-);
 test(
   'listen mode suppresses automatic close and uses the RMS-to-ASR opening path',
   mainSource.includes('if (listenEngaged()) return null;')
@@ -1477,91 +1505,8 @@ test(
     && (mainSource.match(/engagePipeline\(/g) ?? []).length === 1
     && packageSource.includes("id: 'speech.listen.set'"),
 );
-test(
-  'Speech page removes PCM Core Test and embeds the Input Device selector in actual routing',
-  !indexHtml.includes('PCM核心测试')
-    && !indexHtml.includes('pcm/test')
-    && indexHtml.includes('id="input-device"')
-    && indexHtml.includes('id="form-daily"')
-    && !indexHtml.includes('id="form-detect"')
-    && !indexHtml.includes('id="form-recognition"')
-    && !indexHtml.includes('id="vad-max-wavs"')
-    /** ⚠ `man-toggle` 已随旧模式按钮删除；手动入口现在是 `pd-manual` 那一组。 */
-    && indexHtml.includes('id="pd-manual"')
-    && indexHtml.includes('id="asr-model"'),
-);
 // 产品导航收敛为 Overview / Settings / My Voice；内部阶段事实按产品职责归位。
-test(
-  'the page is exactly three product pages and pipeline facts stay on the right page',
-  ['overview', 'settings', 'voice']
-    .every((page) => indexHtml.includes(`data-page="${page}"`)
-      && indexHtml.includes(`id="page-${page}"`))
-    && ['rms-current', 'rms-avg', 'rms-peak', 'rms-cam-countdown', 'cam-live', 'cam-owner',
-      'vad-probability', 'vad-owner', 'asr-owner', 'asr-state', 'ov-current']
-      .every((id) => indexHtml.includes(`id="${id}"`))
-    && !indexHtml.includes('data-page="speech"')
-    && !indexHtml.includes('data-page="diagnostics"')
-    && !indexHtml.includes('<iframe')
-    && !styleCss.includes('grid-template-columns:repeat(6,1fr)')
-    && styleCss.includes('--touch:48px')
-    && /\.tab\s*\{[^}]*height:100%/.test(styleCss),
-);
 // 概览页要能「一眼看完」，所以这六件事必须在同一页上，不需要点开任何分页。
-test(
-  /**
-   * OLD TEST → 概览必须有 `health-badge`/`ov-mic`/`ov-route`/`ov-model`/`listen-state`/
-   *   `tx-latest-text`/`alerts` 七个 id（麦克风、路由、模型、听写、告警……）。
-   * WHY OBSOLETE → 那七项里有五项是**技术读数**（路由、模型、听写开关、开发者告警卡），
-   *   0.21.5 把概览收敛成「服务怎么样 / 现在有没有听见 / 识别到了什么」三块。
-   * NEW ASSERTION → 概览必须能回答的是**产品**三问：服务状态、声音活动、识别结果；
-   *   ⭐ 并且**一开口就要动的那一条**（音量条）必须真的在第一屏的 DOM 里。
-   */
-  'Overview answers the three product questions and reacts the moment there is sound',
-  ['pd-service-badge', 'act-meter', 'act-fill', 'act-badge', 'act-who',
-    'ov-current'].every((id) => indexHtml.includes(`id="${id}"`))
-    // ⛔ 旧的开发者卡整块退出产品路径
-    && !indexHtml.includes('id="alerts"')
-    && !indexHtml.includes('id="ov-route"')
-    && !indexHtml.includes('id="listen-state"')
-    // 音量条是 width 过渡，⛔ 不是会引起重排的动画（它每秒更新多次）
-    && /\.meter-fill\s*\{[^}]*transition:\s*width/.test(styleCss),
-);
-test(
-  'an unrecognised transcript shape is an explicit error, never an empty history',
-  appJs.includes("payload?.schema !== 'termux-os.speech-transcript-feed.v1'")
-    && /throw new Error\(`转写接口返回了不认识的结构/.test(appJs)
-    // ⛔ 不许把 observations 兜底成空数组：那会让「换了字段名」与「没人说话」长成同一个样子
-    && !/observations\s*\?\?\s*\[\]/.test(appJs),
-);
-test(
-  'the newest transcripts come from the record store, never read forward from cursor zero',
-  // feed 是 filter(seq > after).slice(0, limit)，从 0 起读永远拿到最早的那几条。
-  // 旧版靠「累计总数」倒推游标，而累计总数正是这一轮删掉的东西——改为直接读 `recent`。
-  appJs.includes("request(`/records?limit=${TRANSCRIPT_KEEP}`)")
-    && appJs.includes('TRANSCRIPT_KEEP = 10')
-    && !appJs.includes('known - TRANSCRIPT_KEEP'),
-);
-test(
-  /**
-   * OLD TEST → 钉住 `listen-toggle` 那个按钮里的确切措辞（「听写正由…」）。
-   * WHY OBSOLETE → 0.21.5 把四个相似入口收敛成一个 `man-toggle`，
-   *   那个按钮连同它的文案一起没了。
-   * NEW ASSERTION → 钉**保护本身**而不是钉哪个按钮承载它：
-   *   页面上唯一那个会停止语音输入的控件，在持有者不是自己时必须先问一次。
-   * ⚠ 这条保护无法搬到后端：`POST /listen{enabled:false}` 是无条件退出的，
-   *   「要不要打断别人」是产品决定。
-   */
-  'stopping a listen that someone else holds needs an explicit confirmation',
-  (() => {
-    return appJs.includes('const holders = (lifecycle?.requesters ?? []).filter((id) => id !== \'webui\');')
-      && appJs.includes('if (started && holders.length)')
-      && appJs.includes('window.confirm(')
-      && appJs.includes('if (!confirmed) return;')
-      && appJs.includes('force = true;');
-  })()
-    && appJs.includes("['settings-audio-control', ['lifecycle', 'pcm_consumers', 'input', 'listen']")
-    && appJs.includes('语音输入归谁'),
-);
 // 概览要回答的两件事——「有没有出事」和「听写现在归谁」——此前分别只在 `/status`
 // 和 `/listen` 里，于是巡检回路看不见它们。两者都是既有状态的**投影**，不是新状态机；
 // 现在它们是状态流里的两个域。
@@ -1569,39 +1514,7 @@ test(
   'the state stream carries service health and listen ownership as their own domains',
   /service: \(\) => \(\{\s*\n\s*state: state\.state,/.test(mainSource)
     && mainSource.includes('last_error: state.last_error,')
-    && /listen: \(\) => listenSnapshot\(\),/.test(mainSource)
-    && appJs.includes('if (domains.listen && !listenPending) listenState = domains.listen;'),
-);
-test(
-  'a listen taken over by another requester appears without a manual refresh',
-  // 自己的请求还在飞时不接管推送的值：那半秒后端还没改，读回来的是旧值
-  appJs.includes('if (domains.listen && !listenPending) listenState = domains.listen;')
-    && appJs.includes('LISTEN_FAILURE_VISIBLE_MS'),
-);
-test(
-  'switching the ASR model confirms, re-reads the backend, and never claims a fallback',
-  /**
-   * ⭐ **按新意图改写**（docs/091 §使用者反馈③），⛔ 不是绕过。
-   *
-   * 旧断言绑在一个**独立的「切换」按钮**上（`MODEL_RISK` 确认框 + 失败提示）。
-   * 使用者要求去掉那个按钮：保存 ASR 设定**就是**切换——两个按钮意味着
-   * 「选了但没切」是一个合法状态，而没有人想要那个状态。
-   * 不变的仍然是这条：**成功也必须回读后端**，⛔ 页面不许自称换成功了；
-   * 而后端没有任何自动回退机制，页面也就不许出现那种字样。
-   */
-  /**
-   * ⭐ **再次按新意图改写**（docs/097 §十五）：回读这条一个字没让，回读的**对象**变了。
-   * OLD → 回读本包 `/asr/config` 的 `model` 并比对。
-   * WHY OBSOLETE → 那是第二个真相。转录层归 Pipeline 所有，本包 conf 里那个
-   *   `asr.model` 与 App 的 effective 能长期不一致而毫无提示。
-   * NEW → 等 **App 的 effective** 真的变成目标值且不再 transitioning；
-   *   超时/错误如实报出，⛔ 页面仍然不许自称换成功了，也不许出现自动回退字样。
-   */
-  appJs.includes("app?.effective?.asr === wantedModel && app?.state !== 'transitioning'")
-    && appJs.includes('切换超时：App 仍未报告新的 effective')
-    // ⛔ 已经没有第二个入口了
-    && !appJs.includes('asr-model-apply')
-    && !/自动降级|自动回退|自动 fallback/.test(appJs),
+    && /listen: \(\) => listenSnapshot\(\),/.test(mainSource),
 );
 // 一个叫「用了哪个模型」的字段必须对应真实执行体；两个 backend 共用同一条记录路径。
 test(
@@ -1622,90 +1535,32 @@ test(
     && asrControllerSource.includes('sensevoice_not_ready')
     && !asrControllerSource.includes('transcribeQwen'),
 );
-test(
-  'the selected ASR tier keeps an explicit readiness meaning',
-  asrControllerSource.includes('const presence = (files, nowMs = Date.now())')
-    /** ⚠ Audio8 退役后只剩一个 tier；⭐ 但「必须给出显式 readiness」这条没变。 */
-    && asrControllerSource.includes("const variant = 'sensevoice';")
-    && asrControllerSource.includes('const selectedReady = selected.ready === true;')
-    && asrControllerSource.includes('senseReady')
-    && !asrControllerSource.includes('QWEN_MEL_ONNX')
-    && !/const QWEN_ROOT = /.test(asrControllerSource)
-    /**
-     * verify-device 断言的 `files_present` 是 SenseVoice 的事实，不许改语义。
-     * ⭐ **但它必须先排除空集合**（docs/093）：模型管理器还没起来时可执行体是 null
-     * ⇒ 文件清单为空 ⇒ `missing.length === 0` ⇒ 报 ready，**而它一个模型都没有**。
-     * ⚠ 一个空集合让「全部满足」与「什么都没问」变成同一个答案。
-     */
-    && asrControllerSource.includes(
-      'const filesPresent = senseVoice.files.length > 0 && senseVoice.files_present;')
-    && asrControllerSource.includes('const selected =')
-    && asrControllerSource.includes('const selectedReady = selected.ready === true;')
-    // 缺失要说得出缺的是哪个文件
-    && appJs.includes('selected.missing ?? []')
-    && appJs.includes('selected.ready !== true'),
-);
 // 真机渲染抓到的缺陷：重建 <select> 的选项会连带扔掉当前选择，而「脏表单不覆盖」
 // 的守卫只守住了赋值那一步——于是守卫反而保证了用户的选择被抹掉。
-test(
-  'a refresh never overwrites the dirty ASR form',
-  appJs.includes('function populateDaily(')
-    && /if \(dirty\.has\('daily'\)\) return;/.test(appJs)
-    && !appJs.includes('active_profile_id'),
-);
-test(
-  'copy still works where navigator.clipboard does not exist',
-  // 页面走 http（LAN 非安全上下文），clipboard API 在那里是 undefined
-  appJs.includes("document.execCommand('copy')")
-    && appJs.includes('复制失败'),
-);
 test(
   'the developer speech.idle stays locked until it is explicitly unlocked',
   !indexHtml.includes('id="dev-unlock"')
     && !indexHtml.includes('id="force-idle"')
     && !indexHtml.includes('speech.idle'),
 );
+/*
+ * ⭐ CP-SPEECH2-WEBUI18 按新意图改写：此处原有 17 条断言钉的是旧 speech 产品页（ASR 档位选择器、
+ *   记录组卡、Mic 持有者与永久采集开关、手动听写/chain、三/四页导航、listen 接管、剪贴板复制、
+ *   RMS/VAD/ASR 点亮语义……）——那一整页随旧产品面退役。它们守的原则由新页面的断言继承：
+ *   settings-ui-test（Trigger/Scene/单一入口/完整 PUT/My Voice/LIVE）、ui-convergence-test（两 tab、
+ *   id 存在、模态框）、state-test B*（订阅/teardown）、pipeline-test U*（转写单一写入点）。
+ */
 test(
-  /**
-   * OLD TEST → 六格阶段行里 `active`（正在工作）与 `owner`（有资格关门）
-   *   必须是两个各自独立决定的 class。
-   * WHY OBSOLETE → 那一行（`renderStages` + `.stages`）随概览重建整个下线了，
-   *   `renderStages` 已经是没有节点也没有调用者的死代码。
-   * NEW ASSERTION → **区分本身**必须还在，只是换了地方：
-   *   概览的反应层用 `speaking`（有人在说话）与门/阶段各自回答，
-   *   诊断页仍逐阶段显示 owner。⛔ 不许再退回「只看 owner 就点亮」。
-   * ⚠ 这条区分当初是真机上换来的：ASR 一开始转写 VAD 就无故变暗，
-   *   因为 lease 回答的是「谁能关门」，不是「谁在工作」。
-   */
-  'lighting separates "who is working" from "who may close", so VAD stays lit while ASR transcribes',
-  /**
-   * ⭐ **第三次按新意图改写**（docs/097 §五）。区分本身仍在，只是两边都换了来处：
-   *   「在说话」由**断句层**回答（CAM++ 判 USER / FireRedVAD 判 speech），
-   *   「听到了」由**触发层**回答（门开了，或电平越过阈值）。
-   * ⛔ 三个流水线节点的点亮判据仍然互不推导，也仍然不许由 lease 的 owner 决定。
-   */
-  appJs.includes('const segmentSpeaking = !stopped && gateOpen && (fireRedSelected')
-    && appJs.includes('const heard = level >= 0.02 || gateOpen;')
-    /**
-     * ⚠ docs/100 之后这里**多了一个 `stalled` 守卫**：一次 NPU SSR 里
-     *   `running` 全程为 true 而链路一帧都没处理。⭐ 代码比原断言更严，
-     *   故断言跟上——⛔ 不是把守卫从代码里拿掉去迁就测试。
-     */
-    && appJs.includes('const segmentActive = !stopped && gateOpen')
-    && appJs.includes('apSegment.running === true && apSegment.stalled !== true;')
-    // 诊断：owner 仍然逐阶段可见
-    && indexHtml.includes('id="asr-owner"')
-    // ⛔ 旧的「只看 owner」与靠历史字段点亮的写法都不许回来
-    && !appJs.includes('owner === node.stage')
-    && !appJs.includes('vadSpeech || wav'),
+  'WEBUI18 the product page is Speech2-only: three tabs, no legacy controls',
+  (indexHtml.match(/role="tab"/g) ?? []).length === 3
+    && !/pipe-segment|asr-model|man-toggle|ac-chain|mic-holders|input-device|card-clap|page-voice/.test(indexHtml)
+    && !appJs.includes("'/listen'") && !appJs.includes('/chain/') && !appJs.includes("'/mic/"),
 );
 test(
   'the operator page carries live state, not the architecture doctrine that belongs in docs',
   ['不读取 Pool', '解耦文件契约', '只有当前 owner 能发', '关门权=',
     '未把它冒充为', '不含 PCM 字节', 'WAV RESERVOIR', 'VAD PRE-ROLL POOL']
-    .every((phrase) => !indexHtml.includes(phrase))
-    // 精度是可核验的事实而不是教义，所以压成角标保留，不许一起删掉。
-    && indexHtml.includes('id="asr-precision"'),
+    .every((phrase) => !indexHtml.includes(phrase)),
 );
 test(
   'both WebUI pages use Browser Session and never ask for credentials',

@@ -2,6 +2,16 @@
 
 ## Responsibility
 
+**Speech is the only product backend (release candidate 0.27.16).** The WebUI is Speech-only
+(three pages: Overview, History, Settings); the legacy RMS/VAD/ASR product surface is retired — its write
+routes answer `410 LEGACY_SPEECH_RETIRED`, its App pipeline telemetry and model reconciler do not
+start, and at boot the legacy App pipeline is set to `stop` so the system microphone is free for
+the Speech2 AudioRing source. Generic infrastructure (RecordGroups, state-hub, records, capability
+registrations, speech.idle/listen actions) is kept. Source-tree legacy tools remain available to their
+focused host tests, but `public-files.txt` excludes the downstream-only acoustic/speaker labs and
+consumer contract fixture from the production archive; when those lab sources are absent, their
+legacy routes return `410 LEGACY_SPEECH_RETIRED` and the product runtime remains loadable.
+
 Own everything downstream of raw audio: RMS gate, owner lease, the manual FireRedVAD rolling
 pre-roll Pool, the automatic CAM++ mono-ms rolling tape, FireRedVAD features and staircase cut
 policy, WAV retention, ASR preprocessing and decoding, transcript records, and the five speech
@@ -21,8 +31,11 @@ through Framework Core or the browser.
   never undeclare on shutdown — a service restart is not a reason to churn an HTP session.
 - **Treat an App 503 as "not ready yet" and retry.** Only a non-retryable failure counts against an
   utterance.
-- **Hold no model paths.** Locations come from the Framework asset map at the moment a model is
-  needed (`service/assets.mjs`).
+- **Do not invent model paths or executable descriptors.** Manager 0.4.4 supplies only raw package
+  and file facts (`file.local.path`). App `/api/inference/model/prepare` owns the source-to-runtime
+  handoff, context/cache choice, and inference verification; App `/api/inference/residents` owns
+  the live resident fact. The service may pass those returned facts to its consumers, but it never
+  constructs a cache path or sends an executable/context descriptor back to Manager.
 - **Only the current lease owner may close.** A lease answers who may close, never who is working.
 - **Suppress feedback at the gate, never at the microphone.** Re-enabling capture needs a top
   activity, so disabling the mic becomes permanent deafness.
@@ -45,33 +58,62 @@ through Framework Core or the browser.
 - `service/` — HTTP service, App clients, resident declarations, RMS, lease, projections, config
   - `vad/` VAD and WAV · `asr/` recognition · `storage/` records
   - `capture/` App event stream · `lifecycle/` chain start/stop
-- `service/models.mjs` — the model shelf: the only route to obtaining or removing a speech model,
-  because asset Packages are hidden from the Framework's own Package pages
-- `web/` — 概览 / 设置 / 诊断 pages
+- `service/speech2.mjs` — thin client for the independent App `/api/speech2/*` surface
+  (status/policy/start/stop/transcripts/USER voice collection) plus the App AudioRing source API, the product
+  Trigger mapping (`stop` = Speech2 stopped · `passthrough`/`volume` = `policy.trigger.mode`), the
+  product policy field map, and `speech2Overview()` (layered projection + input + warnings +
+  per-poll activity); it owns no audio, CAM/VAD/chunking/ASR/model lifecycle and never probes
+  model files
+- Speech2 Start (`POST /speech2/start`) = release the legacy mic path → App Speech2 start → start the
+  configured AudioRing microphone source (`config.speech2.input_source`, default
+  `SYSTEM_BUILTIN_MIC`); an input failure (e.g. `FGS_REQUIRED`) is kept and shown, never hidden
+- `service/speech2-transcripts.mjs` — the formal Speech2 transcript consumer: AppEvents only wakes
+  it, `GET /api/speech2/transcripts?after_seq=` is the authority; provisional stays live-only,
+  a higher revision replaces the live line, a final enters records exactly once (key
+  `s2:<boot_id>:<generation>:<segment_id>`), the `(boot_id, seq)` cursor lives in the data root
+- `web/` — the Speech product surface: `index.html` (Overview / History / Settings; its `/packages/<id>/`
+  base is required because Framework serves the package entry without a trailing slash), `app.js` (all I/O and
+  rendering), `style.css`. The compact shared Header shows MEM/ZRAM plus Speech, Input, Live state,
+  Trigger, Scene and Models from existing state domains. LIVE retains three current meters, a fixed
+  60-second timeline of Sound/RMS, FireRedVAD probability, and actual CAM cosine, plus exactly two fixed
+  text slots: current provisional and latest completed sentence (History remains the full list). Overview is
+  the daily-use page with Stopped/Listening/Error and Start/Stop merged into its Mode/Activation controls card,
+  plus Voice Input target, one-line explanation, and Sound/Speech/Voice-match meters; it omits engineering
+  status grids, the temporary recording tool and acceptance controls.
+  History reuses RecordGroups, the existing SQLite archive and `/records/audio`, shows frozen identity,
+  and hides the player after WAV retention expires. Settings contains My Voices (USER collection API; never
+  the fixed `my-voice` compatibility slot) and advanced policy/audio/model/diagnostics controls.
+  My Voices Test captures five seconds for CAM-only comparison and is read-only. Conversation admits valid
+  speech regardless of CAM identity; Voice Input filters non-target/unmatched speakers before ASR enqueue
+  with a named trace reason. Every policy write remains GET → change → PUT of the complete policy.
+- `service/models.mjs` — the model shelf: the raw Manager download/operation routes plus the
+  raw/runtime/resident projection used by the WebUI
+- `service/raw-models.mjs` — the fixed three-model raw mapping and App-runtime coordinator
+- `service/asset-manager.mjs` — the raw-only Manager 0.4.4 capability client
 - `test/`, `scripts/` — host suites, smoke, and the device verification hook
 - `public-files.txt` — the release archive's contents. Anything imported at runtime must be listed.
+  `scripts/consumer-fixture.mjs`, `service/acoustic-lab.mjs`, and `service/speaker-lab.mjs` are
+  source-only test/lab inputs and must not be added to the production archive.
 
 ## Runtime paths
 
 - Status: `<frameworkRoot>/.runtime/services/<context.services.id('termux-speech')>/`
-- Config: `config/termux-speech.v4.json`
+- Config: `config/termux-speech.v4.json` (includes `speech2.input_source`)
+- Speech2 transcript cursor: `<persistRoot>/data/termux-speech/speech2/transcript-cursor.v1.json`
+  (⛔ never inside the version directory: an update must not lose or replay finals)
 - Data: `<persistRoot>/data/termux-speech/{vad,asr,records}/`
-- Models: resolved as **logical models**, never as asset ids and never as paths —
-  `model.sensevoice`, `model.fireredvad`, and `model.campplus`.
-  `service/logical-models.mjs` asks the HF Model Manager
-  (`GET .../model/resolve?id=…`) and gets back an **executable** plus **companions keyed by
-  role**; filenames come from `files.<role>`.
+- Models use speech's internal ids (`model.sensevoice`, `model.fireredvad`, and
+  `model.campplus`) only as feature ids. The raw package mapping is fixed in
+  `service/raw-models.mjs` and uses the Manager keys
+  `huggingface:johnson-yo/termux_os-asset-{sensevoice,campplus,fireredvad}-htp-onnx`.
+  Manager returns absolute local file facts; the service sends a complete raw source to App
+  `/api/inference/model/prepare`; the returned App artifact and resident snapshot are separate
+  runtime layers.
 
-  ⛔ **This package must not know what a CTX is** — no `ctx`/`graph` fallback chains, no
-  `target` comparison, no `v73`/`v79`, no QNN version, no literal `model.onnx` /
-  `model_ir11.onnx`. Which artifact runs on this device is the Manager's and the App's
-  question, not ours. (docs/093 · `test/logical-migration-test.mjs` asserts every one of these.)
-
-  ⚠ A model that is not enabled must **degrade**, not crash: `requireLogicalModel` throws
-  `ModelNotEnabled` and the controller reports `reason: 'model_not_enabled'`.
-  ⭐ **An empty file list is not "all files present."** When the Manager is down the executable
-  is null, the list is empty, and `missing.length === 0` — which would read as ready while we
-  hold no model at all. `files.length > 0 &&` is load-bearing.
+  ⛔ The service never restores Manager logical `resolve/use` routes, guesses a model/cache path,
+  chooses a target or QNN version, or sends an executable/context descriptor to Manager.
+  A missing layer degrades that feature and remains visible as `manager_unreachable`,
+  `manager_contract_error`, `raw_missing`, `app_prepare_failed`, or `resident_failed`.
 
 ## Verification
 

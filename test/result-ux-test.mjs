@@ -122,8 +122,17 @@ test('U12 定稿走 find → retranscribe / admit 的 upsert，⛔ 不是无条�
   /const existing = records\?\.find\?\.\(r\.segment_id\) \?\? null;/.test(main)
   && /if \(existing\) records\.retranscribe\(/.test(main));
 
-test('U13 「正在识别」有且只有一栏（⛔ 不新增第二个 widget）',
-  (read('web/index.html').match(/id="ov-current"/g) ?? []).length === 1);
+{
+  const html = read('web/index.html');
+  const appjs = read('web/app.js');
+  test('U13 LIVE 固定显示 Current sentence / Previous sentence 两槽，且由当前 live 数据更新',
+    (html.match(/id="live-current-half"/g) ?? []).length === 1
+    && (html.match(/id="live-previous-final"/g) ?? []).length === 1
+    && html.includes('>Current sentence</span>')
+    && html.includes('>Previous sentence</span>')
+    && appjs.includes("setText($('live-current-half'), currentText")
+    && appjs.includes("setText($('live-previous-final'), previous?.text"));
+}
 
 // ── PART G：音频只是一个引用 ───────────────────────────────────────────
 
@@ -132,13 +141,16 @@ test('U14 ⭐ App 段落的音频是一个**引用**，⛔ 不是 speech 本地�
 
 test('U15 App 私有绝对路径不进 records', !/wav_path: r\.archive_wav/.test(main));
 
+// ⭐ 正式 App 归档引用且 WAV 可用时显示播放器；保留过期提示与处理详情。
 {
-  const views = read('web/views.js');
-  test('U16 ⭐ 音频不可用时不画播放器，改成一句说明',
-    views.includes("record.audio_available === false") && views.includes('音频已过期'));
   const appjs = read('web/app.js');
-  test('U17 `audio_available` 由记录自己说，⛔ 不从 segment_id 推',
-    appjs.includes('audio_available: item.audio_available === true'));
+  test('U16 ⭐ History 对可用 App 音频引用显示播放器，并保留过期提示与 Details',
+    appjs.includes("if (audioRef?.source === 'app' && audioRef.segment_id && it.audio_available === true)")
+    && appjs.includes("const audio = el('audio');")
+    && appjs.includes("audio.src = `${PKG}/records/audio?segment_id=${encodeURIComponent(audioRef.segment_id)}`")
+    && appjs.includes("'Audio expired'")
+    && appjs.includes("const details = el('details', 'tx-details')")
+    && appjs.includes("'Details'"));
 }
 
 // ── 音频可用性是结构保证，⛔ 不是快照 ────────────────────────────────

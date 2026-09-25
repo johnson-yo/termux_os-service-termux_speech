@@ -1,8 +1,9 @@
 /**
  * SPDX-License-Identifier: Apache-2.0
- * [INPUT]: The three-page Overview/Settings/Diagnostics markup plus live stage/owner/health classes.
- * [OUTPUT]: A 390dp-first dark layout with 48dp touch targets, meters, and no page-level h-scroll.
- * [POS]: Dependency-free Package visual layer; only the active page scrolls, never the whole body.
+ * [INPUT]: Recovery20B Overview / History / Settings markup and their frozen identity facts.
+ * [OUTPUT]: Compact mobile-first three-page layout; merged Overview controls, LIVE meters + fixed
+ *           current/final sentence slots + 60-second timeline, persistent voice colors, paged History.
+ * [POS]: Dependency-free package visual layer; the active page owns vertical scrolling.
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 :root {
@@ -892,6 +893,78 @@ pre {
   *,*::before,*::after { scroll-behavior:auto!important; transition:none!important; animation:none!important; }
 }
 
+/* ============================================================
+   Package-owned confirmation modal
+   Native window.confirm() depends on the WebView host's WebChromeClient and is therefore
+   not a portable Package UI primitive.  This fixed DOM layer is deliberately a plain div,
+   not <dialog>: it has the broadest WebView behavior and stays above page scroll containers.
+   ============================================================ */
+.tos-confirm[hidden] { display:none !important; }
+.tos-confirm {
+  position:fixed;
+  inset:0;
+  z-index:2147483647;
+  display:grid;
+  place-items:center;
+  padding:calc(16px + env(safe-area-inset-top, 0px))
+    calc(16px + env(safe-area-inset-right, 0px))
+    calc(16px + env(safe-area-inset-bottom, 0px))
+    calc(16px + env(safe-area-inset-left, 0px));
+  isolation:isolate;
+}
+.tos-confirm-backdrop {
+  position:absolute;
+  inset:0;
+  background:rgba(2, 6, 12, .78);
+  touch-action:none;
+}
+.tos-confirm-panel {
+  position:relative;
+  z-index:1;
+  width:min(100%, 480px);
+  max-height:90vh;
+  max-height:min(90dvh, 560px);
+  overflow:auto;
+  padding:20px;
+  border:1px solid #40536b;
+  border-radius:16px;
+  background:linear-gradient(145deg, #182535, #101821);
+  box-shadow:0 18px 60px rgba(0, 0, 0, .65);
+  outline:none;
+}
+.tos-confirm-panel h2 {
+  margin:0;
+  color:var(--text);
+  font-size:1.05rem;
+  line-height:1.25;
+}
+.tos-confirm-message {
+  margin:12px 0 0;
+  color:#d7e3f0;
+  font-size:.84rem;
+  line-height:1.55;
+  white-space:pre-line;
+  overflow-wrap:anywhere;
+}
+.tos-confirm-actions {
+  display:flex;
+  gap:10px;
+  margin-top:20px;
+}
+.tos-confirm-actions button {
+  flex:1 1 0;
+  min-width:0;
+  min-height:var(--touch);
+}
+.tos-confirm-panel.is-danger { border-color:#86434a; }
+body.tos-confirm-open { overflow:hidden; }
+body.tos-confirm-open > main { pointer-events:none; user-select:none; }
+
+@media (max-width:400px) {
+  .tos-confirm-panel { padding:16px; border-radius:13px; }
+  .tos-confirm-actions { flex-direction:column-reverse; }
+}
+
 /* 记录分组（docs/061 §七/§八）。只列盘上那两组，不列全生命周期累计。 */
 .group-list { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 6px; }
 .group-list li {
@@ -1309,9 +1382,22 @@ pre {
   pointer-events: none;
   z-index: 2;
 }
+.cam-col .bar-cam {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  border-radius: 1px;
+  background: #a78bfa;
+  opacity: 0.88;
+  pointer-events: none;
+  z-index: 3;
+}
+.cam-col .bar-cam.user { background: #63d6a0; }
+.cam-col .bar-cam.other { background: #8993a1; }
 
 /* ============================================================
-   我的声音（My Voice）
+   My Voices — 复用原登记卡的状态与录音作业视觉
    ============================================================ */
 .vc-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 8px; }
 .vc-detail-val {
@@ -1353,6 +1439,16 @@ pre {
   font-size: 0.82rem;
   white-space: nowrap;
 }
+.vc-voice-list { list-style: none; padding: 0; margin: 12px 0 0; display: grid; gap: 8px; }
+.vc-voice-row { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--panel); }
+.vc-voice-detail { display: grid; gap: 3px; margin-bottom: 8px; }
+.vc-voice-name { font-size: 0.9rem; overflow-wrap: anywhere; }
+.vc-voice-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.vc-voice-actions button { flex: 1 1 85px; min-height: 38px; }
+.vc-rename-editor { display: flex; gap: 6px; margin-top: 8px; }
+.vc-rename-editor[hidden] { display: none; }
+.vc-rename-editor input { flex: 1 1 110px; min-width: 0; }
+.vc-rename-editor button { flex: 0 0 auto; }
 .vc-record-title {
   font-size: 0.82rem;
   font-weight: 700;
@@ -1471,4 +1567,184 @@ pre {
   font-size: 12px;
   color: var(--muted, #59606e);
   font-style: italic;
+}
+
+/* ── Speech2 (CP-SPEECH2-TERMUX-SPEECH17) ─────────────────────────────── */
+.s2-layers { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: .4rem; }
+.s2-layer { display: flex; align-items: center; gap: .45rem; }
+.s2-live, .s2-history { display: flex; flex-direction: column; gap: .4rem; padding: 0; margin: 0; }
+.s2-history { list-style: none; }
+.s2-line, .s2-history-item { display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; }
+.s2-provisional .s2-text { opacity: .6; font-style: italic; }
+.s2-final .s2-text { font-weight: 600; }
+.s2-tag { font-size: .75rem; opacity: .6; }
+.s2-role { font-size: .72rem; padding: .05rem .4rem; border-radius: .6rem; border: 1px solid currentColor; }
+.s2-role-user { color: #2e7d32; }
+.s2-role-other { color: #c62828; }
+.s2-role-unknown { color: #8a8a8a; }
+.s2-models { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: .35rem; }
+.s2-model { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+.s2-model-verdict { font-size: .8rem; opacity: .7; }
+
+/* ── CP-SPEECH2-WEBUI18: Speech2-only Overview controls ─────────────────── */
+/* Trigger + Scene + Apply share the reused three-column control row. */
+.ov-pipe-row > .ov-apply {
+  align-self: end;
+  min-height: 32px;
+  height: 32px;
+  padding: 0 8px;
+  font-size: 0.74rem;
+}
+.ov-run { flex-wrap: nowrap; }
+.ov-run button { min-width: 72px; }
+#card-live .s2-live { margin-top: 8px; }
+.s2-live-meters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: 12px;
+  margin: 10px 0;
+}
+.s2-live-meters > div { min-width: 0; }
+.s2-live-meter-head { display: flex; justify-content: space-between; gap: 8px; font-size: .78rem; }
+.s2-live-meter-head strong { font-variant-numeric: tabular-nums; }
+.s2-live-meter {
+  height: 10px;
+  margin: 4px 0;
+  overflow: hidden;
+  border-radius: 6px;
+  background: rgba(148, 163, 184, .22);
+}
+.s2-live-meter i { display: block; width: 0; height: 100%; border-radius: inherit; background: #38bdf8; transition: width .12s linear; }
+.s2-live-meter.cam i { background: #a78bfa; }
+.s2-live-meter.firered i { background: #fb923c; }
+.s2-live-meters small { display: block; min-height: 1.2em; overflow-wrap: anywhere; color: var(--muted); font-size: .7rem; }
+.s2-live-state-facts { margin-top: 8px; }
+.mic-acceptance-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.mic-acceptance-actions button { flex: 1 1 10rem; }
+#mic-acceptance-note { margin-top: 8px; line-height: 1.45; }
+.s2-models { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .35rem; }
+.s2-model { display: flex; align-items: center; gap: .5rem; font-size: .8rem; }
+.s2-model-verdict { margin-left: auto; color: var(--muted); font-size: .72rem; }
+.tx-time .s2-role { margin-left: .3rem; }
+.warn { color: var(--amber) !important; }
+
+.tr-script { margin: 6px 0 8px 1.1rem; padding: 0; font-size: .82rem; line-height: 1.5; }
+.tr-script li { margin: 2px 0; }
+
+/* RECOVERY19D：per-final 指标（Audio / ASR / Latency / Final / Speed） */
+.tx-metrics {
+  font-size: 11px;
+  color: var(--muted, #59606e);
+  font-variant-numeric: tabular-nums;
+  margin-top: 2px;
+}
+
+/* ── RECOVERY20B: compact product surface, persistent speaker colors ── */
+#page-overview .card { padding: 12px; }
+#page-overview .section-title { align-items: center; }
+#page-overview .section-title h2 { font-size: 1rem; }
+#page-overview .ov-run { margin-left: auto; }
+#page-overview .ov-run button { min-height: 42px; padding: 0 14px; }
+#page-overview .ov-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 10px 12px;
+}
+#page-overview .ov-controls > * { min-width: 0; margin: 0; }
+#page-overview .ov-run-row { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; }
+#page-overview .ov-run-row h2 { min-width: 0; margin: 0; }
+#page-overview .ov-run { width: auto; flex: 0 0 auto; margin: 0 0 0 auto; }
+#page-overview .ov-run button { flex: 0 0 auto; }
+#page-overview .ov-controls > #ov-warn-input,
+#page-overview .ov-controls > #ov-warn-voice,
+#page-overview .ov-controls > #ov-error,
+#page-overview .ov-controls > #ov-note { grid-column: 1 / -1; }
+#page-overview .ov-controls > #ov-target-wrap,
+#page-overview .ov-controls > #ov-mode-note { grid-column: 1 / -1; }
+#page-overview .ov-controls .ov-pipe > span,
+#page-overview .ov-controls > #ov-target-wrap > label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: .76rem;
+  font-weight: 700;
+}
+#page-overview .ov-controls select { width: 100%; min-height: 42px; }
+#page-overview #ov-target-wrap[hidden] { display: none; }
+#page-overview #ov-mode-note { line-height: 1.35; }
+#page-overview .s2-live-meters {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  margin: 8px 0 4px;
+}
+#page-overview .s2-live-meter-head { font-size: .82rem; }
+#page-overview .s2-live-meter { height: 12px; margin: 3px 0 0; }
+#page-overview .live-transcript-lines { display: grid; gap: 5px; margin: 7px 0 4px; }
+#page-overview .live-transcript-line {
+  display: block;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+#page-overview .live-transcript-line > span { margin-right: 8px; color: var(--muted); font-size: .7rem; font-weight: 700; }
+#page-overview .live-transcript-line > strong { font-size: .78rem; line-height: 1.25; overflow-wrap: anywhere; white-space: pre-wrap; }
+#page-overview #live-cam-name { min-width: 0; overflow-wrap: anywhere; }
+#page-overview #live-summary { margin: 6px 0 0; }
+#page-overview #live-legend { margin: 2px 0 0; line-height: 1.15; }
+.speaker-color-0 { --speaker-color: #55c8ff; }
+.speaker-color-1 { --speaker-color: #ffb454; }
+.speaker-color-2 { --speaker-color: #c084fc; }
+.speaker-color-3 { --speaker-color: #63d6a0; }
+.speaker-other { --speaker-color: #8993a1; }
+.speaker-mark {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 1px 8px;
+  border: 1px solid color-mix(in srgb, var(--speaker-color, #8993a1) 70%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--speaker-color, #8993a1) 16%, transparent);
+  color: var(--speaker-color, #8993a1);
+  font-size: .75rem;
+  font-weight: 750;
+}
+.s2-live-meter.speaker-color-0 i,
+.s2-live-meter.speaker-color-1 i,
+.s2-live-meter.speaker-color-2 i,
+.s2-live-meter.speaker-color-3 i,
+.s2-live-meter.speaker-other i { background: var(--speaker-color); }
+.tx-history-list {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 12px;
+  padding: 0;
+  list-style: none;
+}
+.tx-history-item {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+.tx-history-item .tx-time { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.speaker-confidence { color: var(--muted); font-size: .76rem; font-variant-numeric: tabular-nums; }
+.tx-history-item .tx-text { margin-top: 7px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.tx-audio-wrap { margin-top: 7px; }
+.tx-audio-wrap audio { width: 100%; height: 38px; }
+.tx-details { margin-top: 7px; color: var(--muted); font-size: .78rem; }
+.tx-details summary { cursor: pointer; width: fit-content; }
+#page-settings > .advanced-group > summary { min-height: 44px; display: flex; align-items: center; font-weight: 750; }
+
+@media (max-width: 400px) {
+  body { padding: 8px; }
+  main { height: calc(100dvh - 16px); }
+  .tabs { margin-bottom: 7px; }
+  #page-overview .card { padding: 10px; margin-bottom: 7px; }
+  #page-overview .ov-controls { gap: 8px; }
+  #page-overview .ov-controls select { min-height: 40px; font-size: .84rem; }
+  #page-overview .s2-live-meters { gap: 6px; }
+  #page-overview .live-transcript-line { padding: 4px 6px; }
 }

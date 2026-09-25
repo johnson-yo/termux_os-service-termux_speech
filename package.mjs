@@ -72,6 +72,7 @@ export async function register(context) {
     if (!response.ok || payload?.ok !== true) {
       const error = new Error(payload?.error ?? `termux-speech service HTTP ${response.status}`);
       error.status = response.status;
+      error.details = Array.isArray(payload?.details) ? payload.details : null;
       throw error;
     }
     return payload;
@@ -306,22 +307,24 @@ export async function register(context) {
       try {
         // ⚠ 只判 POST 会让 PUT 的 body **静默变成 undefined**：路由注册了、返回 200、
         //   而下游收到一个空 patch ⇒ 「什么都没改」和「改了没生效」长得一模一样。
-        const body = (method === 'POST' || method === 'PUT') ? await readBody() : undefined;
+        const body = (['POST', 'PUT', 'PATCH'].includes(method)
+          || (method === 'DELETE' && route === '/speech2/voices/item')) ? await readBody() : undefined;
         const query = method === 'GET'
           ? new URL(req.url, 'http://framework.local').search
           : '';
         const payload = await serviceRequest(servicePath + query, { method, body, timeoutMs });
         json(res, 200, payload);
-      } catch (error) {
-        json(res, Number(error?.status) || 503, {
-          ok: false,
-          error: String(error?.message ?? error),
-        });
-      }
+    } catch (error) {
+      json(res, Number(error?.status) || 503, {
+        ok: false,
+        error: String(error?.message ?? error),
+        ...(Array.isArray(error?.details) ? { details: error.details } : {}),
+      });
+    }
     });
   };
 
-  // 模型需求卡。⭐ 这里只转发 logical model 状态与作业，不暴露资产清单，也不提供删除。
+  // 模型四层状态。raw package facts 与 App runtime facts 分层转发，不暴露 Manager 内部状态机。
   proxy('GET', '/models');
   /**
    * ⚠ 下载/安装现在由 Manager 作为**作业**执行，本包立刻拿到 operation_id，
@@ -329,7 +332,7 @@ export async function register(context) {
    */
   proxy('GET', '/models/operation');
   proxy('POST', '/models/download', '/models/download', { timeoutMs: 120_000 });
-  proxy('POST', '/models/use', '/models/use', { timeoutMs: 120_000 });
+  proxy('POST', '/models/prepare', '/models/prepare', { timeoutMs: 30 * 60_000 });
   proxy('GET', '/status');
   proxy('GET', '/live');
   proxy('GET', '/state');
@@ -339,9 +342,7 @@ export async function register(context) {
   proxy('GET', '/records');
   proxy('GET', '/records/archive');
   proxy('GET', '/pipeline');
-  // ⭐ docs/096：三层 Pipeline 的唯一写入口（一次 PUT 提交整套）。
-  //   ⚠ 路由必须在**这里**注册——service 里处理了但没注册的症状是 `unknown_package_route`（docs/079）。
-  proxy('PUT', '/pipeline', '/pipeline', { timeoutMs: 240000 });
+  // ⛔ CP-SPEECH2-WEBUI18：旧三层 Pipeline 的写入口已退役（Speech2 是唯一产品后端）。
   proxy('GET', '/listen');
   proxy('GET', '/states');
   proxy('GET', '/rms');
@@ -357,56 +358,12 @@ export async function register(context) {
   // 听写链（docs/065）：状态只读 + 两个 App 闸门参数的读写代理。
   proxy('GET', '/asr/backend');
   proxy('GET', '/asr/foreground');
-  proxy('GET', '/pcm/consumers');
-  // 声学校准 / Endpoint Lab（docs/078）。⛔ 这一组没有一条会走到 ASR。
-  proxy('GET', '/speaker/state');
-  proxy('GET', '/speaker/timeline');
-  // 正式声纹门（docs/081）。⛔ 与上面那两条不是一组：Lab 是校准台，这是生产线。
-  proxy('GET', '/activity-shadow/state');
-  proxy('GET', '/activity-shadow/history');
-  // docs/084 CAM++ HTP 验收模式（默认 OFF）
-  proxy('GET', '/activity-test/state');
-  proxy('GET', '/activity-test/history');
-  proxy('GET', '/activity-test/segments');
-  proxy('GET', '/speaker-activity/state');
-  proxy('POST', '/speaker-activity/replay');
-  proxy('POST', '/speaker-activity/probe');
-  proxy('GET', '/speaker/enroll/orphans');
-  proxy('POST', '/speaker/enroll/orphans/purge');
-  proxy('GET', '/speaker-gate/state');
-  proxy('GET', '/speaker-gate/telemetry');
-  for (const r of ['/acoustic-lab/state', '/acoustic-lab/timeline', '/acoustic-lab/epochs']) {
-    proxy('GET', r);
-  }
-  /**
-   * ⭐ WAV 试听要**原样透传字节**，不能走 `proxy`（它 `response.json()`）。
-   * 一个把 WAV 当 JSON 解析的路由，会以「解析失败」的形式失败——而真正的原因是
-   * 我们把二进制塞进了一条只会读 JSON 的管子。
-   */
+  // ⛔ WEBUI18：旧声纹/拍掌/Lab/activity-test 的只读诊断与写入口一并退出产品面。
   proxy('GET', '/devices');
-  /**
-   * 拍手手势（App Feature Gate）的**低频**控制面。
-   * ⚠ 新增一条必须**同时**加在这里，漏了 Framework 直接回 `unknown_package_route`
-   *   而页面上只表现为按钮没反应（docs/079 §8 已经付过这个代价）。
-   */
-  // P1 policy（低频）。⚠ 新增一条必须**同时**加在这里，漏了 Framework 直接回
-  //   unknown_package_route，而页面上只表现为按钮没反应。
+  // 只读：旧 App policy（诊断），旧 speech-input 投影（verify/diagnostic）。⛔ 写入口已退役。
   proxy('GET', '/policy');
   proxy('GET', '/policy/status');
-  proxy('POST', '/policy/put');
-  proxy('GET', '/clap/state');
-  proxy('GET', '/clap/events');
-  proxy('POST', '/clap/config');
-  proxy('POST', '/clap/enroll/start');
-  proxy('POST', '/clap/enroll/finish');
-  proxy('POST', '/clap/enroll/cancel');
-  proxy('POST', '/clap/enroll/drop');
-  proxy('POST', '/clap/test');
-  proxy('POST', '/clap/reset');
   proxy('GET', '/speech-input');
-  proxy('POST', '/rms/config');
-  proxy('POST', '/vad/config');
-  proxy('POST', '/asr/config');
 
   /**
    * WAV 原样透传：**状态码、Range、字节都不加工**。上游那一侧（`sendWavFile`）已经
@@ -452,68 +409,34 @@ export async function register(context) {
       `${serviceBase}/records/audio?segment_id=${encodeURIComponent(segmentId)}`,
       'record wav');
   });
-  context.routes.register('GET', '/acoustic-lab/audio', async (req, res) => {
-    const q = new URL(req.url, 'http://framework.local').searchParams;
-    await pipeWav(req, res, `${serviceBase}/acoustic-lab/audio/${Number(q.get('epoch'))}/`
-      + `${String(q.get('which') ?? '')}`, 'lab audio');
-  });
-  context.routes.register('GET', '/activity-test/audio', async (req, res) => {
-    const q = new URL(req.url, 'http://framework.local').searchParams;
-    await pipeWav(req, res, `${serviceBase}/activity-test/audio/${String(q.get('wav') ?? '')}`,
-      'activity-test segment');
-  });
-  context.routes.register('GET', '/speaker/audio', async (req, res) => {
-    const q = new URL(req.url, 'http://framework.local').searchParams;
-    await pipeWav(req, res, `${serviceBase}/speaker/audio/${String(q.get('clip') ?? '')}`,
-      'speaker clip');
-  });
 
-  /**
-   * ⚠ 新增一条 `/speaker` 端点必须**同时**加在这里。漏了的话 Framework 直接回
-   * `unknown_package_route`，而页面若把写操作的响应丢掉就完全看不出来
-   * （docs/079 §8 已经用一整轮 72 个 epoch 的错标签付过这个代价）。
-   * ⚠ 改完 `package.mjs` 要 `framework.sh restart`——installed 包的 import 没有 cache-buster。
-   */
-  for (const r of ['/speaker/enroll/start', '/speaker/enroll/stop',
-    '/speaker/test/start', '/speaker/test/stop', '/speaker/profile/build',
-    '/speaker/profile/clear', '/speaker/profile/remove', '/speaker/config', '/speaker/purge',
-    '/speaker/label', '/speaker/labels/clear', '/speaker/threshold/ack',
-    '/speaker-activity/config',
-    // docs/087 P3：执行器开关与手动声纹同步（⛔ 两条都不进普通用户设置面）。
-    '/speaker-activity/executor', '/speaker-activity/profile/sync',
-    '/speaker-gate/config', '/speaker-gate/telemetry/reset',
-    '/activity-shadow/config', '/activity-shadow/stats/reset',
-    '/activity-test/start', '/activity-test/stop', '/activity-test/segments/remove',
-    '/activity-test/config',
-    // ⚠ 只注册了 GET /pcm/consumers 而漏了 POST：Framework 直接回
-    //   `unknown_package_route`，本轮做 A/B 时才发现（service 侧一直是有的）。
-    '/pcm/consumers']) {
-    proxy('POST', r, r, { timeoutMs: 120_000 });
-  }
-  for (const r of ['/acoustic-lab/config', '/acoustic-lab/calibration/start',
-    '/acoustic-lab/calibration/stop', '/acoustic-lab/test/start', '/acoustic-lab/test/stop',
-    '/acoustic-lab/reference/apply', '/acoustic-lab/reference/clear', '/acoustic-lab/purge',
-    '/acoustic-lab/phase']) {
-    proxy('POST', r, r, { timeoutMs: 60_000 });
-  }
-  proxy('POST', '/asr/dictation');
-  /**
-   * ⚠ GET 与 POST 都要注册：service 两个都实现了，而这里只注册了 POST——
-   * 于是页面每次加载都对 GET 拿到一个 404（`unknown_package_route`）。
-   * 它被 `.catch()` 吞掉所以功能没坏，但控制台每次都留一条红色噪音，
-   * 而那正是使用者验收时第一眼会看到的东西。
-   */
-  proxy('GET', '/asr/dictation/gate');
-  proxy('POST', '/asr/dictation/gate');
-  proxy('POST', '/asr/transcribe');
-  proxy('POST', '/chain/start');
-  proxy('POST', '/chain/stop');
-  proxy('POST', '/lifecycle/config');
   proxy('POST', '/idle');
   proxy('POST', '/listen');
   // Android App 的 primary action 由 loopback service 统一收口到自动 CAM++ 模式。
   proxy('POST', '/assistant/call', '/assistant/call', { timeoutMs: 15_000 });
-  proxy('POST', '/input-device');
-  proxy('POST', '/mic/enable');
-  proxy('POST', '/mic/disable');
+  // CP-SPEECH2-SHELL-POLICY5: thin, versioned Speech2 client routes. The Package owns no
+  // Speech2 runtime and therefore does not add any microphone/model lifecycle here.
+  proxy('GET', '/speech2/status');
+  proxy('GET', '/speech2/policy');
+  proxy('PUT', '/speech2/policy', '/speech2/policy', { timeoutMs: 15_000 });
+  // ⭐ WEBUI18：Start = 旧链让出麦克风 + App Speech2 start + 启动 AudioRing 麦克风源（两者都要时间）。
+  // ⚠ 真机：Stop 后再 Start 要 23–34 s（App 重载 T267 ctx）⇒ 给到 120 s。
+  proxy('POST', '/speech2/start', '/speech2/start', { timeoutMs: 120_000 });
+  proxy('POST', '/speech2/stop', '/speech2/stop', { timeoutMs: 45_000 });
+  proxy('GET', '/speech2/input');
+  proxy('POST', '/speech2/input', '/speech2/input', { timeoutMs: 15_000 });
+  // CP-SPEECH2-TERMUX-SPEECH17：正式 transcript / history / My Voice / 分层状态。
+  proxy('GET', '/speech2/overview');
+  proxy('GET', '/speech2/transcripts/live');
+  proxy('POST', '/speech2/transcripts/sync');
+  proxy('GET', '/speech2/history');
+  proxy('GET', '/speech2/my-voice');
+  proxy('POST', '/speech2/my-voice', '/speech2/my-voice', { timeoutMs: 15_000 });
+  proxy('DELETE', '/speech2/my-voice');
+  proxy('GET', '/speech2/voices');
+  proxy('POST', '/speech2/voices');
+  proxy('POST', '/speech2/voices/test');
+  proxy('POST', '/speech2/voices/record');
+  proxy('PATCH', '/speech2/voices/item');
+  proxy('DELETE', '/speech2/voices/item');
 }

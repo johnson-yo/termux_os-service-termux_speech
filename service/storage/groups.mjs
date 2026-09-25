@@ -323,6 +323,11 @@ export class RecordGroups {
       error: outcome.error
         ?? (!appOwned && segment.wav_path && !wavAvailable ? 'WAV was not available at admit time' : null),
       source: outcome.source ?? 'segment',
+      /**
+       * 生产者自带的元数据（SPEECH17：Speech2 的 speaker_role/scene/revision/身份）。
+       * ⭐ 原样透传，本模块⛔ 不解释——「这一句是谁说的」属于生产者，不属于记录组。
+       */
+      meta: outcome.meta ?? null,
       created_at: new Date(this.now()).toISOString(),
       completed_at: new Date(this.now()).toISOString(),
     };
@@ -362,6 +367,7 @@ export class RecordGroups {
       item.backend = outcome.backend ?? item.backend;
       item.inference_ms = outcome.inference_ms ?? item.inference_ms;
       item.error = outcome.error ?? null;
+      if (outcome.meta !== undefined) item.meta = outcome.meta;
       item.completed_at = new Date(this.now()).toISOString();
       /**
        * ⭐ **「最近识别」要跟着改写走**（docs/091 §使用者反馈④）。
@@ -401,6 +407,7 @@ export class RecordGroups {
       audio_source: item.audio_source ?? null,
       source_kind: sourceKindOf(item),
       segment_id: item.segment_id ?? null,
+      meta: item.meta ?? null,
       at_ms: Date.parse(item.completed_at) || null,
     };
   }

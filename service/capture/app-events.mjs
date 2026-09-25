@@ -48,6 +48,13 @@ export class AppEventsClient {
     this.policy = null;
     /** App 的 segment 结果事实（docs/088 P4）。⛔ 只转发，判断在消费方。 */
     this.onSegment = () => {};
+    /**
+     * Speech2 的 transcript 紧凑事实（SPEECH17）。⭐ 只作唤醒：权威在
+     * `/api/speech2/transcripts?after_seq=`，因为这条总线队列满丢最旧、⛔ 不保证送达。
+     */
+    this.onTranscript = () => {};
+    this.transcriptFrames = 0;
+    this.transcript = null;
     this.segment = null;
     this.gateOpens = null;
     this.gate = null;
@@ -171,6 +178,18 @@ export class AppEventsClient {
     if (data.activity && typeof data.activity === 'object') this.observeActivity(data.activity, bootId);
     if (data.policy && typeof data.policy === 'object') this.observePolicy(data.policy);
     if (data.segment && typeof data.segment === 'object') this.observeSegment(data.segment, bootId);
+    /**
+     * ⭐ App 把 `transcript` 放在**帧的顶层**（与 `data` 并列，AppEvents.frame()），⛔ 不在 `data` 里。
+     * ⚠ WEBUI18 真机抓到：只读 `data.transcript` ⇒ 事件唤醒**从 SPEECH17 起一次都没发生过**，
+     *   transcript 全靠 10 s 兜底同步送达——而兜底链的泄漏（start() 叠加）恰好把延迟掩盖了。
+     */
+    const transcript = (frame?.transcript && typeof frame.transcript === 'object') ? frame.transcript
+      : (data.transcript && typeof data.transcript === 'object') ? data.transcript : null;
+    if (transcript) {
+      this.transcript = transcript;
+      this.transcriptFrames += 1;
+      try { this.onTranscript(transcript, bootId); } catch { /* 观测不得影响事件流 */ }
+    }
     this.intervals.ingest(data.playing, bootId);
     this.onChange();
     return frame;
@@ -273,6 +292,7 @@ export class AppEventsClient {
       boot_id: this.bootId,
       last_seq: this.lastSeq,
       frames_received: this.framesReceived,
+      transcript_frames: this.transcriptFrames,
       frames_discarded: this.framesDiscarded,
       generation_changes: this.generationChanges,
       last_event: this.lastEvent,

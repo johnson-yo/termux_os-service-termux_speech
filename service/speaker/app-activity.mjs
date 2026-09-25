@@ -3,12 +3,14 @@
  * [INPUT]: App 的 `/api/speech/activity` 控制面 + AppEvents 帧里的 `activity` 域
  * [OUTPUT]: 对外提供 AppSpeakerActivity —— 把 CAM++ 的**高频执行**交给 App，
  *           本包只做低频的策略下发、准入通知与段落消费
- * [POS]: docs/087 P3。⭐ 一句话：**App 决定「谁在说、说到哪」，本包决定「这一段算不算数」。**
+ * [POS]: docs/140（承接 docs/087 P3）。⭐ 一句话：**App 决定「谁在说、说到哪」，本包决定「这一段算不算数」。**
  *
  * ⭐ 与旧的 `activity.mjs` 是同一份判据的两个执行位置，⛔ 不是两套算法：
  *   FSM / fbank / cosine 已经逐位对照过（App 的 `ActivityParityTest` 用**本包这份实现**
  *   跑出来的黄金数据做断言）。这里只负责把参数送过去、把结果收回来。
  * ⭐ **PCM 不再出 App**：本模块一个音频字节都不搬，收到的是 `wav_path` 与元数据。
+ *   FR+CAM 的边界在 App 内已经收口：CAM++ 唯一拥有句首，CAM++/FireRedVAD
+ *   的结束候选取较早者；本包只消费并透传 `fusion_source`，不重新判边界。
  * ⚠ exactly-once 的判据是**递增的 `seq`**，⛔ 不是布尔也不是「最后一段变了」——
  *   事件总线本就允许重复推送，而同一句话的两个 revision 只差一个数字。
  * ⚠ `boot_id` 变了（App 重生）计数器归零：那时只重新对齐基线，⛔ 不把历史重放一遍。
@@ -17,12 +19,19 @@
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
+import {
+  CAMPLUS_EMBEDDING_CONTRACT,
+  CAMPLUS_FEATURE_PROTOCOL,
+  CAMPLUS_FRAMES,
+  CAMPLUS_WINDOW_MS,
+} from './campplus.mjs';
+
 export const APP_ACTIVITY_MODES = Object.freeze(['app', 'legacy_speech', 'shadow']);
 
 export class AppSpeakerActivity {
   /**
    * @param android      `createAndroidAppClient()` 的实例
-   * @param calibration  `() => { profile, profile_ready }`（复用既有 CPU 登记的声纹）
+   * @param calibration  `() => { profile, profile_ready }`（复用固定 HTP 登记的声纹）
    * @param modelPath    CAM++ 源图绝对路径（Asset 解析后的结果）
    * @param ctxPath      QNN 2.47 EPContext wrapper 绝对路径（可为 null）
    * @param onSegment    `(segment) => void` 正式下游；⛔ 本模块不认识 ASR
@@ -101,6 +110,15 @@ export class AppSpeakerActivity {
     /** 下发给 App 的判据由调用方在 `ensureRunning` 时给；这里只记住最后一份。 */
     this.lastConfig = {};
     this.profileSyncInFlight = false;
+  }
+
+  /** App prepare is the only source of the runtime artifact used here. */
+  setRuntime({ artifact } = {}) {
+    if (!artifact?.path || this.started) return false;
+    this.ctxPath = artifact.path;
+    this.modelPath = null;
+    this.onChange();
+    return true;
   }
 
   /** 有界退避：⛔ 不无限快速重试，也⛔ 不放弃。 */
@@ -243,11 +261,32 @@ export class AppSpeakerActivity {
       fingerprint: profile.fingerprint ?? null,
       generation,
       built_at_ms: profile.builtAtMs ?? 0,
+      algorithm: {
+        model_id: 'campplus',
+        backend: 'htp',
+        embedding_contract: profile.algorithm?.embedding_contract ?? CAMPLUS_EMBEDDING_CONTRACT,
+        feature_protocol: profile.algorithm?.feature_protocol ?? CAMPLUS_FEATURE_PROTOCOL,
+        window_ms: CAMPLUS_WINDOW_MS,
+        frames: CAMPLUS_FRAMES,
+        aggregation: profile.algorithm?.aggregation ?? 'sentence-window-unique-coverage-v1',
+      },
+      backend: 'htp',
+      embedding_contract: profile.algorithm?.embedding_contract ?? CAMPLUS_EMBEDDING_CONTRACT,
+      feature_protocol: profile.algorithm?.feature_protocol ?? CAMPLUS_FEATURE_PROTOCOL,
+      window_ms: CAMPLUS_WINDOW_MS,
+      frames: CAMPLUS_FRAMES,
+      aggregation: profile.algorithm?.aggregation ?? 'sentence-window-unique-coverage-v1',
     };
     // ⛔ 指纹给了就必须与 App 本地重算的一致；对不上 App 会拒收，这正是要的。
     try {
       const data = await this.android.json('/api/speech/speaker/profile',
         { method: 'POST', body });
+      const readback = await this.android.json('/api/speech/speaker/profile');
+      if (readback?.ready !== true || readback.fingerprint !== body.fingerprint
+          || readback.generation !== generation
+          || readback.embedding_contract !== body.embedding_contract) {
+        throw new Error('App profile readback does not match the synchronized profile');
+      }
       this.profileGeneration = generation;
       this.profileFingerprint = data?.profile?.fingerprint ?? body.fingerprint;
       this.profileSyncedAtMs = this.now();
@@ -276,7 +315,8 @@ export class AppSpeakerActivity {
   /** 判据下发。取值与本包 `activity.mjs` 的 TEST_DEFAULTS 同源。 */
   async pushConfig(config = {}) {
     const body = {
-      window_ms: config.window_ms ?? 1500,
+      // The App CAM++ executor accepts only the fixed HTP contract.
+      window_ms: CAMPLUS_WINDOW_MS,
       step_ms: config.step_ms ?? 300,
       enter_threshold: config.enter_threshold ?? 0.40,
       exit_threshold: config.exit_threshold ?? 0.35,
@@ -481,6 +521,7 @@ export class AppSpeakerActivity {
         duration_ms: Number(segment.duration_ms) || 0,
         start_mono_ms: Number(segment.start_mono_ms) || null,
         end_mono_ms: Number(segment.end_mono_ms) || null,
+        fusion_source: segment.fusion_source ?? null,
         commit_reason: segment.commit_reason ?? null,
         max_similarity: segment.max_similarity ?? null,
         mean_user_similarity: segment.mean_user_similarity ?? null,

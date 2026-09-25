@@ -11,7 +11,7 @@
  *
  * ⚠ 阈值与窗长**绑定**，不可互换：同一个人在安静房间里
  *   6 秒的段是 0.95，而 1.5 秒的窗只有 0.487（真机实测）。
- *   换了 window_ms 就必须重新校准 threshold——`configure()` 会把这件事说出来。
+ *   CAM++ HTP 输入固定为 1.5 s；`window_ms` 只保留为兼容字段，不能改变模型输入。
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 
@@ -26,7 +26,7 @@ export const USERVAD_DEFAULTS = Object.freeze({
 });
 
 /** 页面推荐的窗长。500 允许手输但不推荐——离线实测它的 margin 基本归零。 */
-export const RECOMMENDED_WINDOWS = Object.freeze([750, 1000, 1500, 2000]);
+export const RECOMMENDED_WINDOWS = Object.freeze([1500]);
 
 export const LABELS = Object.freeze(
   ['UNLABELED', 'USER', 'BACKGROUND', 'OTHER_NEAR', 'OVERLAP']);
@@ -50,7 +50,7 @@ export const describe = (values) => {
  */
 export class UserVadState {
   constructor(config = {}) {
-    this.config = { ...USERVAD_DEFAULTS, ...config };
+    this.config = { ...USERVAD_DEFAULTS, ...config, window_ms: 1500 };
     this.reset();
   }
 
@@ -58,15 +58,13 @@ export class UserVadState {
    * 实时改参数。返回是否需要重新校准阈值——**换窗长就必须重校**。
    */
   configure(patch = {}) {
-    const before = this.config.window_ms;
     for (const [k, v] of Object.entries(patch)) {
+      if (k === 'window_ms') continue;
       if (k in this.config && Number.isFinite(Number(v))) this.config[k] = Number(v);
     }
     this.config.on_windows = Math.max(1, Math.round(this.config.on_windows));
     this.config.off_windows = Math.max(1, Math.round(this.config.off_windows));
-    const changed = this.config.window_ms !== before;
-    if (changed) this.calibrationStale = true;
-    return { config: { ...this.config }, window_changed: changed,
+    return { config: { ...this.config }, window_changed: false,
              recalibrate_hint: this.calibrationStale };
   }
 

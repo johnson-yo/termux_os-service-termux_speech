@@ -4,7 +4,7 @@
 本文列出的字段与语义是冻结面；未在本文出现的一律是内部实现，随时可能改名或消失。
 
 - Package: `github.termux-os.service.termux-speech`
-- Version: **0.24.1**
+- Version: **0.27.16**
 - Capability: **`speech.state`**（`kind: action`）
 - Schema: **`termux-os.speech-product-state.v1`**
   ⚠ 不是 `termux-os.speech-state.v1`——那个名字属于状态流的**信封**
@@ -132,6 +132,14 @@ idle → activity.active=true → transcription.status=incomplete（可能多个
 `backend` 是产生这一版文字的 backend，不能从当前设置倒推；切换期间仍以结果实际运行的 backend 为准。
 
 ---
+
+### `speech2`（state-hub 域，SPEECH17；⛔ 不属于 `public` 快照）
+
+Speech2 的 live transcript，经既有 `/state/ws` 推送（⛔ 不另起传输）：
+`available` / `boot_id` / `after_seq` / `current`（最近一条未完成）/ `live[]`
+（每句 `segment_id`、`revision`、`complete`、`text`、`speaker_role`、`history`）/ `counters`
+（`finals_admitted`、`revision_replaced`、`suppressed_stale|blank|error`、`boot_changes`、`truncated_gaps`）。
+⭐ provisional 只在这里；final 进 records（`source_kind=speech2`，`meta.speaker_role`）恰好一次。
 
 ## 5. 两个消费方示例
 

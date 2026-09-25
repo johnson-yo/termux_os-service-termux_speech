@@ -71,8 +71,10 @@ test('L10 只保留最新 10 个 epoch，且连 WAV 一起删',
  *   钉实现细节的测试，会在实现变得更正确时变红。现在钉的是意图本身：
  *   这条路上不许出现 `.json()`，头由上游决定。
  */
+// ⭐ WEBUI18：Lab 试听路由随旧产品面退役；WAV 透传 helper 仍服务 /records/audio，判据不变。
 test('L11 WAV 透传不走 JSON 代理（否则会以「解析失败」的形式失败）',
-  pkg.includes("context.routes.register('GET', '/acoustic-lab/audio'")
+  !pkg.includes("context.routes.register('GET', '/acoustic-lab/audio'")
+  && pkg.includes("context.routes.register('GET', '/records/audio'")
   && (() => {
     const helper = /const pipeWav = async \(req, res, url, label\) => \{[\s\S]*?\n  \};/.exec(pkg)?.[0];
     return Boolean(helper) && !helper.includes('.json()') && helper.includes("['content-type', 'Content-Type']");

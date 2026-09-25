@@ -14,6 +14,17 @@
 
 export const EMBEDDING_DIM = 192;
 
+/** CAM++ profile identity shared with the Android App's fixed-window path. */
+export const SPEAKER_ALGORITHM = Object.freeze({
+  model_id: 'campplus',
+  backend: 'htp',
+  embedding_contract: 'campplus-htp-t148-v1',
+  feature_protocol: 'campplus-kaldi-cmn-v1',
+  window_ms: 1500,
+  frames: 148,
+  aggregation: 'sentence-window-unique-coverage-v1',
+});
+
 export const PROFILE_DEFAULTS = Object.freeze({
   /**
    * ⚠ 这是个**默认值，不是调出来的值**，而且真机已经证明它对「另一个说话人」不够：
@@ -64,6 +75,9 @@ export const describe = (values) => {
 export class SpeakerProfile {
   constructor(config = {}) {
     this.config = { ...PROFILE_DEFAULTS, ...config };
+    this.algorithm = { ...SPEAKER_ALGORITHM };
+    this.legacy = false;
+    this.legacyReason = null;
     this.reset();
   }
 
@@ -75,7 +89,7 @@ export class SpeakerProfile {
   }
 
   reset() {
-    this.enrollments = [];       // { id, duration_ms, embedding(L2), at_ms }
+    this.enrollments = [];       // { id, duration_ms, embedding(L2), metadata, at_ms }
     this.reference = null;       // L2 归一化后的平均
     this.builtAtMs = null;
     this.pairwise = [];
@@ -92,6 +106,14 @@ export class SpeakerProfile {
       duration_ms: meta.duration_ms ?? null,
       embedding: unit,
       at_ms: Date.now(),
+      window_count: Number.isFinite(Number(meta.window_count)) ? Number(meta.window_count) : null,
+      valid_window_count: Number.isFinite(Number(meta.valid_window_count))
+        ? Number(meta.valid_window_count) : null,
+      vad_coverage: Number.isFinite(Number(meta.vad_coverage)) ? Number(meta.vad_coverage) : null,
+      inference_ms: Number.isFinite(Number(meta.inference_ms)) ? Number(meta.inference_ms) : null,
+      embedding_contract: meta.embedding_contract ?? this.algorithm.embedding_contract,
+      feature_protocol: meta.feature_protocol ?? this.algorithm.feature_protocol,
+      aggregation: meta.aggregation ?? this.algorithm.aggregation,
     });
     return { ok: true, count: this.enrollments.length };
   }
@@ -135,7 +157,7 @@ export class SpeakerProfile {
     return { ok: true };
   }
 
-  get ready() { return Array.isArray(this.reference); }
+  get ready() { return !this.legacy && Array.isArray(this.reference); }
 
   /**
    * 这份声纹的身份。⭐ 存在的理由只有一个：**阈值绑在 (声纹, 窗长) 上**，
@@ -197,20 +219,37 @@ export class SpeakerProfile {
 
   toJSON() {
     return {
-      version: 1,
+      version: 2,
       config: { ...this.config },
+      algorithm: { ...this.algorithm },
+      legacy: this.legacy,
+      legacy_reason: this.legacyReason,
       built_at_ms: this.builtAtMs,
       reference: this.reference,
       pairwise: this.pairwise,
       enrollments: this.enrollments.map((e) => ({
         id: e.id, duration_ms: e.duration_ms, at_ms: e.at_ms, embedding: e.embedding,
+        window_count: e.window_count, valid_window_count: e.valid_window_count,
+        vad_coverage: e.vad_coverage, inference_ms: e.inference_ms,
+        embedding_contract: e.embedding_contract, feature_protocol: e.feature_protocol,
+        aggregation: e.aggregation,
       })),
     };
   }
 
   static fromJSON(raw) {
     const p = new SpeakerProfile(raw?.config ?? {});
-    if (Array.isArray(raw?.reference) && raw.reference.length === EMBEDDING_DIM) {
+    const algorithm = raw?.algorithm;
+    const compatible = algorithm && Object.entries(SPEAKER_ALGORITHM).every(([key, expected]) => (
+      algorithm[key] === expected
+    ));
+    if (!compatible) {
+      p.legacy = true;
+      p.legacyReason = 'profile_algorithm_missing_or_incompatible';
+    } else {
+      p.algorithm = { ...SPEAKER_ALGORITHM };
+    }
+    if (!p.legacy && Array.isArray(raw?.reference) && raw.reference.length === EMBEDDING_DIM) {
       p.reference = raw.reference;
       p.builtAtMs = raw.built_at_ms ?? null;
       p.pairwise = Array.isArray(raw.pairwise) ? raw.pairwise : [];
@@ -218,7 +257,13 @@ export class SpeakerProfile {
     for (const e of raw?.enrollments ?? []) {
       if (Array.isArray(e?.embedding) && e.embedding.length === EMBEDDING_DIM) {
         p.enrollments.push({ id: e.id, duration_ms: e.duration_ms ?? null,
-                             embedding: e.embedding, at_ms: e.at_ms ?? null });
+          embedding: e.embedding, at_ms: e.at_ms ?? null,
+          window_count: e.window_count ?? null, valid_window_count: e.valid_window_count ?? null,
+          vad_coverage: e.vad_coverage ?? null, inference_ms: e.inference_ms ?? null,
+          embedding_contract: e.embedding_contract ?? null,
+          feature_protocol: e.feature_protocol ?? null,
+          aggregation: e.aggregation ?? null,
+        });
       }
     }
     return p;
@@ -244,6 +289,9 @@ export class SpeakerProfile {
       pairwise: describe(this.pairwise),
       config: { ...this.config },
       embedding_dim: EMBEDDING_DIM,
+      algorithm: { ...this.algorithm },
+      legacy: this.legacy,
+      legacy_reason: this.legacyReason,
     };
   }
 }

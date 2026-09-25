@@ -8,9 +8,10 @@
  */
 
 export class UpstreamError extends Error {
-  constructor(message, status = 502, { retryable = false, retryAfterMs = null } = {}) {
+  constructor(message, status = 502, { retryable = false, retryAfterMs = null, details = null } = {}) {
     super(message);
     this.status = status;
+    this.details = Array.isArray(details) ? details : null;
     // 「还没好」不是「坏了」。App 侧 503 有两个来源，都必须原样重试而不是记为失败：
     // 常驻图在 worker 重生后尚未对账完成（docs/051 §5.4），以及有界准入 Semaphore(8)
     // 拒绝过载（docs/051 §4.3）。把它压成 502 会让调用方放弃并上报错误。
@@ -80,6 +81,7 @@ export async function appJson(descriptor, path, {
     throw new UpstreamError(message, status, {
       retryable,
       retryAfterMs: retryable ? retryAfterFrom(message) : null,
+      details: payload?.details,
     });
   }
   return payload.data;

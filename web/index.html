@@ -1,15 +1,22 @@
 <!--
   SPDX-License-Identifier: Apache-2.0
-  [INPUT]: Browser Session APIs/WS for health, listen mode, RMS/VAD/ASR, state bus, and transcripts.
-  [OUTPUT]: Three phone-first product pages — Overview, Settings, My Voice.
-  [POS]: Package-owned control page; it renders metadata only and never receives PCM or credentials.
-  [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+  [INPUT]: Browser Session routes /speech2/* (overview, policy, start/stop, input, history, voices)
+           and the `speech2` + `memory` domains of the existing /state/ws stream; package assets use
+           the installed `/packages/<package-id>/` base so the no-trailing-slash entry resolves.
+  [OUTPUT]: Speech product pages: Overview / History / Settings plus the compact shared Header
+            (MEM/ZRAM and live Speech/Input/stream/Trigger/Scene/Models facts) and 60-second LIVE
+            timeline with fixed current-provisional/latest-final sentence slots. Overview combines run state/actions and listening preferences in one card;
+            History reuses RecordGroups + SQLite archive; Settings owns voices and advanced policy.
+  [POS]: Package-owned control page; it renders App-authored facts only and never receives PCM or
+         credentials. A raw policy editor exists only under ?dev=1 (never a product tab).
+  [PROTOCOL]: Update this header when changed, then check AGENTS.md and public-files.txt.
 -->
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<base href="/packages/github.termux-os.service.termux-speech/">
 <title>Termux Speech</title>
 <link rel="stylesheet" href="style.css">
 </head>
@@ -18,439 +25,249 @@
   <header>
     <h1 class="brand-title">Termux<br>Speech</h1>
     <div class="header-panel header-info">
-      <!-- Row 1: 左 MEM，右 ZRAM -->
-      <div id="mem-avail" class="mem-cols" title="实时可用内存（参考值）"></div>
-      <!-- Row 2: 状态多列指示网格（Label 上，Value/Dot 下，列间有分隔线） -->
+      <div id="mem-avail" class="mem-cols" title="Live available memory (reference)"></div>
       <div class="status-panel">
-        <!--
-          ⭐ 这六格的**每一个值**都来自 `app_pipeline` 域（App effective + App runtime），
-             ⛔ 不再读 `lifecycle.chain` / `pipeline.owner` / `listen.engaged` / `asr.model`。
-          ⚠ 那四个旧来源描述的是**已经不在跑**的执行体：真机上 `lifecycle.chain` 恒为
-             `stopped` 而 App pipeline 正在 `running`，于是 Header 说"语音链已停止"、
-             Overview 说"运行中"——同一页面两个答案。
-        -->
         <div class="status-col">
-          <span class="status-lbl">语音链</span>
-          <span id="st-dot-chain" class="status-dot off" title="正在读取 App pipeline…"></span>
+          <span class="status-lbl">Speech</span>
+          <span id="st-dot-speech2" class="status-dot off" title="Reading Speech..."></span>
         </div>
         <div class="status-col">
-          <span class="status-lbl">收音</span>
-          <span id="st-dot-mic" class="status-dot off" title="正在读取麦克风状态…"></span>
+          <span class="status-lbl">Input</span>
+          <span id="st-dot-input" class="status-dot off" title="Reading input source..."></span>
         </div>
         <div class="status-col">
-          <span class="status-lbl">实时状态</span>
-          <span id="st-dot-live" class="status-dot warn" title="连接中"></span>
+          <span class="status-lbl">Live state</span>
+          <span id="st-dot-live" class="status-dot warn" title="Connecting..."></span>
         </div>
         <div class="status-col">
-          <span class="status-lbl">触发</span>
-          <span id="st-val-gate" class="status-val text-good" title="触发层：正在读取…">—</span>
+          <span class="status-lbl">Trigger</span>
+          <span id="st-val-trigger" class="status-val text-muted">—</span>
         </div>
         <div class="status-col">
-          <span class="status-lbl">断句</span>
-          <span id="st-val-vad" class="status-val text-good" title="断句层：正在读取…">—</span>
+          <span class="status-lbl">Scene</span>
+          <span id="st-val-scene" class="status-val text-muted">—</span>
         </div>
         <div class="status-col">
-          <span class="status-lbl">转录</span>
-          <span id="st-val-asr" class="status-val text-good" title="转录层：正在读取…">—</span>
+          <span class="status-lbl">Models</span>
+          <span id="st-val-models" class="status-val text-muted">—</span>
         </div>
       </div>
     </div>
-    <!-- 兼容测试保留节点（隐藏） -->
-    <span id="pipeline-live" hidden aria-hidden="true">CONNECTING</span>
-    <p id="pipeline-note" hidden aria-hidden="true">正在读取 Live 状态…</p>
   </header>
 
-  <nav class="tabs" role="tablist" aria-label="Termux Speech 页面">
+  <nav class="tabs" role="tablist" aria-label="Termux Speech pages">
     <button class="tab" role="tab" data-page="overview" aria-controls="page-overview">Overview</button>
+    <button class="tab" role="tab" data-page="history" aria-controls="page-history">History</button>
     <button class="tab" role="tab" data-page="settings" aria-controls="page-settings">Settings</button>
-    <button class="tab" role="tab" data-page="voice" aria-controls="page-voice">My Voice</button>
   </nav>
 
   <p id="region-failures" class="message bad" hidden></p>
 
   <!-- ============================================================
-       Overview：只读事实。RMS → VAD → ASR 的当前状态全部在这里。
+       Overview — the Speech run page.
        ============================================================ -->
   <section class="page" id="page-overview" role="tabpanel" hidden>
-    <!--
-      三层 Pipeline（docs/096/097）。⭐ 每次切换 merge 三层后**一次 PUT**，⛔ 不再分别调三个旧 API。
-      ⚠ 这里曾经沿用 `.ov-mode-tablist`——那是给「自动转录 | 手动转录 | 停止」三个**按钮**用的
-        38px 高、三等分网格。塞进三个带 label 的 select 之后，44px 的全局 select 最小高度
-        与 label 的 margin 一起把它撑破，而状态字被挤成第四列。
-        ⭐ **控件换了，容器就得换**：现在是三列 selector + 独立一行的状态字。
-    -->
-    <div class="ov-pipe-row" role="group" aria-label="三层 Pipeline">
-      <label class="ov-pipe"><span>触发</span>
-        <select id="pipe-trigger">
-          <option value="stop">停止</option>
-          <option value="passthrough">直通</option>
-          <option value="volume">音量</option>
-          <option value="clap">拍掌</option>
-        </select></label>
-      <label class="ov-pipe"><span>断句</span>
-        <select id="pipe-segment">
-          <option value="fireredvad">FireRedVAD</option>
-          <option value="fireredvad_camplus">FR + CAM++</option>
-        </select></label>
-      <label class="ov-pipe"><span>转录</span>
-        <select id="pipe-asr">
-          <option value="sensevoice">SenseVoice</option>
-        </select></label>
-    </div>
-    <p id="pipe-state" class="ov-pipe-state">—</p>
-
-    <!-- ⭐ 「门永远不会开」必须说在使用者真的在看的那一页上。
-         ⚠ 它与「一切正常，只是没人说话」在界面上原本长得一模一样。 -->
-    <p id="ov-gate-blocked" class="message bad" hidden></p>
-
-    <!-- ⭐ 「断句层挂了」必须说在这一页上。
-         ⚠ 真机 SSR 事故：running/admitted/loaded/health 四个全为真、四个绿灯全亮，
-            而每一次图执行都失败——它与「一切正常，只是没人说话」原本长得一模一样。 -->
-    <p id="ov-segment-stalled" class="message bad" hidden></p>
-
-    <!--
-      三层流水线状态条：[触发] -(N%)- [断句](Ns) -(N%)- [转录]
-      ⭐ 视觉结构一格没动，⛔ 但三个节点的名字**不再写死**成 RMS/VAD/ASR——
-         它们是 effective pipeline 的三层，名字随选择变（直通 / FireRedVAD / SenseVoice）。
-      ⚠ id 保持不变（`gn-rms`/`gn-vad`/`gn-asr`）：它们是**位置**的名字不是内容的名字，
-         改 id 只会让每一处引用同步失败而不带来任何澄清。
-    -->
-    <div class="gate-flow-container">
-      <div class="gate-flow" id="gate-flow">
-        <div class="gate-slot slot-left">
-          <span class="gate-box active" id="gn-rms">触发</span>
-        </div>
-        <div class="gate-slot slot-conn">
-          <span class="gate-dash">-</span>
-          <span class="gate-ratio" id="gr-rms">(0%)</span>
-          <span class="gate-dash">-</span>
-        </div>
-        <div class="gate-slot slot-center">
-          <span class="gate-box" id="gn-vad">
-            <span class="gate-name">断句</span><span class="gate-countdown" id="gc-vad">(—)</span>
-          </span>
-        </div>
-        <div class="gate-slot slot-conn">
-          <span class="gate-dash">-</span>
-          <span class="gate-ratio" id="gr-cam">(0%)</span>
-          <span class="gate-dash">-</span>
-        </div>
-        <div class="gate-slot slot-right">
-          <span class="gate-box" id="gn-asr">转录</span>
+    <section class="card ov-controls" id="ov-controls" aria-label="Speech listening controls">
+      <div class="section-title ov-run-row">
+        <h2 id="ov-state-text">Stopped</h2>
+        <span id="ov-state" class="badge" hidden>—</span>
+        <div class="actions ov-run">
+          <button id="ov-start" type="button" class="primary">Start listening</button>
+          <button id="ov-stop" type="button" class="danger" hidden>Stop</button>
         </div>
       </div>
-    </div>
-
-    <!-- RMS 能量与 CAM++ 声纹复合时序图表 -->
-    <section class="card" id="card-cam-top">
-      <div class="section-title">
-        <div>
-          <h2>LIVE</h2>
-        <p id="cam-off" class="note">RMS · CAM++ / FireRedVAD · 1秒/柱</p>
-        </div>
-        <span id="cam-now" class="badge">—</span>
+      <p id="ov-warn-input" class="message bad" hidden></p>
+      <p id="ov-warn-voice" class="message warn" hidden></p>
+      <p id="ov-error" class="message bad" hidden></p>
+      <p id="ov-note" class="message" aria-live="polite"></p>
+      <label class="ov-pipe"><span>Mode</span>
+        <select id="ov-scene" aria-label="Mode">
+          <option value="VOICE_INPUT">Voice input</option><option value="CONVERSATION">Conversation</option>
+          <option value="MEDIA_STREAM">Media stream</option><option value="AI_BARGE_IN">AI barge-in</option>
+          <option value="MEDIA_FILE">Media file</option>
+        </select></label>
+      <label class="ov-pipe"><span>Activation</span>
+        <select id="ov-trigger" aria-label="Activation">
+          <option value="volume">Voice activated</option><option value="passthrough">Always listening</option>
+        </select></label>
+      <div id="ov-target-wrap" hidden>
+        <label for="ov-target">Listen for</label>
+        <select id="ov-target" aria-label="Target voice"></select>
+        <p id="ov-target-empty" class="note" hidden>No voice profile yet.</p>
+        <button id="ov-setup-voice" class="secondary" type="button" hidden>Set up My Voices</button>
       </div>
-      <div class="cam-plot" id="cam-plot">
-        <i class="rms-threshold-line" id="rms-threshold-line" title="RMS 开门阈值 (100%)"></i>
-        <i class="cam-threshold" id="cam-threshold" title="CAM++ 阈值"></i>
-        <div class="cam-history" id="ov-cam-history"></div>
-      </div>
-      <!-- 隐藏兼容测试钩子 -->
-      <span id="cam-live" hidden></span>
-      <span id="cam-owner" hidden></span>
+      <p id="ov-mode-note" class="note" aria-live="polite"></p>
     </section>
-
-    <!-- 兼容保留隐藏节点（已移除冗余可见卡片与迁移控件） -->
-    <div hidden aria-hidden="true">
-      <span id="pd-service-note"></span>
-      <span id="pd-service-badge"></span>
-      <span id="pd-resident"></span>
-      <span id="pd-manual"></span>
-      <span id="pd-asr"></span>
-      <span id="ready-badge"></span>
-      <ul id="diag-summary"></ul>
-      <span id="act-hint"></span>
-      <span id="act-badge"></span>
-      <div id="act-meter"><div id="act-fill"></div></div>
-      <span id="act-who"></span>
-      <span id="rms-current"></span>
-      <span id="rms-avg"></span>
-      <span id="rms-peak"></span>
-      <span id="rms-threshold"></span>
-      <span id="rms-admission"></span>
-      <span id="rms-cam-countdown"></span>
-      <div class="rms-bar"><div id="rms-fill"></div><i id="rms-open-marker"></i><b id="rms-bar-value"></b></div>
-      <span id="vad-note"></span>
-      <span id="vad-mode"></span>
-      <span id="vad-state"></span>
-      <span id="vad-owner"></span>
-      <span id="vad-live"></span>
-      <span id="vad-probability"></span>
-      <span id="vad-countdown"></span>
-      <span id="vad-wav-total"></span>
-      <div class="vad-meter"><div id="vad-fill"></div><b id="vad-live-label"></b></div>
-      <span id="vad-last-wav"></span>
-      <span id="vad-last-wav-detail"></span>
-      <span id="vad-drops"></span>
-      <span id="vad-drop-detail"></span>
-      <span id="input-note"></span>
-      <span id="input-state"></span>
-      <span id="asr-owner"></span>
-      <span id="asr-countdown"></span>
-      <span id="asr-total"></span>
-      <span id="asr-ws"></span>
-      <span id="tx-live-meta"></span>
-      <div id="asr-model-facts"></div>
-      <button id="copy-latest" type="button"></button>
-      <input id="res-enabled" type="checkbox">
-      <span id="res-badge"></span>
-      <span id="res-state"></span>
-      <span id="res-profile"></span>
-      <a id="res-enroll" href="#voice"></a>
-      <span id="man-badge"></span>
-      <span id="man-state"></span>
-      <span id="man-text"></span>
-      <span id="ac-badge"></span>
-      <span id="chain-state"></span>
-      <span id="chain-detail"></span>
-      <div id="ac-facts"></div>
-      <button id="ac-chain" type="button"></button>
-      <span id="ac-note"></span>
-      <span id="chain-note"></span>
-      <strong id="ov-capture"></strong>
-      <strong id="ov-dictation"></strong>
-      <span id="spkgate-badge"></span>
-      <input id="spkgate-enabled" type="checkbox">
-      <strong id="spkgate-authority"></strong>
-      <strong id="spkgate-profile"></strong>
-      <strong id="spkgate-calib"></strong>
-      <strong id="spkgate-state"></strong>
-      <span id="spkgate-warning"></span>
-      <span id="spkgate-note"></span>
-    </div>
-
-    <section class="card asr-card" id="diag-asr">
-      <div class="section-title">
-        <div><h2>ASR转录</h2><p id="asr-note" class="note asr-queue-note">□ □ □ □ □</p></div>
-        <div class="badge-stack"><span id="asr-state" class="badge">STANDBY</span><span id="asr-precision" class="badge tag">—</span></div>
+    <section class="card" id="card-live">
+      <div class="section-title"><h2>LIVE</h2><span id="live-now" class="badge">—</span></div>
+      <div class="s2-live-meters" aria-label="Current listening levels">
+        <div><div class="s2-live-meter-head"><span>Sound</span><strong id="live-rms-value">—</strong></div><div class="s2-live-meter"><i id="live-rms-meter"></i></div></div>
+        <div><div class="s2-live-meter-head"><span>Speech</span><strong id="live-fr-value">—</strong></div><div class="s2-live-meter firered"><i id="live-fr-meter"></i></div></div>
+        <div><div class="s2-live-meter-head"><span id="live-cam-name">Voice match</span><strong id="live-cam-value">—</strong></div><div class="s2-live-meter cam"><i id="live-cam-meter"></i></div></div>
       </div>
-      <div class="transcript-fact live-fact"><span>正在识别</span><strong id="ov-current">等待语音…</strong></div>
-      <div class="tx-history-section">
-        <ul id="tx-history-list" class="tx-history-list"></ul>
+      <div class="live-transcript-lines" id="live-speech-lines" aria-label="Live sentences">
+        <div class="live-transcript-line"><span>Current sentence</span> <strong id="live-current-half" aria-live="polite">Waiting for speech…</strong></div>
+        <div class="live-transcript-line"><span>Previous sentence</span> <strong id="live-previous-final" aria-live="polite">No completed sentence yet.</strong></div>
+      </div>
+      <p id="live-summary" class="note" aria-live="polite">Waiting for sound…</p>
+      <p id="live-legend" class="note">One-second bars · last 60 seconds</p>
+      <div class="cam-plot" id="live-plot" aria-label="Last 60 seconds of Sound, FireRedVAD, and CAM cosine">
+        <i class="rms-threshold-line" id="rms-threshold-line" title="Volume trigger threshold (100%)"></i>
+        <div class="cam-history" id="live-history"></div>
       </div>
     </section>
   </section>
 
+  <section class="page" id="page-history" role="tabpanel" hidden>
+    <section class="card">
+      <div class="section-title"><div><h2>History</h2><p id="history-note" class="note">—</p></div></div>
+      <ul id="history-list" class="tx-history-list" aria-live="polite"></ul>
+      <button id="history-more" type="button" class="secondary" hidden>Load more</button>
+    </section>
+  </section>
+
   <!-- ============================================================
-         Settings：Product Policy、ASR/Models、Audio Input/Lifecycle 三个产品分组。
+       Settings — USER voice collection, Speech policy, input source, models.
        ============================================================ -->
   <section class="page" id="page-settings" role="tabpanel" hidden>
-
-    <!-- ============================================================
-         策略参数（policy）—— ⭐ **这张卡就是 speech-policy.json**。
-         每一个可调项在这里出现**一次**，⛔ 不在别处再放一个入口：
-         两个入口写同一个字段，迟早会各说各的，而症状是「改了没用」。
-         保存 = 一次完整 PUT（generation+1），⛔ 不是逐字段 setter。
-         ============================================================ -->
-    <details class="card settings-group" id="card-policy">
-      <summary>策略参数（policy）</summary>
-      <div class="settings-inner">
-        <p class="note">调整后保存；需要等到下一段语音的参数会在边界处生效。</p>
-
-        <!-- ============================================================
-             ⭐ **三层 Pipeline 就是 Settings 的骨架**（docs/097 §十一）。
-             旧结构是「开门 / 说话人 / 语音检测 / 分段」四段，那是执行体还在本包时的分法；
-             现在执行体在 App，可选的东西只有三层 + 每层的参数。
-             ⚠ 三个 selector 与 Overview 顶部那三个是**同一个控件的两个视图**：
-               同一个渲染器写、同一个 PUT 写回。⛔ 不是"两个入口写同一个字段"——
-               那正是 `gate.mode=音量` 与 `pipeline.trigger=直通` 各说各话的来源。
-             ============================================================ -->
-        <h2>触发（trigger）</h2>
-        <label for="set-pipe-trigger">触发方式</label>
-        <select id="set-pipe-trigger">
-          <option value="stop">停止</option>
-          <option value="passthrough">直通</option>
-          <option value="volume">音量</option>
-          <option value="clap">拍掌</option>
-        </select>
-        <p id="trg-note" class="message"></p>
-        <p id="set-trigger-current" class="hint">当前运行：读取中…</p>
-        <label for="open-threshold">音量阈值</label>
-        <div class="gate-field"><input id="open-threshold" type="range" min="0.001" max="0.200" step="0.001"><input id="open-number" type="number" min="0.001" max="1" step="0.001" inputmode="decimal"></div>
-        <div class="config-grid">
-          <div><label for="pol-gate-frames">连续几帧越线才开门</label><input id="pol-gate-frames" type="number" min="1" max="20" step="1" inputmode="numeric"></div>
-          <div><label for="pol-gate-tol">拍掌容许度</label><select id="pol-gate-tol"><option value="strict">strict（严）</option><option value="standard">standard</option><option value="loose">loose（松）</option></select></div>
-        </div>
-
-        <h2>断句（segment）</h2>
-        <label for="set-pipe-segment">断句方式</label>
-        <select id="set-pipe-segment">
-          <option value="fireredvad">FireRedVAD</option>
-          <option value="fireredvad_camplus">FireRedVAD + CAM++（本人过滤）</option>
-        </select>
-        <p id="set-segment-current" class="hint">当前运行：读取中…</p>
-        <p id="vad-model-hint" class="hint">模型依赖按当前 Pipeline 判断。</p>
-        <div class="config-grid">
-          <div><label for="pol-seg-head">句首回溯 ms</label><input id="pol-seg-head" type="number" min="0" max="3000" step="50" inputmode="numeric"></div>
-          <div><label for="pol-seg-tail">句尾保留 ms</label><input id="pol-seg-tail" type="number" min="0" max="2000" step="50" inputmode="numeric"></div>
-          <div><label for="pol-seg-grace">续句等待 ms</label><input id="pol-seg-grace" type="number" min="0" max="4000" step="100" inputmode="numeric"></div>
-          <!-- ⭐ 硬切时长：**两个句尾方案共用**，同时也是阶梯曲线的终点（docs/098）。
-               ⚠ 它曾经是代码里写死的 15 秒，于是「切得太长」没有任何旋钮可调。 -->
-          <div><label for="pol-seg-hardcap">硬切时长 ms</label><input id="pol-seg-hardcap" type="number" min="2000" max="20000" step="500" inputmode="numeric"></div>
-        </div>
-
-        <h3 class="sub-h">FireRedVAD 句尾判定</h3>
-        <p id="set-vad-end-hint" class="hint">只在断句方式为 FireRedVAD 时生效；CAM++ 的句尾由说话人判定给出。</p>
-        <label for="pol-vad-endmode">句尾方案</label>
-        <select id="pol-vad-endmode">
-          <option value="hangover">固定悬停（最后一个语音帧 + 悬停）</option>
-          <option value="stepped">阶梯式悬停（先松后紧 · 回选停顿谷）</option>
-        </select>
-        <p id="vad-end-note" class="hint"></p>
-        <div class="config-grid">
-          <div><label for="pol-vad-hangover">固定悬停 ms</label><input id="pol-vad-hangover" type="number" min="100" max="3000" step="100" inputmode="numeric"></div>
-          <div><label for="pol-vad-hgmax">阶梯起点（松）ms</label><input id="pol-vad-hgmax" type="number" min="100" max="3000" step="100" inputmode="numeric"></div>
-          <div><label for="pol-vad-hgmin">阶梯终点（紧）ms</label><input id="pol-vad-hgmin" type="number" min="100" max="3000" step="100" inputmode="numeric"></div>
-          <div><label for="pol-vad-pressure">压力起点 ms</label><input id="pol-vad-pressure" type="number" min="0" max="10000" step="100" inputmode="numeric"></div>
-        </div>
-        <p class="hint">阶梯刻度固定 100 ms —— 它是 PCM 帧(100 ms)与 FireRedVAD 帧(10 ms)的最小公倍数，两个时钟都能精确表达。</p>
-
-        <h3 class="sub-h">CAM++ 本人过滤参数</h3>
-        <p id="speaker-model-hint" class="hint">模型依赖按当前 Pipeline 判断。</p>
-        <p id="set-camplus-idle" class="hint" hidden>当前未开启 CAM++ 本人过滤，这几项此刻不生效；改了仍会保存。</p>
-        <div class="config-grid">
-          <div><label for="pol-spk-enter">进入阈值</label><input id="pol-spk-enter" type="number" min="-1" max="1" step="0.01" inputmode="decimal"></div>
-          <div><label for="pol-spk-exit">退出阈值</label><input id="pol-spk-exit" type="number" min="-1" max="1" step="0.01" inputmode="decimal"></div>
-          <div><label for="pol-spk-encf">进入确认窗数</label><input id="pol-spk-encf" type="number" min="1" max="10" step="1" inputmode="numeric"></div>
-          <div><label for="pol-spk-excf">退出确认窗数</label><input id="pol-spk-excf" type="number" min="1" max="10" step="1" inputmode="numeric"></div>
-          <div><label for="pol-spk-window">窗长 ms</label><input id="pol-spk-window" type="number" min="500" max="4000" step="50" inputmode="numeric"></div>
-          <div><label for="pol-spk-step">窗步进 ms</label><input id="pol-spk-step" type="number" min="100" max="1000" step="10" inputmode="numeric"></div>
-          <div><label for="pol-spk-headmode">句首模式</label><select id="pol-spk-headmode"><option value="trim">trim（按位移裁）</option><option value="safe">safe（不裁）</option></select></div>
-          <div><label for="pol-spk-usertimeout">关门倒计时 ms</label><input id="pol-spk-usertimeout" type="number" min="2000" max="120000" step="500" inputmode="numeric"></div>
-        </div>
-        <p class="hint">每次确认说话都会重置倒计时。</p>
-
-        <h2>历史音频（history）</h2>
-        <p class="note">App 音频上限是安全上限，不是归档保留数量。建议保持 200；过低可能提前删除未归档录音。</p>
-        <label for="pol-hist-keep">App 音频上限（条）</label>
-        <input id="pol-hist-keep" type="number" min="0" max="500" step="10" inputmode="numeric">
-
-        <div id="policy-facts" class="facts vc-facts"></div>
-        <div class="form-actions">
-          <p id="policy-note" class="message"></p>
-          <button id="policy-reload" type="button" class="secondary">放弃修改</button>
-          <button id="policy-save" type="button" class="primary">保存策略</button>
-        </div>
-      </div>
-    </details>
-
-    <details class="card settings-group" open>
-      <summary>ASR</summary>
-      <form id="form-daily" class="settings-inner">
-        <!-- ⭐ 与 Overview 的「转录」是同一个控件：同一份 effective 写、同一个 Pipeline PUT 写回。
-             ⛔ 不再有第二个真相（旧 `asr.model` 字段）。 -->
-        <label for="asr-model">转写模型</label>
-        <select id="asr-model"><option value="sensevoice">SenseVoice</option></select>
-        <p id="asr-model-note" class="message"></p>
-        <p id="set-asr-current" class="hint">当前运行：读取中…</p>
-        <p id="asr-model-dependency" class="hint">模型需求会跟随当前 Pipeline。</p>
-        <label for="asr-language">识别语言<em class="when">即时生效</em></label>
-        <select id="asr-language"><option value="auto">自动</option><option value="zh">普通话</option><option value="yue">粤语</option><option value="en">English</option><option value="ja">日本語</option><option value="ko">한국어</option></select>
-        <div class="form-actions"><p id="daily-note" class="message"></p><button id="save-daily" type="submit">保存 ASR 设置</button></div>
-      </form>
-    </details>
-
-    <details class="card settings-group" id="card-audio-input" open>
-      <summary>Audio 输入 / Lifecycle</summary>
-      <section class="settings-inner">
-        <h2>Audio 输入</h2><p id="connection-note" class="note">正在连接 Android App…</p>
-        <p class="hint">这里管理麦克风来源与收音生命周期。</p>
-        <!-- ⚠ 「PCM 直连」这一格已删：新架构下 PCM 从不离开 App，本包那条 WS 不再是产品路径，
-             把它摆在使用者面前只会让一个必然「等待鉴权」的字段看起来像故障。
-             ⛔ 只删界面事实，App 的麦克风架构一个字节没动。节点作为兼容钩子隐藏保留。 -->
-        <div class="facts input-facts"><div><span>当前配置</span><strong id="selected">—</strong></div><div><span>实际路由</span><strong id="routed">—</strong></div><div><span>永久收音</span><strong id="mic-persistent">—</strong></div><div><span>麦克风持有者</span><strong id="mic-holders">—</strong></div></div>
-        <span id="pcm-state" hidden aria-hidden="true"></span>
-        <label for="input-device">输入设备<em class="when">即时生效</em></label><select id="input-device" aria-label="选择 Input Device"><option value="system_default">系统默认</option></select>
-        <label>永久收音<em class="when">跨停链与重启</em></label><p class="note">只想用语音链不需要开启；它由你明确关闭。</p>
-        <div class="actions"><button id="enable" type="button">开启永久收音</button><button id="disable" class="danger" type="button">关闭永久收音</button></div><p id="action-note" class="message"></p>
-        <button id="refresh" class="secondary" type="button">刷新配置</button>
-      </section>
-    </details>
-
-    <details class="card settings-group" id="card-models-wrap">
-      <summary>模型需求</summary>
-      <div id="card-models"><div class="section-title"><div><h2>模型需求</h2><p class="note">这里显示当前 Pipeline（触发 → 断句 → 转录）实际需要的模型。</p></div><button id="models-refresh" type="button" class="ghost">刷新</button></div><p id="models-summary" class="message"></p><p id="models-freshness" class="note"></p><a id="models-manager-link" class="secondary" href="#" target="_blank" rel="noopener" hidden>模型管理</a><div id="models-list" class="model-list"></div></div>
-    </details>
-  </section>
-
-  <!-- ============================================================
-       My Voice：只处理身份与 enrollment，不承载 CAM 监测或校准图表。
-       ============================================================ -->
-  <section class="page" id="page-voice" role="tabpanel" hidden>
     <section class="card" id="card-voice">
       <div class="section-title">
         <div>
-          <h2>登记我的声音 <span id="vc-badge" class="badge">—</span></h2>
+          <h2>My Voices <span id="vc-badge" class="badge">—</span></h2>
           <p id="vc-note" class="note">—</p>
         </div>
       </div>
       <p class="note" id="vc-error" hidden></p>
       <div id="vc-facts" class="facts vc-facts"></div>
-
-      <!-- 4 个操作按钮一字排开：录制、生成、测试、重置 -->
-      <div class="actions vc-global-actions">
-        <button id="vc-start" type="button" class="primary">录制</button>
-        <button id="vc-build" type="button" class="primary" disabled>生成</button>
-        <button id="vc-test" type="button" class="primary" disabled>测试</button>
-        <button id="vc-clear" type="button" class="danger" disabled>重置</button>
-        <!-- 协议与测试保留元素（隐藏） -->
-        <button id="vc-stop" type="button" hidden aria-hidden="true"></button>
-        <button id="vc-enable" type="button" hidden aria-hidden="true"></button>
-        <span id="vc-mode" hidden aria-hidden="true"></span>
-        <span id="vc-enroll-note" hidden aria-hidden="true"></span>
-      </div>
-
-      <!-- 录音样本明细 -->
+      <label for="vc-duration">Recording length</label>
+      <select id="vc-duration">
+        <option value="5000">5 s</option>
+        <option value="8000" selected>8 s</option>
+        <option value="12000">12 s</option>
+      </select>
+      <label for="vc-label">New voice label</label>
+      <input id="vc-label" type="text" maxlength="64" autocomplete="off" placeholder="e.g. Yang">
+      <div class="actions vc-global-actions"><button id="vc-add" type="button" class="primary">+ Add voice</button></div>
+      <ul id="vc-voices" class="vc-voice-list" aria-label="Registered voices"></ul>
       <div class="vc-clips-section">
         <div class="step-header">
-          <span class="vc-record-title">已录样本</span>
+          <span class="vc-record-title">Recording job</span>
         </div>
         <ul id="vc-clips" class="clip-list"></ul>
       </div>
     </section>
 
-    <!-- ============================================================
-         拍手手势：与声纹并列的第二种身份/触发方式。
-         ⭐ 判定与模板全在 App 内（高频音频不出 App），这一页只是低频控制面。
-         ============================================================ -->
-    <section class="card" id="card-clap">
-      <div class="section-title">
-        <div>
-          <h2>拍手手势 <span id="cl-badge" class="badge">—</span></h2>
-          <p id="cl-note" class="note">—</p>
+    <details class="card advanced-group" id="card-advanced">
+      <summary>Advanced</summary>
+    <details class="card settings-group" id="card-policy">
+      <summary>Speech policy</summary>
+      <div class="settings-inner">
+        <p class="note">Every editable value below is sent through the complete App policy and has a runtime consumer. Trigger mode and Scene also remain on Overview.</p>
+        <h2>Trigger</h2>
+        <label for="pol-trigger-mode">Mode</label>
+        <select id="pol-trigger-mode" aria-label="Speech trigger mode">
+          <option value="volume">Volume (one-time latch)</option>
+          <option value="passthrough">Passthrough</option>
+        </select>
+        <p class="note">Stop is the run-state control on Overview. The first gate is held until Stop/Start.</p>
+        <h2>Volume trigger</h2>
+        <label for="pol-volume-window">RMS window (ms)</label>
+        <input id="pol-volume-window" type="number" min="10" max="1000" step="10" inputmode="numeric">
+        <label for="pol-volume-threshold">Volume threshold</label>
+        <div class="gate-field"><input id="pol-volume-range" type="range" min="0.001" max="0.200" step="0.001"><input id="pol-volume-threshold" type="number" min="0.001" max="1" step="0.001" inputmode="decimal"></div>
+        <label for="pol-volume-frames">Consecutive RMS windows to open</label>
+        <input id="pol-volume-frames" type="number" min="1" max="20" step="1" inputmode="numeric">
+        <label for="pol-pre-roll">FireRed pre-roll (ms)</label>
+        <input id="pol-pre-roll" type="number" min="0" max="2000" step="10" inputmode="numeric">
+        <h2>CAM++ identity</h2>
+        <div class="gate-field"><label for="pol-cam-enter">Enter threshold</label><input id="pol-cam-enter" type="number" min="0" max="1" step="0.01" inputmode="decimal"></div>
+        <div class="gate-field"><label for="pol-cam-exit">Exit threshold</label><input id="pol-cam-exit" type="number" min="0" max="1" step="0.01" inputmode="decimal"></div>
+        <div class="gate-field"><label for="pol-cam-enter-confirm">Enter confirms</label><input id="pol-cam-enter-confirm" type="number" min="1" max="20" step="1" inputmode="numeric"></div>
+        <div class="gate-field"><label for="pol-cam-exit-confirm">Exit confirms</label><input id="pol-cam-exit-confirm" type="number" min="1" max="20" step="1" inputmode="numeric"></div>
+        <p id="pol-cam-geometry" class="note">CAM window/step are fixed by the installed HTP tensor; loading effective geometry…</p>
+        <h2>FireRed VAD / segmentation</h2>
+        <label for="pol-vad-threshold">Speech posterior threshold</label>
+        <input id="pol-vad-threshold" type="number" min="0" max="1" step="0.01" inputmode="decimal">
+        <div class="gate-field"><label for="pol-vad-smooth">Smoothing frames (10 ms each)</label><input id="pol-vad-smooth" type="number" min="1" max="50" step="1" inputmode="numeric"></div>
+        <div class="gate-field"><label for="pol-vad-min-speech">Minimum speech frames (10 ms each)</label><input id="pol-vad-min-speech" type="number" min="1" max="100" step="1" inputmode="numeric"></div>
+        <label for="pol-vad-end-mode">Gap handling</label>
+        <select id="pol-vad-end-mode"><option value="stepped">Stepped gap (reversible HALF)</option><option value="hangover">Fixed hangover</option></select>
+        <div class="gate-field"><label for="pol-vad-hangover">Fixed hangover (ms)</label><input id="pol-vad-hangover" type="number" min="100" max="3000" step="100" inputmode="numeric"></div>
+        <div class="gate-field"><label for="pol-vad-hangover-max">Stepped initial hangover (ms)</label><input id="pol-vad-hangover-max" type="number" min="100" max="3000" step="100" inputmode="numeric"></div>
+        <div class="gate-field"><label for="pol-vad-hangover-min">Stepped final hangover (ms)</label><input id="pol-vad-hangover-min" type="number" min="100" max="3000" step="100" inputmode="numeric"></div>
+        <div class="gate-field"><label for="pol-vad-pressure">Stepping begins after (ms)</label><input id="pol-vad-pressure" type="number" min="0" max="7900" step="100" inputmode="numeric"></div>
+        <div class="gate-field"><label for="pol-vad-final-confirm">HALF→FULL confirmation (ms)</label><input id="pol-vad-final-confirm" type="number" min="0" max="3000" step="10" inputmode="numeric"></div>
+        <div class="gate-field"><label for="pol-vad-half-resume">Speech after HALF before FULL uses newer end (ms)</label><input id="pol-vad-half-resume" type="number" min="10" max="1000" step="10" inputmode="numeric"></div>
+        <p class="note">FireRed detector chunk cap is fixed at 8000 ms; product segment hard cap remains 16000 ms. Both are shown as fixed behavior, not editable look-alike controls.</p>
+        <h2>SenseVoice</h2>
+        <label for="pol-asr-language">Recognition language</label>
+        <select id="pol-asr-language">
+          <option value="auto">Auto</option><option value="zh">Chinese</option><option value="en">English</option><option value="ja">Japanese</option><option value="yue">Cantonese</option>
+        </select>
+        <div id="policy-facts" class="facts vc-facts"></div>
+        <div id="policy-runtime-facts" class="facts vc-facts" aria-live="polite"></div>
+        <div class="form-actions">
+          <p id="policy-note" class="message"></p>
+          <button id="policy-reload" type="button" class="secondary">Discard changes</button>
+          <button id="policy-save" type="button" class="primary">Save policy</button>
         </div>
       </div>
-      <p class="note" id="cl-error" hidden></p>
-      <div id="cl-facts" class="facts vc-facts"></div>
+    </details>
 
-      <div class="actions vc-global-actions">
-        <button id="cl-start" type="button" class="primary">录制</button>
-        <button id="cl-build" type="button" class="primary" disabled>生成</button>
-        <button id="cl-test" type="button" class="primary" disabled>测试</button>
-        <button id="cl-clear" type="button" class="danger" disabled>重置</button>
+    <details class="card settings-group" id="card-input">
+      <summary>Audio input</summary>
+      <div class="settings-inner">
+        <p class="note">The App microphone source Speech starts with. Changing it while running switches the source immediately.</p>
+        <div class="facts input-facts"><div><span>Configured</span><strong id="in-configured">—</strong></div><div><span>Active source</span><strong id="in-active">—</strong></div></div>
+        <label for="in-source">Input source</label>
+        <select id="in-source" aria-label="Speech input source"></select>
+        <div class="form-actions"><p id="in-note" class="message"></p><button id="in-save" type="button" class="primary">Use this input</button></div>
       </div>
+    </details>
 
-      <div class="vc-clips-section">
-        <div class="step-header">
-          <span class="vc-record-title">已录手势</span>
+    <details class="card settings-group" id="card-models">
+      <summary>Models</summary>
+      <div class="settings-inner">
+        <ul id="models-list" class="s2-models"></ul>
+        <p id="models-authority" class="note"></p>
+      </div>
+    </details>
+    </details>
+
+    <!-- ⭐ Developer-only: complete Speech policy editor. Present only with ?dev=1. -->
+    <template id="dev-policy-template">
+      <details class="card settings-group" id="card-dev-policy">
+        <summary>Speech policy (developer)</summary>
+        <div class="settings-inner">
+          <label for="dev-policy-json">Complete Speech policy</label>
+          <textarea id="dev-policy-json" rows="16" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+          <p id="dev-policy-note" class="message"></p>
+          <div class="actions">
+            <button id="dev-policy-reload" type="button" class="secondary">Reload</button>
+            <button id="dev-policy-apply" type="button" class="primary">Apply complete policy</button>
+          </div>
         </div>
-        <ul id="cl-clips" class="clip-list"></ul>
-      </div>
-    </section>
+      </details>
+    </template>
   </section>
 </main>
+<!--
+  Package-owned confirmation UI. Do not replace this with window.confirm(): an Android WebView only
+  shows that native dialog when its host supplies a WebChromeClient.
+-->
+<div id="tos-confirm" class="tos-confirm" hidden aria-hidden="true">
+  <div class="tos-confirm-backdrop" data-confirm-cancel></div>
+  <section id="tos-confirm-panel" class="tos-confirm-panel" role="dialog" aria-modal="true"
+    aria-labelledby="tos-confirm-title" aria-describedby="tos-confirm-message" tabindex="-1">
+    <h2 id="tos-confirm-title">Confirm</h2>
+    <p id="tos-confirm-message" class="tos-confirm-message"></p>
+    <div class="tos-confirm-actions">
+      <button id="tos-confirm-cancel" type="button" class="secondary">Cancel</button>
+      <button id="tos-confirm-accept" type="button" class="primary">Confirm</button>
+    </div>
+  </section>
+</div>
 <script src="/admin/session.js"></script>
-<script src="views.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

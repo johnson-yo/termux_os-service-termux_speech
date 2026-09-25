@@ -1,162 +1,175 @@
 /**
  * SPDX-License-Identifier: Apache-2.0
- * [INPUT]: 16 kHz mono s16 samples
- * [OUTPUT]: 192 维 CAM++ speaker embedding，由 App 的 ORT **CPU** graph session 计算
- * [POS]: docs/080。整条链都在手机上：PCM → Node fbank（复用 VAD 那份）→ per-utt CMN
- *        → App ORT CPU → embedding。⛔ 不装新 runtime，不占 NPU。
+ * [INPUT]: 16 kHz mono PCM16 的一个固定 1.5 s 窗
+ * [OUTPUT]: App 内 HTP CAM++ 的 192 维 embedding 与可核对的执行事实
+ * [POS]: docs/132 P2。Speech 只持有窄 embedding client；前处理、模型和 session 归 App。
  *
- * ⭐ 三件都是实测确认过、不能凭直觉改的事：
- *   ① **前处理复用 `../vad/fbank.mjs`**：它与 torchaudio Kaldi fbank 实测
- *      `max|Δ| ≤ 7.6e-04`。⚠ 这是量出来的，不是「都是 80 维 Kaldi fbank」推出来的——
- *      窗函数 / DC 去除 / log floor 任何一处不同都会移动 embedding。
- *   ② **`backend: 'cpu'`**：CAM++ 没有 HTP ctx，也不该去抢 NPU。手机实测
- *      1 秒段 20.7 ms、3 秒段 40 ms、8 秒段 90 ms，SoC 温度不动。
- *   ③ **要拿回张量必须 `return_outputs: true` + `output_mode: 'raw'`**，
- *      回来的是 `outputs[].data_b64`。⚠ 默认只回 stats——按字面猜 `values.embedding`
- *      会拿到 `undefined`，再 `Array.from` 就成了一个长度为 1 的数组，**一路不报错**。
+ * ⛔ 本文件不再导入 fbank、generic/campplus.onnx 或 [ResidentGraph]。
+ * App 是唯一的 CAM++ 前处理/HTP 执行方，登记与正式识别共用同一条实现。
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
-import fs from 'node:fs';
-import path from 'node:path';
 
-import { computeFbank } from '../vad/fbank.mjs';
-import { ResidentGraph } from '../residents.mjs';
-import { EMBEDDING_DIM } from './profile.mjs';
+export const CAMPLUS_MODEL_ID = 'campplus';
+export const CAMPLUS_EMBEDDING_CONTRACT = 'campplus-htp-t148-v1';
+export const CAMPLUS_FEATURE_PROTOCOL = 'campplus-kaldi-cmn-v1';
+export const CAMPLUS_WINDOW_MS = 1_500;
+export const CAMPLUS_WINDOW_SAMPLES = 24_000;
+export const CAMPLUS_FRAMES = 148;
+export const CAMPLUS_EMBEDDING_DIM = 192;
 
-const MEL = 80;
-const SR = 16_000;
-/** 恒等 CMVN：`computeFbank` 会做 `(x-mean)*istd`，这样拿到的就是原始 fbank。 */
-const IDENTITY_CMVN = {
-  means: new Float32Array(MEL),
-  istd: new Float32Array(MEL).fill(1),
+const encodePcm = (samples) => {
+  if (!(samples instanceof Int16Array) || samples.length !== CAMPLUS_WINDOW_SAMPLES) {
+    throw new RangeError(
+      `CAM++ HTP requires exactly ${CAMPLUS_WINDOW_SAMPLES} PCM samples (1.5 s)`,
+    );
+  }
+  const bytes = Buffer.alloc(samples.length * 2);
+  for (let i = 0; i < samples.length; i += 1) bytes.writeInt16LE(samples[i], i * 2);
+  return bytes.toString('base64');
+};
+
+const finiteEmbedding = (value) => {
+  if (!Array.isArray(value) || value.length !== CAMPLUS_EMBEDDING_DIM) return false;
+  let norm = 0;
+  for (const x of value) {
+    if (!Number.isFinite(Number(x))) return false;
+    norm += Number(x) ** 2;
+  }
+  return norm > 0 && Number.isFinite(norm);
 };
 
 export class CamPlusEmbedder {
-  /**
-   * @param backend  `cpu`（既有声纹门，动态 T）或 `htp`（docs/084 验收模式，**固定 T=148**）
-   * @param ctxPath  QNN 2.47 EPContext wrapper 的绝对路径；给了才可能真的跑在 HTP 上
-   *
-   * ⚠ 两者不是同一张图能力：HTP ctx 是**固定 [1,148,80]**（1500 ms 一个窗），
-   *   登记那种整段 1.1–5.6 s 的动态长度它吃不下 —— 所以登记继续留 CPU，
-   *   运行时才用 HTP（实测两侧 centroid cos=0.999992，见 INTEGRATION_READINESS.md）。
-   */
-  constructor({ android, residentId, modelPath, estMemMb = 32,
-                backend = 'cpu', ctxPath = null, resolveModelPath = null }) {
+  constructor({ android, residentId = null, modelPath = null, ctxPath = null } = {}) {
+    this.android = android;
+    // Kept as a diagnostic identity for old snapshots; App owns the actual lease.
+    this.residentId = residentId;
     this.modelPath = modelPath;
-    /** 用时解析的兜底（见 [ensure]）。⛔ 不是「另一个来源」，是**同一个**来源晚一点问。 */
-    this.resolveModelPath = resolveModelPath;
-    this.backend = backend;
     this.ctxPath = ctxPath;
-    /**
-     * ⭐ 登记用的 CAM++ 是 **CPU + 动态长度**的临时会话。
-     * ⛔ 它与 App 那张常驻 `app-speaker-cam`（HTP、固定 `[1,148,80]`）**不是同一张图**，
-     *   也不该常驻：登记是罕见的一次性动作，而那张图吃不下整段任意长度的录音。
-     */
-    this.graph = new ResidentGraph({
-      android, id: residentId, model: 'campplus',
-      modelPath, backend, ctxPath, estMemMb, priority: 40, ephemeral: true,
-    });
+    this.prepared = false;
+    this.metadata = null;
     this.lastError = null;
     this.lastMs = null;
     this.calls = 0;
+    this.releaseInFlight = null;
   }
 
-  get filesPresent() {
-    try {
-      // ctx 命中时源图不必存在（runbook §5：`require(ctxUsable || 源图存在)`）
-      if (this.ctxPath && fs.existsSync(this.ctxPath)) return true;
-      return fs.existsSync(this.modelPath);
-    } catch { return false; }
-  }
-
-  /** 释放这张图（只在 docs/084 验收模式用；⛔ 常驻声纹门不该 churn HTP 会话）。 */
-  async release() { try { await this.graph.undeclare(); } finally { this.lastError = null; } }
-
-  /**
-   * ⭐ **登记用的那张图改成用时解析。**
-   *
-   * ⚠ 它只在使用者点「登记」时才用到，而旧代码在**服务启动那一刻**把它解析成一个常量。
-   *   真机复现过两种失败，且都不报错、只在几分钟后表现成一句 `CAM++ model missing`：
-   *   ① Manager 比本服务晚起一秒 ⇒ 整个 descriptor 拿不到；
-   *   ② Manager 答了话但 `companions` 还没派生完 ⇒ **答案完整合法，只是少了这一项**。
-   * ⭐ 启动时解析一个只在人点按钮时才需要的东西，等于把一次瞬时竞态变成永久故障。
-   * ⛔ 解析不到仍然明确失败，不猜路径、不回落。
-   */
   setModelPath(next) {
-    if (!next || next === this.modelPath) return;
-    this.modelPath = next;
-    this.graph.modelPath = next;
+    if (next) this.modelPath = next;
+  }
+
+  setRuntime({ sourcePath, artifact } = {}) {
+    if (sourcePath) this.modelPath = sourcePath;
+    if (artifact?.path) this.ctxPath = artifact.path;
+    return this.snapshot();
   }
 
   async ensure() {
-    if (!this.filesPresent && typeof this.resolveModelPath === 'function') {
-      this.setModelPath(await this.resolveModelPath().catch(() => null));
-    }
-    if (!this.filesPresent) throw new Error(`CAM++ model missing: ${this.modelPath}`);
-    await this.graph.declare();
-    return this.graph.snapshot();
-  }
-
-  /** 官方前处理：Kaldi fbank(80) → 逐维减均值（per-utterance CMN）。 */
-  features(samples) {
-    const { feat, frames } = computeFbank(samples, IDENTITY_CMVN);
-    if (!frames) return null;
-    const means = new Float64Array(MEL);
-    for (const row of feat) for (let i = 0; i < MEL; i += 1) means[i] += row[i];
-    for (let i = 0; i < MEL; i += 1) means[i] /= frames;
-    const out = new Float32Array(frames * MEL);
-    for (let t = 0; t < frames; t += 1) {
-      for (let i = 0; i < MEL; i += 1) out[t * MEL + i] = feat[t][i] - means[i];
-    }
-    return { data: out, frames };
-  }
-
-  /** @param samples Int16Array —— 一段 16 kHz mono PCM。 */
-  async embed(samples) {
-    const f = this.features(samples);
-    if (!f) throw new Error('too few samples for one fbank frame');
-    const started = Date.now();
-    const r = await this.graph.run({
-      inputs: {
-        feat: {
-          dtype: 'float32',
-          shape: [1, f.frames, MEL],
-          data_b64: Buffer.from(f.data.buffer, f.data.byteOffset, f.data.byteLength)
-            .toString('base64'),
+    if (this.prepared) return this.metadata ?? this.snapshot();
+    try {
+      const data = await this.android.json('/api/speech/speaker/embedding/prepare', {
+        method: 'POST',
+        body: {
+          model_id: CAMPLUS_MODEL_ID,
+          embedding_contract: CAMPLUS_EMBEDDING_CONTRACT,
         },
-      },
-      outputs: ['embedding'],
-      // ⛔ 这两个都必须给，否则只回 stats（见头部 ③）。
-      return_outputs: true,
-      output_mode: 'raw',
-    });
-    const tensor = (r?.outputs ?? []).find((t) => t?.name === 'embedding') ?? r?.outputs?.[0];
-    if (!tensor?.data_b64) {
-      throw new Error(`CAM++ returned no tensor (keys: ${Object.keys(r ?? {}).join(',')})`);
+      });
+      // App 的 `data` 本身就是 execution facts；不能把其中的 embedding 字段
+      // 当成另一层结果对象。prepare 与 embed 共用同一个明确的 data contract。
+      const meta = data;
+      if (meta?.backend !== 'htp' || meta?.frames !== CAMPLUS_FRAMES
+          || meta?.window_ms !== CAMPLUS_WINDOW_MS) {
+        throw new Error('App returned a non-fixed HTP CAM++ contract');
+      }
+      this.prepared = true;
+      this.metadata = meta;
+      this.lastError = null;
+      return meta;
+    } catch (error) {
+      this.lastError = String(error?.message ?? error);
+      throw error;
     }
-    const buf = Buffer.from(tensor.data_b64, 'base64');
-    const emb = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
-    if (emb.length !== EMBEDDING_DIM) {
-      throw new Error(`CAM++ embedding dim ${emb.length}, expected ${EMBEDDING_DIM}`);
+  }
+
+  async release() {
+    if (!this.prepared && !this.releaseInFlight) return this.snapshot();
+    if (this.releaseInFlight) return this.releaseInFlight;
+    this.releaseInFlight = (async () => {
+      try {
+        const data = await this.android.json('/api/speech/speaker/embedding/release', {
+          method: 'POST', body: { model_id: CAMPLUS_MODEL_ID },
+        });
+        this.prepared = false;
+        this.metadata = null;
+        this.lastError = null;
+        return data;
+      } finally {
+        this.releaseInFlight = null;
+      }
+    })();
+    return this.releaseInFlight;
+  }
+
+  /** App performs feature extraction and inference; no raw PCM is retained there. */
+  async embed(samples) {
+    await this.ensure();
+    const started = Date.now();
+    try {
+      const data = await this.android.json('/api/speech/speaker/embedding', {
+        method: 'POST',
+        body: {
+          model_id: CAMPLUS_MODEL_ID,
+          embedding_contract: CAMPLUS_EMBEDDING_CONTRACT,
+          pcm_s16le_b64: encodePcm(samples),
+        },
+      });
+      // App API 的响应是 `{ ok: true, data: { embedding: [...] , ...facts } }`，
+      // appJson 已经取出 data。这里必须保留 data 对象，embedding 只是其中一个字段。
+      const result = data;
+      const embedding = result?.embedding;
+      if (!finiteEmbedding(embedding)) throw new Error('App returned an invalid CAM++ embedding');
+      if (result?.backend !== 'htp' || result?.frames !== CAMPLUS_FRAMES) {
+        throw new Error('App returned an incompatible CAM++ execution fact');
+      }
+      this.calls += 1;
+      this.lastMs = Number.isFinite(Number(result.inference_ms))
+        ? Number(result.inference_ms) : Date.now() - started;
+      this.metadata = { ...this.metadata, ...result };
+      this.lastError = null;
+      return {
+        embedding,
+        frames: CAMPLUS_FRAMES,
+        duration_ms: CAMPLUS_WINDOW_MS,
+        inference_ms: this.lastMs,
+        // `backend=htp` is the fixed contract; compute_unit is an observed App fact.
+        // Never manufacture a value when the App cannot prove the lower-level unit.
+        compute_unit: result.compute_unit ?? null,
+        model_id: result.model_id ?? CAMPLUS_MODEL_ID,
+        model_version: result.model_version ?? null,
+        embedding_contract: result.embedding_contract ?? CAMPLUS_EMBEDDING_CONTRACT,
+        feature_protocol: result.feature_protocol ?? CAMPLUS_FEATURE_PROTOCOL,
+        backend: result.backend,
+      };
+    } catch (error) {
+      this.lastError = String(error?.message ?? error);
+      throw error;
     }
-    this.calls += 1;
-    this.lastMs = r?.profile?.median_ms ?? (Date.now() - started);
-    this.lastError = null;
-    return {
-      embedding: Array.from(emb),
-      frames: f.frames,
-      duration_ms: Math.round(samples.length / SR * 1000),
-      inference_ms: Number(Number(this.lastMs).toFixed(1)),
-      compute_unit: r?.profile?.compute_unit ?? null,
-    };
   }
 
   snapshot() {
     return {
+      model_id: CAMPLUS_MODEL_ID,
       model_path: this.modelPath,
-      files_present: this.filesPresent,
-      backend: 'cpu',
-      resident: this.graph.snapshot?.() ?? null,
+      ctx_path: this.ctxPath,
+      resident_id: this.residentId,
+      backend: 'htp',
+      window_ms: CAMPLUS_WINDOW_MS,
+      samples: CAMPLUS_WINDOW_SAMPLES,
+      frames: CAMPLUS_FRAMES,
+      embedding_dim: CAMPLUS_EMBEDDING_DIM,
+      embedding_contract: CAMPLUS_EMBEDDING_CONTRACT,
+      feature_protocol: CAMPLUS_FEATURE_PROTOCOL,
+      prepared: this.prepared,
+      metadata: this.metadata,
       calls: this.calls,
       last_inference_ms: this.lastMs,
       last_error: this.lastError,
@@ -164,4 +177,4 @@ export class CamPlusEmbedder {
   }
 }
 
-export const defaultModelPath = (root) => path.join(root, 'campplus', 'model.onnx');
+export const defaultModelPath = (root) => `${root}/campplus/htp-t148/campplus.onnx`;

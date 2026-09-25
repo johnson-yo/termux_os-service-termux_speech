@@ -64,12 +64,7 @@ export class VadController {
     android,
     dataRoot,
     config,
-    /**
-     * ⭐ **已经路由好的图参数**，来自 `executableGraphArgs(descriptor)`。
-     * ⛔ 不是一个裸路径：`executable.path` 多数时候是一份 EPContext，当成 `model_path`
-     *   送过去会被 App 以 `EP_CONTEXT_AS_MODEL_PATH` 拒绝。判据只住在 `logical-models.mjs`，
-     *   本类**不许知道** `kind` 这个字段存在。
-     */
+    /** App prepare 返回的 runtime artifact 投影；本类不推断 raw 文件或 context 来源。 */
     graph = null,
     /** logical descriptor 给出的 runtime CMVN 绝对路径；⛔ 不从 modelFile 推导。 */
     cmvnFile = null,
@@ -106,7 +101,7 @@ export class VadController {
     this.onProbability = typeof onProbability === 'function' ? onProbability : null;
     this.probabilityFrames = 0;
     this.config = { ...config };
-    this.executable = graph ?? null;
+    this.runtimeArtifact = graph ?? null;
     /** 「文件在不在」与状态投影用的那一份；⛔ 不拿它去当 model_path。 */
     this.modelPath = graph?.path ?? null;
     this.cmvnPath = cmvnFile;
@@ -404,18 +399,17 @@ export class VadController {
   }
 
   /**
-   * ⭐ **可执行体是一个会迟到的事实，⛔ 不是一个只在开机为真的常量。**
+   * ⭐ **App runtime 是一个会迟到的事实，⛔ 不是一个只在开机为真的常量。**
    *
-   * ⚠ 与 `AsrController.applyLogical` 同一件事、同一个理由（docs/103 §8.2⑥）：
-   *   speech 比模型管理器先起来时，启动那一刻解析不到 FireRedVAD，
+   * ⚠ speech 比 raw Manager/App prepare 先起来时，启动那一刻解析不到 FireRedVAD，
    *   于是它**永远** `degraded`，而重启一次就好了。
    * ⛔ 已经声明过常驻时不许就地改路径——见 [ResidentGraph.configure]。
    * @returns 有没有真的换过
    */
-  applyLogical({ graph, cmvnFile } = {}) {
+  applyRuntime({ graph, cmvnFile } = {}) {
     if (this.modelsReady || (this.modelPath && this.cmvnPath)) return false;
     if (!graph?.path || !cmvnFile) return false;
-    this.executable = graph;
+    this.runtimeArtifact = graph;
     this.modelPath = graph.path;
     this.cmvnPath = cmvnFile;
     this.graph.configure({
@@ -428,8 +422,8 @@ export class VadController {
   }
 
   ensureModelFiles() {
-    if (!this.modelPath) throw new Error('FireRedVAD logical executable is unavailable');
-    if (!this.cmvnPath) throw new Error('FireRedVAD logical companion cmvn is unavailable');
+    if (!this.modelPath) throw new Error('FireRedVAD App runtime is unavailable');
+    if (!this.cmvnPath) throw new Error('FireRedVAD raw CMVN is unavailable');
     if (!fs.existsSync(this.modelPath)) {
       throw new Error(`FireRedVAD model missing: ${this.modelPath}`);
     }
@@ -744,8 +738,8 @@ export class VadController {
         id: 'fireredvad',
         // ⭐ 报的是**实际载入的那一份**，并说清它是不是编译产物。
         model_path: this.modelPath,
-        executable_kind: this.executable?.kind ?? null,
-        loaded_as: this.executable?.isContext ? 'ctx_path' : 'model_path',
+        runtime_kind: this.runtimeArtifact?.kind ?? null,
+        loaded_as: this.graph.ctxPath ? 'ctx_path' : 'model_path',
         cmvn_path: this.cmvnPath,
         files_present: this.filesPresent(),
         runtime: 'android-app-ort-qnn-htp',
